@@ -83,9 +83,9 @@ Agent side: `MACH_SERVER`, `MACH_ORG`, `MACH_STATE_DIR`, `MACH_POLICY`,
 - Put Caddy/nginx in front for TLS (agents speak wss://) and set
   `MACH_TRUST_PROXY=1` on the server. Nothing else exposes ports; targets
   dial out only.
-- The control plane is the single high-value target: it reads command
-  content (no app-layer E2E yet) and holds the audit log. Harden it
-  accordingly; see README "Known limitations" for the honest list.
+- The control plane is the single high-value target: it brokers every
+  command and holds the audit log (E2E keeps command CONTENT from it,
+  but metadata remains). Harden it accordingly; see SECURITY-NOTES.md.
 
 ## Known limitations (documented, do not hide)
 
@@ -97,3 +97,97 @@ Agent side: `MACH_SERVER`, `MACH_ORG`, `MACH_STATE_DIR`, `MACH_POLICY`,
   discipline, full-screen TUIs need a real PTY.
 - **Postgres backing is implemented** (`MACH_DB=postgres://…`) alongside
   SQLite (WAL, capped connections) — schema is identical.
+
+## Open work for continuing agents (approaches + acceptance criteria)
+
+Each item below was deliberately deferred. Work them in order; each has
+an intended approach and an acceptance test. All require `go test ./...`
+AND `scripts/e2e.sh` green before a PR.
+
+### 1. Policy layer is a foot-guard, not a sandbox
+
+`internal/agent/policy.go` does substring deny/allow matching — bypassable
+(`rm -rf` → `rm -r -f`, base64 pipes, `$(...)`, etc.). Add real OS
+confinement behind it:
+
+- Linux: seccomp allowlist for exec'd children
+  (`golang.org/x/sys/unix`, SockFprog) applied via the pre-exec hook in
+  `internal/agent/run.go` where `applyConfinement(c)` is already called;
+  optionally ship `prlimit`-based caps (CPU, FSIZE, NPROC) when the
+  `prlimit(1)` binary exists.
+- macOS: `sandbox-exec` profile (deprecated but functional) or document
+  non-availability honestly.
+- Windows: restricted token / Job Object — os/exec cannot do this; use
+  `golang.org/x/sys/windows` with a wrapper, or document non-availability.
+
+**Acceptance test**: a unit test where an allowlist-limited command
+cannot escape the allowlist via shell metacharacter tricks
+(`echo $(rm -rf /)`, backticks, pipes into sh) — the existing
+`TestPolicyAllowlist` extends to cover these.
+
+### 2. Streaming console is not a kernel PTY
+
+`/v1/console/stream` (server/stream.go) + `handleStream`
+(agent/streamexec.go) give live 32 KiB chunks and remote Ctrl-C, but no
+echo/line discipline — TUI apps (vim, htop) don't work.
+
+Fix: add `pty: true` to `protocol.StreamStart`; on the agent, when set,
+run the command under a kernel PTY (`github.com/creack/pty`, pure Go,
+already an ecosystem standard) and relay the pty master the same way
+stream_out chunks flow today. Teach `mach console` local raw mode via
+`golang.org/x/term` (MakeRaw on stdin, restore on exit). Keep the
+non-PTY path as fallback (Windows without a pty port).
+
+**Acceptance test**: an e2e check that a PTY-allocated session reports
+terminal type and survives resize messages — or minimally, `mach
+console` running a full-screen app renders without mangling.
+
+### 3. No signed release manifests for shipped binaries
+
+The Docker image ships prebuilt agents in `/opt/mach-agents/` with no
+provenance. (Runtime `push-update` manifests ARE signature-verified —
+that part is done.)
+
+Fix: in the Dockerfile build stage, after the cross-compile loop, sha256
+each binary and sign the manifest with the control-plane identity key
+(the same ed25519 flow as `push-update`), emitting `manifest.signed`
+next to the binaries. Add a `mach verify <binary> <manifest>`
+subcommand that checks the signature against the pinned `server_key`.
+Acceptance: a unit test where a tampered binary fails verification, and
+an e2e check that the shipped manifest verifies.
+
+### 4. Single control plane = SPOF
+
+Acceptable for a household fleet; the foundation is already in place
+(`MACH_DB=postgres://…`). The blocker is the in-memory broker
+(`internal/broker/broker.go` maps machine→conn, pinning sessions to one
+server). A multi-server design would route exec/stream frames via a
+shared pub/sub (Postgres LISTEN/NOTIFY — already a supported backing —
+or Redis) and make the `pending` exec waiters shared. Only take this on
+if fleet scale actually demands it.
+
+## Wire-format gotchas (learned implementing the above — don't rediscover)
+
+- **SealedB64 is base64 of the SealedMessage JSON**
+  (`{"v":1,"eph":...,"body":...}`), and the console's local `e2eWire`
+  copy MUST carry the `v:1` field — a missing `v` fails on the agent
+  with "unsupported sealed message version".
+- **Nonce size**: chacha20poly1305.NonceSize (12 bytes), NOT
+  NonceSizeX — mixing them panics on Open.
+- **AAD is the sender's ephemeral pubkey** — both Seal and Open must
+  pass it; dropping it breaks tamper detection.
+- **`mach exec` E2E mode ignores `command`/`argv`**: when `sealed` is
+  set the server requires `e2e_pub` and ignores plaintext fields (and
+  vice versa). The console always tries E2E first and falls back to
+  plaintext only when the machine has no `pub_e2e` (pre-E2E enrollment)
+  — don't "fix" that fallback away.
+- **Audit in E2E mode** writes a `[E2E sealed command]` placeholder with
+  exit code only. Needing command content in audit is a deliberate
+  policy change to propose — not silently implement.
+- **Agent update re-exec** runs `self run` detached (Setsid on unix);
+  if you touch update logic, verify the new process survives the old
+  one exiting (e2e checks "post-update exec works" twice).
+- **Rate limiters are per-IP** with port-stripped keys; behind a proxy
+  they need `MACH_TRUST_PROXY=1` or every client shares the proxy IP.
+- **Time-based tests**: pairing TTL/expiry tests sleep tiny amounts;
+  keep tolerances loose or they flake on loaded machines.
