@@ -31,7 +31,7 @@ func readJSON(r *http.Request, v any) error {
 // ---- POST /v1/pair/start  (agent, unauthenticated but ungranted) ----
 
 func (s *Server) handlePairStart(w http.ResponseWriter, r *http.Request) {
-	if s.tooManyPairStarts(s.clientIP(r)) {
+	if s.pairStarts.record(s.clientIP(r)) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many pairing attempts; try later"})
 		return
 	}
@@ -79,6 +79,12 @@ func validPubKey(pk string) error {
 // ---- POST /v1/pair/status  (agent polls while waiting for approval) ----
 
 func (s *Server) handlePairStatus(w http.ResponseWriter, r *http.Request) {
+	// Token lookups hash candidates per request; keep the per-IP rate
+	// bounded (generous: real agents poll every ~2s).
+	if s.pairLookups.record(s.clientIP(r)) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many requests"})
+		return
+	}
 	var req protocol.PairStatusReq
 	if err := readJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json"})
@@ -148,12 +154,21 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
 	machine, err := s.st.MachineByName(name)
 	if err != nil || machine == nil {
-		http.Error(w, "unknown machine", http.StatusUnauthorized)
+		// Upgrade-then-close instead of a 401: an HTTP-level error would be
+		// an oracle for distinguishing "known machine" from "unknown" during
+		// name enumeration. (Revoked machines get the explicit frame below.)
+		if ws0, err0 := s.upgrader.Upgrade(w, r, nil); err0 == nil {
+			ws0.SetReadLimit(64 << 10)
+			_ = ws0.SetReadDeadline(time.Now().Add(10 * time.Second))
+			ws0.Close()
+		}
 		return
 	}
 	if machine.Revoked {
 		ws2, err2 := s.upgrader.Upgrade(w, r, nil)
 		if err2 == nil {
+			ws2.SetReadLimit(64 << 10)
+			_ = ws2.SetReadDeadline(time.Now().Add(10 * time.Second))
 			conn0 := protocol.NewWSConn(ws2)
 			_ = conn0.WriteEnvelope(protocol.Envelope{Type: "revoked"})
 			conn0.Close()
@@ -167,6 +182,12 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	conn := protocol.NewWSConn(ws)
 	defer conn.Close()
 
+	// Pre-auth window: bounded frames and a hard deadline to finish hello,
+	// so an unauthenticated client can neither buffer an unbounded frame
+	// nor hold a connection open indefinitely.
+	ws.SetReadLimit(64 << 10)
+	_ = ws.SetReadDeadline(time.Now().Add(15 * time.Second))
+
 	// Replay-proof hello: server sends a random challenge; the agent signs
 	// name|challenge. Captured hellos are worthless on other connections.
 	nonce := store.RandToken(32)
@@ -179,11 +200,19 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var hr protocol.HelloRequest
-	if err := json.Unmarshal(env.Payload, &hr); err != nil || hr.PubKey != machine.PubKey || verifyAgentHello(machine.PubKey, hr, nonce) != nil {
+	if err := json.Unmarshal(env.Payload, &hr); err != nil || hr.PubKey != machine.PubKey || hr.Name != machine.Name || verifyAgentHello(machine.PubKey, hr, nonce) != nil {
 		_ = conn.WriteEnvelope(protocol.Envelope{Type: "hello_result", Payload: mustJSON(protocol.HelloResponse{OK: false, Error: "bad signature or key"})})
 		return
 	}
-	_ = conn.WriteEnvelope(protocol.Envelope{Type: "hello_result", Payload: mustJSON(protocol.HelloResponse{OK: true})})
+	// Mutual authentication: sign the challenge with this control plane's
+	// identity key. The agent verifies against the key it pinned at
+	// enrollment, so a hijacked TLS layer cannot impersonate the server.
+	resp := protocol.HelloResponse{OK: true, ServerAuth: "v1 " + base64.StdEncoding.EncodeToString(ed25519.Sign(s.serverPriv, []byte("server|"+nonce)))}
+	_ = conn.WriteEnvelope(protocol.Envelope{Type: "hello_result", Payload: mustJSON(resp)})
+
+	// Authenticated: exec_result frames carry up to 2×8 MiB of output plus
+	// JSON overhead; raise the frame cap accordingly.
+	ws.SetReadLimit(40 << 20)
 
 	ac := &broker.AgentConn{Name: machine.Name, Conn: conn, LastSeen: time.Now(), Hostname: hr.Hostname, OS: hr.OS, Arch: hr.Arch, AgentVer: hr.AgentVer}
 	s.br.Add(ac)
@@ -213,7 +242,7 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		}
 		switch env.Type {
 		case "exec_result":
-			s.completeExec(env)
+			s.completeExec(env, machine.Name)
 		case "ping":
 			_ = conn.WriteEnvelope(protocol.Envelope{Type: "pong"})
 		default:
@@ -294,13 +323,17 @@ type pendingExec struct {
 	source  string
 }
 
-func (s *Server) completeExec(env protocol.Envelope) {
+func (s *Server) completeExec(env protocol.Envelope, fromMachine string) {
 	var res protocol.ExecResult
 	if err := json.Unmarshal(env.Payload, &res); err != nil {
 		res = protocol.ExecResult{Error: "bad exec_result payload"}
 	}
 	s.pendMu.Lock()
 	pe, ok := s.pending[env.ReqID]
+	if ok && pe.machine != fromMachine {
+		// Only the machine the exec was dispatched to may complete it.
+		ok = false
+	}
 	if ok {
 		delete(s.pending, env.ReqID)
 	}
@@ -315,8 +348,8 @@ func (s *Server) completeExec(env protocol.Envelope) {
 
 // authFailures tracks failed console-auth attempts per IP for rate limiting.
 type authLimiter struct {
-	mu      sync.Mutex
-	fails   map[string][]time.Time
+	mu    sync.Mutex
+	fails map[string][]time.Time
 }
 
 func (a *authLimiter) tooMany(ip string) bool {

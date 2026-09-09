@@ -8,7 +8,12 @@ import (
 // ConsoleDefault is what plain `mach` shows on a configured admin machine:
 // the fleet status table, one shot (same output as `mach list`).
 func ConsoleDefault() int {
-	machines, err := DefaultClient().Machines()
+	c, err := DefaultClient()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "mach: "+err.Error())
+		return 2
+	}
+	machines, err := c.Machines()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "mach: "+err.Error())
 		return 3

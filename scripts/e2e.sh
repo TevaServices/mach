@@ -17,8 +17,10 @@ FAIL=0
 
 cleanup() {
   [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null
-  [[ -n "${AGENT_PID:-}" ]] && kill "$AGENT_PID" 2>/dev/null
-  pkill -f "mach run" 2>/dev/null
+  # Kill only processes started from THIS workdir's binary — never a bare
+  # `pkill -f "mach run"`, which would match unrelated processes (editors,
+  # other projects' dev servers) that merely contain those words.
+  [[ -n "${WORKDIR:-}" ]] && pkill -f "^$WORKDIR/mach run" 2>/dev/null
   rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -121,11 +123,11 @@ for i in $(seq 1 30); do
 done
 [[ -n "$TOKEN" ]]; check "pairing token published" $?
 for i in 1 2 3 4 5; do
-  curl -s -o /dev/null -X POST "$BASE/pair/$TOKEN" --data "code=WRONGWRONGWR&name=attacker&approve=1"
+  curl -s -o /dev/null -X POST "$BASE/pair/$TOKEN" --data "code=WRONGWRONGWR&org=$ORG&name=attacker&approve=1"
 done
 # 6th attempt with the CORRECT code must fail (any non-200/anything-but-approved).
 CODE=$(grep -oE '[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}' "$WORKDIR/qr.log" | head -1)
-RESP=$(curl -s -X POST "$BASE/pair/$TOKEN" --data "code=$CODE&name=attacker&approve=1")
+RESP=$(curl -s -X POST "$BASE/pair/$TOKEN" --data "code=$CODE&org=$ORG&name=attacker&approve=1")
 echo "$RESP" | grep -q "approved"; [[ $? -ne 0 ]]; check "lockout: correct code refused after 5 strikes" $?
 
 step "pair page shows org list, not the code"

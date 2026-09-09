@@ -12,19 +12,20 @@ type Envelope struct {
 // ---- agent -> control plane ----
 
 type HelloRequest struct {
-	Auth      string `json:"auth"`       // "v1 <base64 ed25519 signature>" over name|challenge (connection-bound)
-	PubKey    string `json:"pub_key"`    // hex
-	Name      string `json:"name"`       // machine name (must match enrollment)
-	AgentVer  string `json:"agent_version,omitempty"`
-	Hostname  string `json:"hostname,omitempty"`
-	OS        string `json:"os,omitempty"`
-	Arch      string `json:"arch,omitempty"`
+	Auth     string `json:"auth"`    // "v1 <base64 ed25519 signature>" over name|challenge (connection-bound)
+	PubKey   string `json:"pub_key"` // hex
+	Name     string `json:"name"`    // machine name (must match enrollment)
+	AgentVer string `json:"agent_version,omitempty"`
+	Hostname string `json:"hostname,omitempty"`
+	OS       string `json:"os,omitempty"`
+	Arch     string `json:"arch,omitempty"`
 }
 
 type HelloResponse struct {
-	OK        bool   `json:"ok"`
-	Error     string `json:"error,omitempty"`
-	ServerVer string `json:"server_version,omitempty"`
+	OK         bool   `json:"ok"`
+	Error      string `json:"error,omitempty"`
+	ServerVer  string `json:"server_version,omitempty"`
+	ServerAuth string `json:"server_auth,omitempty"` // "v1 <base64 ed25519 sig>" by the server's identity key over "server|<challenge>"
 }
 
 type ExecResult struct {

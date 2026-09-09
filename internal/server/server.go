@@ -7,6 +7,7 @@ package server
 import (
 	"crypto/ed25519"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -20,7 +21,6 @@ import (
 type Server struct {
 	st           *store.Store
 	br           *broker.Broker
-	pubURL       string // public base URL, e.g. https://mach.example.com
 	org          string // org prefix for machine names, e.g. "bcross"
 	serverKeyHex string // ed25519 public key of this control plane (pinned by agents)
 	serverPriv   ed25519.PrivateKey
@@ -32,33 +32,41 @@ type Server struct {
 	pendMu  sync.Mutex
 	pending map[string]*pendingExec
 
-	// pair-start rate limiting: ip -> start times
-	rlMu       sync.Mutex
-	pairStarts map[string][]time.Time
+	// pair-start rate limiting: max 5 per IP per 10 minutes
+	pairStarts *ipLimiter
 
-	// failed console-auth attempts per client (rate limiting)
-	authFails authLimiter
+	// failed console-auth attempts per client (rate limiting): only actual
+	// failures count, max 20 per IP per 10 minutes
+	authFails *ipLimiter
+
+	// pair-token lookups (page views, agent polls): generous but bounded
+	pairLookups *ipLimiter
 
 	// cleanup ticker stop
 	cleanupStop chan struct{}
 }
 
-func New(st *store.Store, br *broker.Broker, pubURL, org, keyPath string) *Server {
+func New(st *store.Store, br *broker.Broker, org, keyPath string) *Server {
 	if org == "" {
 		org = "mach"
 	}
 	s := &Server{
 		st:          st,
 		br:          br,
-		pubURL:      pubURL,
 		org:         org,
 		pairingTTL:  10 * time.Minute,
 		upgrader:    websocket.Upgrader{ReadBufferSize: 32 * 1024, WriteBufferSize: 32 * 1024},
 		pending:     map[string]*pendingExec{},
-		pairStarts:  map[string][]time.Time{},
+		pairStarts:  newIPLimiter(5, 10*time.Minute),
+		authFails:   newIPLimiter(20, 10*time.Minute),
+		pairLookups: newIPLimiter(240, 10*time.Minute),
 		cleanupStop: make(chan struct{}),
 	}
-	s.loadOrCreateServerKey(keyPath)
+	if err := s.loadOrCreateServerKey(keyPath); err != nil {
+		// Refusing to start is deliberate: a server that silently rotates
+		// its identity key breaks every enrolled agent's update pin.
+		panic("server: identity key: " + err.Error())
+	}
 	// Housekeeping: purge terminal pairings hourly (keep 24h for forensics).
 	go func() {
 		t := time.NewTicker(time.Hour)
@@ -103,7 +111,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/exec", s.authConsole(s.handleExec))
 	mux.HandleFunc("GET /v1/audit", s.authConsole(s.handleAudit))
 
-	// Server management API (enroll-scoped keys): revoke + updates
+	// Server management API: machine revocation (exec:* keys only)
 	mux.HandleFunc("POST /v1/admin/revoke", s.authConsole(s.handleRevokeMachine))
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -116,35 +124,75 @@ func (s *Server) Routes() http.Handler {
 }
 
 // clientIP: trust X-Forwarded-For only when the operator enabled proxy mode.
+// With one trusted proxy layer, the RIGHTMOST XFF entry is the one that
+// proxy appended (the actual client) — leftmost entries are client-supplied
+// and spoofable. The port is always stripped: RemoteAddr carries an
+// ephemeral per-connection port, and rate limiting must not key on it.
 func (s *Server) clientIP(r *http.Request) string {
 	if s.trustProxy {
 		if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
-			for i := 0; i < len(xf); i++ {
-				if xf[i] == ',' {
-					return strings.TrimSpace(xf[:i])
-				}
+			parts := strings.Split(xf, ",")
+			host := strings.TrimSpace(parts[len(parts)-1])
+			if ip, _, err := net.SplitHostPort(host); err == nil {
+				host = ip
 			}
-			return strings.TrimSpace(xf)
+			if host != "" {
+				return host
+			}
 		}
+	}
+	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return ip
 	}
 	return r.RemoteAddr
 }
 
-// tooManyPairStarts enforces max 5 pair starts per IP per 10 minutes.
-func (s *Server) tooManyPairStarts(ip string) bool {
-	now := time.Now()
-	s.pairStarts[ip] = append(filterRecent(s.pairStarts[ip], now, 10*time.Minute), now)
-	return len(s.pairStarts[ip]) > 5
+// ipLimiter is a mutex-guarded sliding-window counter per client IP.
+// Entries (and keys) that age out of the window are dropped so the map
+// cannot grow without bound.
+type ipLimiter struct {
+	mu     sync.Mutex
+	max    int
+	window time.Duration
+	hits   map[string][]time.Time
 }
 
-func filterRecent(times []time.Time, now time.Time, window time.Duration) []time.Time {
-	out := times[:0]
-	for _, t := range times {
-		if now.Sub(t) < window {
-			out = append(out, t)
+func newIPLimiter(max int, window time.Duration) *ipLimiter {
+	return &ipLimiter{max: max, window: window, hits: map[string][]time.Time{}}
+}
+
+// record appends a hit and reports whether the IP is over its limit.
+func (l *ipLimiter) record(ip string) bool {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	times := l.hits[ip][:0]
+	for _, t := range l.hits[ip] {
+		if now.Sub(t) < l.window {
+			times = append(times, t)
 		}
 	}
-	return out
+	over := len(times) >= l.max
+	if !over {
+		times = append(times, now)
+	}
+	l.hits[ip] = times
+	return over
+}
+
+// blocked reports whether the IP is at/over its limit without recording
+// a hit (for gating requests before validation).
+func (l *ipLimiter) blocked(ip string) bool {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, t := range l.hits[ip] {
+		if now.Sub(t) < l.window {
+			n++
+		}
+	}
+	return n >= l.max
 }
 
 func (s *Server) logf(format string, args ...any) {
@@ -153,9 +201,10 @@ func (s *Server) logf(format string, args ...any) {
 
 // hasScope checks a key's scope string covers a capability.
 //   - "exec:*" covers exec on any machine
-//   - "exec:<name>,<name>" covers exec only on the listed machines
+//   - "exec:<name>|<name>" (or comma-separated) covers exec only on the
+//     listed machines
 //   - "readonly" covers machines + audit reads (no exec)
-//   - "enroll" covers API-key enrollment (not console exec)
+//   - "enroll" covers API-key enrollment only (not console reads or admin)
 func hasScope(scopes, want string) bool {
 	for _, s := range strings.Split(scopes, ",") {
 		s = strings.TrimSpace(s)
@@ -171,19 +220,54 @@ func hasScope(scopes, want string) bool {
 	return false
 }
 
+// execAllowlist returns the machines an exec-scoped key may touch.
+// (nil, true) means unrestricted (exec:* or a non-exec scope the caller has
+// already vetted); (names, false) restricts to those machine names,
+// case-insensitively. Accepts both allowlist separators: "exec:m1|m2" and
+// "exec:m1,m2" (the comma form was the documented one in the store, so bare
+// comma segments following an exec: entry are absorbed into its allowlist).
+func execAllowlist(scopes string) (allowed []string, all bool) {
+	segs := strings.Split(scopes, ",")
+	for i := 0; i < len(segs); i++ {
+		s := strings.TrimSpace(segs[i])
+		if s == "exec:*" {
+			return nil, true
+		}
+		if !strings.HasPrefix(s, "exec:") {
+			continue
+		}
+		allow := strings.TrimPrefix(s, "exec:")
+		for j := i + 1; j < len(segs); j++ {
+			nxt := strings.TrimSpace(segs[j])
+			if nxt == "" || strings.HasPrefix(nxt, "exec:") || nxt == "readonly" || nxt == "enroll" {
+				break
+			}
+			allow += "|" + nxt
+			i = j
+		}
+		for _, m := range splitAny(allow, ",|") {
+			if m = strings.ToLower(strings.TrimSpace(m)); m != "" {
+				allowed = append(allowed, m)
+			}
+		}
+	}
+	return allowed, false
+}
+
+func splitAny(s, seps string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool { return strings.ContainsRune(seps, r) })
+}
+
 // keyCanExecOn enforces the exec allowlist for scoped keys.
 func keyCanExecOn(scopes, machine string) bool {
-	for _, s := range strings.Split(scopes, ",") {
-		s = strings.TrimSpace(s)
-		if s == "exec:*" {
+	allowed, all := execAllowlist(scopes)
+	if all {
+		return true
+	}
+	machine = strings.ToLower(machine)
+	for _, m := range allowed {
+		if m == machine {
 			return true
-		}
-		if strings.HasPrefix(s, "exec:") {
-			for _, m := range strings.Split(strings.TrimPrefix(s, "exec:"), "|") {
-				if strings.TrimSpace(m) == machine {
-					return true
-				}
-			}
 		}
 	}
 	return false

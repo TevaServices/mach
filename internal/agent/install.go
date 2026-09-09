@@ -3,8 +3,10 @@ package agent
 import (
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -34,13 +36,64 @@ func Install(stateDir string) error {
 	case "windows":
 		return installWindows(cfg.Name, exe)
 	default:
-		return installSystemd(cfg.Name, exe)
+		return installSystemd(cfg.Name, exe, stateDir)
 	}
+}
+
+// dropUser is the account the agent drops to when installed as root.
+func dropUser() string {
+	if v := os.Getenv("MACH_USER"); v != "" {
+		return v
+	}
+	return "nobody"
+}
+
+// chownTree hands the state directory (and everything in it) to the
+// unprivileged account the service will run as, so a root-performed
+// enrollment stays readable by the dropped agent.
+func chownTree(root, username string) error {
+	u, err := user.Lookup(username)
+	if err != nil {
+		return err
+	}
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return err
+	}
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		return err
+	}
+	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Chown(path, uid, gid)
+	})
 }
 
 // ---- linux: systemd ----
 
-func installSystemd(name, exe string) error {
+func installSystemd(name, exe, stateDir string) error {
+	// Run the service directly as the unprivileged account (User=) rather
+	// than letting the process drop: the state dir, env, and permissions
+	// then match what the agent needs, and `mach run` under the unit is
+	// identical to the manual case.
+	runAs := dropUser()
+	envLine := "Environment=MACH_STATE_DIR=" + stateDir + "\n"
+	userLine := ""
+	if os.Geteuid() == 0 {
+		if _, err := user.Lookup(runAs); err == nil {
+			userLine = "User=" + runAs + "\n"
+			envLine += "Environment=MACH_KEEP_PRIVILEGES=1\n" // no double-drop
+			if err := chownTree(stateDir, runAs); err != nil {
+				return fmt.Errorf("chowning state dir %s to %s: %v", stateDir, runAs, err)
+			}
+		} else {
+			// No such user: keep the root-run unit (droppriv is best-effort).
+			runAs = "root"
+		}
+	}
 	unit := fmt.Sprintf(`[Unit]
 Description=mach agent (%s)
 After=network-online.target
@@ -48,13 +101,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%s run
+%s%sExecStart="%s" run
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-`, name, exe)
+`, name, userLine, envLine, exe)
 
 	unitPath := "/etc/systemd/system/machd.service"
 	if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
@@ -72,7 +125,7 @@ WantedBy=multi-user.target
 			return fmt.Errorf("%s: %v: %s", strings.Join(args, " "), err, out)
 		}
 	}
-	fmt.Printf("Installed and started the mach agent service (machine %q). It reconnects automatically after reboots and network loss.\n", name)
+	fmt.Printf("Installed and started the mach agent service (machine %q, running as %s). It reconnects automatically after reboots and network loss.\n", name, runAs)
 	return nil
 }
 
@@ -100,7 +153,7 @@ func installLaunchd(name, exe, stateDir string) error {
   <key>StandardErrorPath</key><string>%s</string>
 </dict>
 </plist>
-`, exe, logPath, logPath)
+`, xmlEscape(exe), xmlEscape(logPath), xmlEscape(logPath))
 
 	if err := os.MkdirAll(plistDir, 0o755); err != nil {
 		return err
@@ -118,15 +171,24 @@ func installLaunchd(name, exe, stateDir string) error {
 	return nil
 }
 
+// xmlEscape makes a string safe for element text / attribute values in the
+// plist (paths with & < > " ' would otherwise corrupt the XML).
+func xmlEscape(s string) string {
+	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&apos;")
+	return r.Replace(s)
+}
+
 // ---- Windows: Task Scheduler ----
 
 func installWindows(name, exe string) error {
 	// Runs at logon; task restarts daily and on failure after 1 minute.
-	sched := fmt.Sprintf(`schtasks /Create /F /TN "machd" /SC ONLOGON /RL HIGHEST /TR "'%s' run"`, exe)
-	if out, err := runCmd("cmd", "/c", sched); err != nil {
+	// /TR receives a command-line string: the executable must be wrapped in
+	// quotes so paths with spaces parse (single quotes are NOT valid for
+	// schtasks). We pass argv directly — no cmd /c, so no double parsing.
+	if out, err := runCmd("schtasks", "/Create", "/F", "/TN", "machd", "/SC", "ONLOGON", "/RL", "HIGHEST", "/TR", `"`+exe+`" run`); err != nil {
 		return fmt.Errorf("schtasks: %v: %s", err, out)
 	}
-	if out, err := runCmd("cmd", "/c", `schtasks /Change /TN "machd" /RI 1`); err != nil {
+	if out, err := runCmd("schtasks", "/Change", "/TN", "machd", "/RI", "1"); err != nil {
 		_ = out // restart interval best-effort
 	}
 	fmt.Printf("Installed Task Scheduler job %q (machine %q): starts at logon, restarts on failure.\n", "machd", name)

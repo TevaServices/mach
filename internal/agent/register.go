@@ -62,6 +62,15 @@ func hostname() string {
 	return h
 }
 
+// warnInsecureServer prints a loud warning when the control plane is plain
+// http: enrollment credentials (and later, commands) cross the wire
+// unencrypted. Allowed (dev deployments) but never silently.
+func warnInsecureServer(server string) {
+	if strings.HasPrefix(server, "http://") {
+		fmt.Println("\n*** WARNING: this control plane uses plain http — enrollment credentials and ALL commands will be unencrypted on the wire. Use an https:// control plane for anything real. ***")
+	}
+}
+
 func bold(s string) string { return "\033[1m" + s + "\033[0m" }
 
 // RegisterQR runs the QR pairing flow: request a pairing session, show the
@@ -74,6 +83,7 @@ func RegisterQR(server, org, stateDir string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	warnInsecureServer(server)
 	start, err := postJSON2[protocol.PairStartResponse](server, "/v1/pair/start", protocol.PairStartReq{
 		PubKey: id.PubHex, Hostname: hostname(), OS: runtime.GOOS, Arch: runtime.GOARCH, AgentVer: Version,
 	})
@@ -149,6 +159,7 @@ func RegisterAPIKey(server, apiKey, name, org, stateDir string) (*Config, error)
 	if err != nil {
 		return nil, err
 	}
+	warnInsecureServer(server) // the API key itself crosses the wire here
 	resp, err := postJSON2[struct {
 		OK        string `json:"ok"`
 		Machine   string `json:"machine"`

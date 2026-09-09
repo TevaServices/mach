@@ -15,7 +15,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	mrand "math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -63,8 +65,11 @@ func (c *cappedBuffer) String() string {
 // Run is the daemon main loop: dial the control plane over an outbound
 // connection, sign in (challenge-bound), execute commands, reconnect with
 // exponential backoff on any failure. Nothing listens inbound.
+//
+// Privilege drop happens AFTER the state files are read: a root-installed
+// service (no User= in the unit) would otherwise drop to an unprivileged
+// user that cannot read its own config and crash-loop forever.
 func Run(stateDir string) error {
-	DropPrivileges()
 	cfg, err := LoadConfig(stateDir)
 	if err != nil {
 		return err
@@ -73,9 +78,11 @@ func Run(stateDir string) error {
 	if err != nil {
 		return err
 	}
+	DropPrivileges()
 
 	backoff := 2 * time.Second
 	for {
+		iterStart := time.Now()
 		err := dialAndServe(cfg, id)
 		if errors.Is(err, errShutdown) {
 			return nil
@@ -87,34 +94,49 @@ func Run(stateDir string) error {
 			return nil
 		}
 		log.Printf("agent: disconnected: %v — reconnecting in %s", err, backoff)
-		time.Sleep(backoff)
+		// Reset the backoff only after a genuinely long-lived session; a
+		// fast-failing error (bad frame, rejected hello) must not hard-reset
+		// the loop to 2s forever.
+		if time.Since(iterStart) > 2*time.Minute {
+			backoff = 2 * time.Second
+		}
+		// Jitter ±25% so a fleet restart doesn't reconnect in lockstep.
+		jittered := backoff - backoff/4 + time.Duration(mrand.Int63n(int64(backoff/2)+1))
+		time.Sleep(jittered)
 		backoff *= 2
 		if backoff > 2*time.Minute {
 			backoff = 2 * time.Minute
-		}
-		if err == errReset {
-			backoff = 2 * time.Second
 		}
 	}
 }
 
 var (
-	errReset    = errors.New("reset backoff")
 	errShutdown = errors.New("shutdown")
 	errRevoked  = errors.New("machine revoked")
 )
 
 func dialAndServe(cfg *Config, id *Identity) error {
-	url := wsURL(cfg.Server) + "/v1/agent/ws?name=" + cfg.Name
+	url := wsURL(cfg.Server) + "/v1/agent/ws?name=" + urlQueryEscape(cfg.Name)
 	ws, resp, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
 		if resp != nil {
+			resp.Body.Close() // gorilla hands back the response on non-101
 			return fmt.Errorf("dial %s: %s", url, resp.Status)
 		}
 		return fmt.Errorf("dial %s: %w", url, err)
 	}
 	defer ws.Close()
 	conn := protocol.NewWSConn(ws)
+
+	// Keepalive: the pinger sends pings; the pong handler (and any data
+	// frame) refreshes the read deadline. A dead server fails the read
+	// within pongWait; a server that stops answering pongs is detected the
+	// same way. Every write carries its own deadline (protocol.WSConn).
+	const pongWait = 90 * time.Second
+	conn.SetPongHandler(func(string) error {
+		_ = ws.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
 
 	// Server initiates hello with a per-connection challenge (ReqID).
 	env, err := conn.ReadEnvelope()
@@ -130,13 +152,13 @@ func dialAndServe(cfg *Config, id *Identity) error {
 	}
 	sig := ed25519.Sign(id.Priv, []byte(helloMessage(cfg.Name, challenge)))
 	hello := protocol.HelloRequest{
-		Auth:      "v1 " + base64.StdEncoding.EncodeToString(sig),
-		PubKey:    id.PubHex,
-		Name:      cfg.Name,
-		AgentVer:  Version,
-		Hostname:  hostname(),
-		OS:        runtime.GOOS,
-		Arch:      runtime.GOARCH,
+		Auth:     "v1 " + base64.StdEncoding.EncodeToString(sig),
+		PubKey:   id.PubHex,
+		Name:     cfg.Name,
+		AgentVer: Version,
+		Hostname: hostname(),
+		OS:       runtime.GOOS,
+		Arch:     runtime.GOARCH,
 	}
 	payload, _ := json.Marshal(hello)
 	if err := conn.WriteEnvelope(protocol.Envelope{Type: "hello", Payload: payload}); err != nil {
@@ -157,9 +179,25 @@ func dialAndServe(cfg *Config, id *Identity) error {
 		}
 		return fmt.Errorf("server rejected hello: %s", msg)
 	}
-	log.Printf("agent: connected to %s as %q", cfg.Server, cfg.Name)
+	// Mutual authentication: the server signs the challenge with the key
+	// this machine pinned at enrollment. TLS alone does not prove server
+	// identity — the pin does.
+	if cfg.ServerKey == "" {
+		log.Printf("agent: WARNING: no server key pinned — skipping control-plane identity verification (re-enroll to pin it)")
+	} else {
+		pub, ok := parsePubKey(cfg.ServerKey)
+		if !ok {
+			return errors.New("corrupt server_key in config — refusing to connect without a valid pin; re-enroll")
+		}
+		serverSig, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(hr.ServerAuth, "v1 "))
+		if err != nil || !ed25519.Verify(pub, []byte("server|"+challenge), serverSig) {
+			return fmt.Errorf("control plane identity verification FAILED (missing or bad server signature) — refusing connection")
+		}
+	}
+	log.Printf("agent: connected to %s as %q (control plane identity verified)", cfg.Server, cfg.Name)
 
-	// Keepalive pinger.
+	// Keepalive pinger: sends pings; pong (or any data frame) refreshes the
+	// read deadline, so a black-holed connection tears down within pongWait.
 	pingCtx, cancelPings := context.WithCancel(context.Background())
 	defer cancelPings()
 	go func() {
@@ -175,16 +213,20 @@ func dialAndServe(cfg *Config, id *Identity) error {
 		}
 	}()
 
+	// Concurrency cap on command execution: a buggy or hijacked control
+	// plane must not be able to spawn unbounded processes on this machine.
+	execSem := make(chan struct{}, maxConcurrentExec)
+
 	// Command loop.
 	for {
-		_ = ws.SetReadDeadline(time.Time{}) // block until frame or drop
+		_ = ws.SetReadDeadline(time.Now().Add(pongWait))
 		env, err := conn.ReadEnvelope()
 		if err != nil {
-			return errReset // clean disconnect → reconnect fast
+			return err // deadline, clean disconnect, or protocol error
 		}
 		switch env.Type {
 		case "exec":
-			go handleExec(conn, env)
+			go handleExec(conn, env, execSem)
 		case "update":
 			if err := handleUpdate(cfg, env); err != nil {
 				log.Printf("agent: update failed: %v", err)
@@ -192,17 +234,27 @@ func dialAndServe(cfg *Config, id *Identity) error {
 		case "revoked":
 			return errRevoked
 		case "pong":
-			// ignore
+			// keepalive ack; the pong handler already refreshed deadlines
 		default:
 			log.Printf("agent: ignoring frame %q", env.Type)
 		}
 	}
 }
 
-func handleExec(conn *protocol.WSConn, env protocol.Envelope) {
+// maxConcurrentExec bounds simultaneously running remote commands.
+const maxConcurrentExec = 8
+
+func handleExec(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{}) {
 	var cmd protocol.ExecCommand
 	if err := json.Unmarshal(env.Payload, &cmd); err != nil {
 		replyExec(conn, env.ReqID, protocol.ExecResult{Error: "bad exec payload"})
+		return
+	}
+	select {
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
+	case <-time.After(10 * time.Second):
+		replyExec(conn, env.ReqID, protocol.ExecResult{Error: "too many concurrent commands on this machine", ExitCode: 126})
 		return
 	}
 	if reason := globalPolicy.Evaluate(cmd.Command, cmd.Argv); reason != "" {
@@ -237,6 +289,15 @@ func handleExec(conn *protocol.WSConn, env protocol.Envelope) {
 	stderr.max = maxOutputBytes
 	c.Stdout = &stdout
 	c.Stderr = &stderr
+	// Stdout/stderr are buffers (not files), so os/exec copies through a
+	// pipe: if a command backgrounds a grandchild that inherits the pipe,
+	// the copy goroutine outlives the direct child. WaitDelay bounds that
+	// wait — without it, `sleep 3600 &` style commands hang Wait() forever
+	// past the timeout, leaking the goroutine and losing the result.
+	c.WaitDelay = 10 * time.Second
+	// Do not leak the agent's own environment (MACH_USER, MACH_POLICY, ...)
+	// into every command the control plane runs.
+	c.Env = filteredEnv()
 	runErr := c.Run()
 
 	res := protocol.ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
@@ -270,7 +331,12 @@ func handleUpdate(cfg *Config, env protocol.Envelope) error {
 	if cfg.ServerKey == "" {
 		return errors.New("no pinned server key in config — refusing update")
 	}
-	if !ed25519.Verify(mustPub(cfg.ServerKey), []byte(upd.Version+"|"+upd.Sha256), mustSig(upd.SigB64)) {
+	pub, ok := parsePubKey(cfg.ServerKey)
+	if !ok {
+		// A wrong-length key would make ed25519.Verify panic; refuse instead.
+		return errors.New("corrupt server_key in config (not a 32-byte hex key) — refusing update")
+	}
+	if !ed25519.Verify(pub, []byte(upd.Version+"|"+upd.Sha256), mustSig(upd.SigB64)) {
 		return errors.New("update signature verification failed — refusing")
 	}
 	var data []byte
@@ -309,13 +375,22 @@ func handleUpdate(cfg *Config, env protocol.Envelope) error {
 	if err != nil {
 		return err
 	}
-	// Atomic swap: write new binary next to self, rename over.
+	// Atomic swap: write new binary next to self, rename over. Windows
+	// cannot rename over a running executable image, so move self aside
+	// first (the .old copy is replaced on the next update).
 	tmp := self + ".new"
 	if err := os.WriteFile(tmp, data, 0o755); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, self); err != nil {
-		return err
+		old := self + ".old"
+		_ = os.Remove(old)
+		if err2 := os.Rename(self, old); err2 != nil {
+			return fmt.Errorf("replacing binary %s: %v (initial rename: %v)", self, err2, err)
+		}
+		if err3 := os.Rename(tmp, self); err3 != nil {
+			return err3
+		}
 	}
 	log.Printf("agent: updated to %s — restarting", upd.Version)
 	// Re-exec self, detached: the new process outlives this one and
@@ -324,7 +399,13 @@ func handleUpdate(cfg *Config, env protocol.Envelope) error {
 	if runtime.GOOS != "windows" {
 		cmd.SysProcAttr = detachSysProcAttr()
 	}
-	return cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	// This process must NOT re-enter the reconnect loop: two live agents
+	// with one identity would fight over the broker connection forever.
+	// errShutdown stops Run() and lets the new process take over.
+	return errShutdown
 }
 
 func mustSig(b64 string) []byte {
@@ -332,12 +413,31 @@ func mustSig(b64 string) []byte {
 	return sig
 }
 
-func mustPub(hexKey string) ed25519.PublicKey {
-	b, _ := hex.DecodeString(hexKey)
-	if len(b) != ed25519.PublicKeySize {
-		return nil
+// parsePubKey hex-decodes an ed25519 public key, rejecting wrong-length
+// input (ed25519.Verify panics on anything that is not 32 bytes).
+func parsePubKey(hexKey string) (ed25519.PublicKey, bool) {
+	b, err := hex.DecodeString(hexKey)
+	if err != nil || len(b) != ed25519.PublicKeySize {
+		return nil, false
 	}
-	return ed25519.PublicKey(b)
+	return ed25519.PublicKey(b), true
+}
+
+// filteredEnv strips this agent's own MACH_* control variables from the
+// environment every executed command inherits.
+func filteredEnv() []string {
+	out := make([]string, 0, len(os.Environ()))
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "MACH_") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+func urlQueryEscape(s string) string {
+	return url.QueryEscape(s)
 }
 
 func helloMessage(name, nonce string) string { return name + "|" + nonce }

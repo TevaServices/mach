@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/bcross/mach/internal/broker"
 	"github.com/bcross/mach/internal/server"
@@ -49,7 +50,7 @@ func serverKeyPath() string {
 }
 
 func newServer(st *store.Store, br *broker.Broker) *server.Server {
-	srv := server.New(st, br, os.Getenv("MACH_PUBLIC_URL"), Org(), serverKeyPath())
+	srv := server.New(st, br, Org(), serverKeyPath())
 	if os.Getenv("MACH_TRUST_PROXY") == "1" {
 		// Only behind the known TLS reverse proxy (Caddy/nginx) — enables
 		// X-Forwarded-For for rate limiting. Off by default.
@@ -76,13 +77,19 @@ func Serve() {
 	srv := newServer(st, broker.New())
 	log.Printf("mach control plane listening on %s (public URL %s, org %q, trust-proxy %v)",
 		listen, pubURL, Org(), os.Getenv("MACH_TRUST_PROXY") == "1")
-	if err := http.ListenAndServe(listen, srv.Routes()); err != nil {
+	// Explicit timeouts: without a ReadHeaderTimeout the public listener is
+	// trivially slowloris'd. (ReadTimeout/WriteTimeout stay unset — console
+	// exec requests legitimately block for up to ~10 minutes.)
+	srvHTTP := &http.Server{
+		Addr:              listen,
+		Handler:           srv.Routes(),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := srvHTTP.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
-
-// normalizeName lowercases and trims a key/machine name for storage.
-func normalizeName(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
 
 // AddAPIKey creates a key with a server-generated high-entropy secret.
 // Returns the generated key (shown ONCE).
@@ -103,6 +110,11 @@ func AddAPIKey(name, scopes string) (string, error) {
 		// allowlist form: exec:m1|m2|m3 (per-machine)
 		if !strings.HasPrefix(scopes, "exec:") {
 			return "", fmt.Errorf("scopes must be one of: enroll | readonly | exec:* | exec:<m1>|<m2>")
+		}
+		// An empty allowlist would create a key that can never exec; that
+		// is always a mistake (usually a truncated machine list).
+		if strings.TrimSpace(strings.TrimPrefix(scopes, "exec:")) == "" {
+			return "", fmt.Errorf("exec: allowlist is empty — list machines (exec:<m1>|<m2>) or use exec:*")
 		}
 	}
 	key := "mach_" + store.RandToken(24) // 192-bit server-generated secret
@@ -138,17 +150,18 @@ type updateManifest struct {
 }
 
 // loadServerPriv returns the control plane's identity private key (for
-// signing update manifests). Reads the persisted key file.
-func loadServerPriv() ed25519.PrivateKey {
+// signing update manifests). Reads the persisted key file; errors surface
+// through PushUpdate as a normal CLI error, not a panic.
+func loadServerPriv() (ed25519.PrivateKey, error) {
 	raw, err := os.ReadFile(serverKeyPath())
 	if err != nil {
-		panic("control plane key missing — run serve once first: " + err.Error())
+		return nil, fmt.Errorf("control plane key missing — run serve once first: %v", err)
 	}
 	b, derr := hex.DecodeString(strings.TrimSpace(string(raw)))
 	if derr != nil || len(b) != ed25519.PrivateKeySize {
-		panic("corrupt control plane key at " + serverKeyPath())
+		return nil, fmt.Errorf("corrupt control plane key at %s", serverKeyPath())
 	}
-	return ed25519.PrivateKey(b)
+	return ed25519.PrivateKey(b), nil
 }
 
 // PushUpdate signs the manifest for a local agent binary and queues it for
@@ -164,7 +177,11 @@ func PushUpdate(machine, binPath, version string) error {
 		Sha256:  hex.EncodeToString(sum[:]),
 		DataB64: base64.StdEncoding.EncodeToString(bin),
 	}
-	sig := ed25519.Sign(loadServerPriv(), []byte(manifest.Version+"|"+manifest.Sha256))
+	priv, err := loadServerPriv()
+	if err != nil {
+		return err
+	}
+	sig := ed25519.Sign(priv, []byte(manifest.Version+"|"+manifest.Sha256))
 	st, err := openStore()
 	if err != nil {
 		return err
