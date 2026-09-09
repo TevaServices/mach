@@ -132,11 +132,8 @@ command audit log). Put Caddy/nginx in front for TLS (agents speak wss://).
 - No signed release manifests for the agent binaries shipped in the
   container image (updates pushed at runtime ARE signature-verified).
 
-**Agents continuing this work** (Hermes, Claude Code, etc.): read
-AGENTS.md — it carries the full work queue with approaches and
-acceptance criteria (seccomp sandboxing for the policy layer, kernel-PTY
-console, signed release manifests, multi-server broker). This README
-keeps only the short list.
+Follow-up work tracks in GitHub issues (#2 sandboxing, #3 PTY, #4
+signed manifests, #5 multi-server) — not in this file.
 
 ## Build
 

@@ -2,7 +2,7 @@ package console
 
 // Streaming console client: `mach console <machine>` opens the
 // /v1/console/stream WebSocket, sends exec_stream, and streams output
-// live (limitation #3). Line-based remote reading remains for scripts;
+// live. Line-based remote reading remains for scripts;
 // this path gives humans/agents live output.
 
 import (

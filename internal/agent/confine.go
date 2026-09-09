@@ -1,6 +1,6 @@
 // Package agent: OS-level execution confinement for remote commands.
 //
-// Limitation #2 from SECURITY-NOTES said the substring policy was a
+// The substring policy layer is a
 // foot-guard. This adds real OS enforcement where the platform allows:
 //
 //   - linux: each command runs in its own process group (setpgid) and is

@@ -120,7 +120,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok\n"))
 	})
-	// Streaming console (limitation #3): live output relay. authConsole
+	// Streaming console: live output relay. authConsole
 	// works for WS too (bearer header on the upgrade request).
 	mux.HandleFunc("GET /v1/console/stream", s.authConsole(func(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
 		s.handleConsoleStreamWS(w, r, keyName, scopes)

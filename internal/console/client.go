@@ -391,7 +391,7 @@ func (c *client) ExecArgv(machine string, argv []string, timeout int) int {
 }
 
 // Console is the interactive mode: streams a persistent shell session
-// live over the streaming endpoint (limitation #3). Falls back to
+// live over the streaming endpoint. Falls back to
 // line-based exec when the streaming endpoint is unavailable.
 func (c *client) Console(machine string) int {
 	fmt.Printf("mach console — %s (Ctrl-C kills the remote session; Ctrl-D exits)\n", machine)

@@ -80,7 +80,7 @@ type SealedExecCommand struct {
 	Timeout   int    `json:"timeout,omitempty"`
 }
 
-// ---- streaming console (limitation #3) ----
+// ---- streaming console ----
 
 // StreamStart initiates a streaming exec session (server → agent frame).
 // The agent runs the command, streaming chunks as they arrive, and

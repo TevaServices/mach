@@ -1,6 +1,6 @@
 package server
 
-// Streaming console relay (limitation #3): `mach console` opens a
+// Streaming console relay: `mach console` opens a
 // dedicated authenticated WebSocket; the control plane pairs it with the
 // target machine's agent WebSocket and relays frames bidirectionally:
 //
