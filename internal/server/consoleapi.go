@@ -1,0 +1,158 @@
+package server
+
+import (
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/bcross/mach/internal/protocol"
+	"github.com/bcross/mach/internal/store"
+)
+
+type ctxKey string
+
+const keyNameKey ctxKey = "key_name"
+
+// authConsole requires a valid API key (Bearer) for the console API.
+func (s *Server) authConsole(next func(w http.ResponseWriter, r *http.Request, keyName string)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		const prefix = "Bearer "
+		if len(auth) <= len(prefix) || auth[:len(prefix)] != prefix {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing bearer key"})
+			return
+		}
+		key := auth[len(prefix):]
+		ok, name, err := s.st.APIKeyExists(key)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
+			return
+		}
+		if !ok {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid api key"})
+			return
+		}
+		next(w, r, name)
+	}
+}
+
+// ---- GET /v1/machines ----
+
+func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request, keyName string) {
+	machines, err := s.st.ListMachines()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
+		return
+	}
+	online := s.br.OnlineNames()
+	resp := protocol.MachinesResponse{Machines: []protocol.MachineInfo{}}
+	for _, m := range machines {
+		resp.Machines = append(resp.Machines, protocol.MachineInfo{
+			Name: m.Name, Hostname: m.Hostname, OS: m.OS, Arch: m.Arch,
+			Online: online[m.Name], AgentVer: m.AgentVer, CreatedAt: m.CreatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// ---- POST /v1/exec ----
+
+func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName string) {
+	var req protocol.ExecRequest
+	if err := readJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json"})
+		return
+	}
+	if req.Machine == "" || req.Command == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "machine and command are required"})
+		return
+	}
+	if req.Timeout <= 0 {
+		req.Timeout = 30
+	}
+	if req.Timeout > 600 {
+		req.Timeout = 600
+	}
+
+	ac := s.br.WaitOnline(req.Machine, 15*time.Second)
+	if ac == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "machine offline or unknown: " + req.Machine})
+		return
+	}
+
+	reqID := store.RandToken(8)
+	pe := &pendingExec{
+		ch:      make(chan protocol.ExecResult, 1),
+		machine: req.Machine,
+		command: req.Command,
+		source:  "console:" + keyName,
+	}
+	s.pendMu.Lock()
+	s.pending[reqID] = pe
+	s.pendMu.Unlock()
+	defer func() {
+		s.pendMu.Lock()
+		delete(s.pending, reqID)
+		s.pendMu.Unlock()
+	}()
+
+	cmdPayload, _ := json.Marshal(protocol.ExecCommand{Command: req.Command, Timeout: req.Timeout})
+	if err := ac.Conn.WriteEnvelope(protocol.Envelope{Type: "exec", ReqID: reqID, Payload: cmdPayload}); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent connection lost"})
+		return
+	}
+
+	grace := time.Duration(req.Timeout)*time.Second + 10*time.Second
+	select {
+	case res := <-pe.ch:
+		s.auditExec(pe, res.ExitCode, res.Stdout, res.Stderr)
+		writeJSON(w, http.StatusOK, res)
+	case <-time.After(grace):
+		res := protocol.ExecResult{Error: "timed out waiting for agent result"}
+		s.auditExec(pe, -1, "", res.Error)
+		writeJSON(w, http.StatusGatewayTimeout, res)
+	}
+}
+
+func (s *Server) auditExec(pe *pendingExec, exitCode int, stdout, stderr string) {
+	s.st.AuditInsert(time.Now().UTC().Format(time.RFC3339), pe.machine, pe.command, pe.source,
+		sql.NullInt64{Int64: int64(exitCode), Valid: true}, stdout, stderr)
+}
+
+// ---- GET /v1/audit ----
+
+func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, keyName string) {
+	machine := r.URL.Query().Get("machine")
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
+			limit = n
+		}
+	}
+	entries, err := s.st.AuditList(machine, limit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
+		return
+	}
+	type auditRow struct {
+		TS         string `json:"ts"`
+		Machine    string `json:"machine"`
+		Command    string `json:"command"`
+		Source     string `json:"source"`
+		ExitCode   *int64 `json:"exit_code"`
+		StdoutSnip string `json:"stdout_snip,omitempty"`
+		StderrSnip string `json:"stderr_snip,omitempty"`
+	}
+	rows := make([]auditRow, 0, len(entries))
+	for _, e := range entries {
+		var ec *int64
+		if e.ExitCode.Valid {
+			v := e.ExitCode.Int64
+			ec = &v
+		}
+		rows = append(rows, auditRow{TS: e.TS, Machine: e.Machine, Command: e.Command, Source: e.Source, ExitCode: ec, StdoutSnip: e.StdoutSnip, StderrSnip: e.StderrSnip})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": rows})
+}
