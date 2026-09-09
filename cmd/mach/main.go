@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/bcross/mach/internal/console"
 )
@@ -49,10 +50,18 @@ func main() {
 
 	case "exec":
 		if len(args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: mach exec <machine> <command...>")
+			fmt.Fprintln(os.Stderr, "usage: mach exec <machine> <command...>\n       mach exec <machine> -- <argv...>   (no-shell mode: args pass through byte-exact)")
 			os.Exit(2)
 		}
-		os.Exit(c.Exec(args[1], join(args[2:]), 0))
+		rest := args[2:]
+		if rest[0] == "--" {
+			// No-shell mode: every argument after -- is delivered as its
+			// own JSON string and exec'd directly on the machine. Your
+			// local shell does the only quoting pass; the remote side
+			// never splits or re-parses anything.
+			os.Exit(c.ExecArgv(args[1], rest[1:], 0))
+		}
+		os.Exit(c.Exec(args[1], strings.Join(rest, " "), 0))
 
 	case "console":
 		if len(args) < 2 {
@@ -80,22 +89,12 @@ func main() {
 	}
 }
 
-func join(parts []string) string {
-	out := ""
-	for i, p := range parts {
-		if i > 0 {
-			out += " "
-		}
-		out += p
-	}
-	return out
-}
-
 func usage() {
 	fmt.Fprint(os.Stderr, `mach — fleet console for the mach control plane
 
   mach list                      list enrolled machines
   mach exec <machine> <cmd...>   run a command remotely (exit code = remote exit)
+  mach exec <machine> -- <argv>  no-shell mode: args pass through byte-exact (no quoting issues)
   mach console <machine>         interactive remote shell
   mach audit [machine] [limit]   recent command audit log
 

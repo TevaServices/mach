@@ -42,9 +42,10 @@ type ExecResult struct {
 // ---- console/authenticated-clients -> control plane ----
 
 type ExecRequest struct {
-	Machine string `json:"machine"`
-	Command string `json:"command"`
-	Timeout int    `json:"timeout,omitempty"` // seconds; 0 = 30
+	Machine string   `json:"machine"`
+	Command string   `json:"command"`            // shell mode: run via sh -c
+	Argv    []string `json:"argv,omitempty"`     // no-shell mode: execve directly, nothing parses anything
+	Timeout int      `json:"timeout,omitempty"`  // seconds; 0 = 30
 }
 
 type MachinesResponse struct {
@@ -65,8 +66,9 @@ type MachineInfo struct {
 // ---- control plane -> agent ----
 
 type ExecCommand struct {
-	Command string `json:"command"`
-	Timeout int    `json:"timeout,omitempty"` // seconds; 0 = 30
+	Command string   `json:"command,omitempty"` // shell mode
+	Argv    []string `json:"argv,omitempty"`    // no-shell mode (argv[0..] via execve)
+	Timeout int      `json:"timeout,omitempty"` // seconds; 0 = 30
 }
 
 // ---- QR pairing (unauthenticated browser/phone side) ----

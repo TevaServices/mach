@@ -148,7 +148,16 @@ func handleExec(conn *protocol.WSConn, env protocol.Envelope) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	c := exec.CommandContext(ctx, "sh", "-c", cmd.Command)
+	var c *exec.Cmd
+	switch {
+	case len(cmd.Argv) > 0:
+		// No-shell mode: execve exactly these arguments. argv[0] is the
+		// binary (PATH-looked-up); nothing on the agent side parses,
+		// splits, or re-quotes anything.
+		c = exec.CommandContext(ctx, cmd.Argv[0], cmd.Argv[1:]...)
+	default:
+		c = exec.CommandContext(ctx, "sh", "-c", cmd.Command)
+	}
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
 	c.Stderr = &stderr

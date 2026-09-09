@@ -65,8 +65,12 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName stri
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json"})
 		return
 	}
-	if req.Machine == "" || req.Command == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "machine and command are required"})
+	if req.Machine == "" || (req.Command == "" && len(req.Argv) == 0) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "machine and (command or argv) are required"})
+		return
+	}
+	if req.Command != "" && len(req.Argv) > 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provide command or argv, not both"})
 		return
 	}
 	if req.Timeout <= 0 {
@@ -98,7 +102,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName stri
 		s.pendMu.Unlock()
 	}()
 
-	cmdPayload, _ := json.Marshal(protocol.ExecCommand{Command: req.Command, Timeout: req.Timeout})
+	cmdPayload, _ := json.Marshal(protocol.ExecCommand{Command: req.Command, Argv: req.Argv, Timeout: req.Timeout})
 	if err := ac.Conn.WriteEnvelope(protocol.Envelope{Type: "exec", ReqID: reqID, Payload: cmdPayload}); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent connection lost"})
 		return

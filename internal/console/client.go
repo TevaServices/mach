@@ -123,10 +123,14 @@ func (c *client) Machines() ([]MachineInfo, error) {
 	return resp.Machines, err
 }
 
-// Exec runs one command on one machine and prints stdout/stderr to the
-// right streams, returning the remote exit code (the local process exit).
-func (c *client) Exec(machine, command string, timeout int) int {
-	body := map[string]any{"machine": machine, "command": command}
+// runExec is the shared one-shot path; exactly one of command/argv is set.
+func (c *client) runExec(machine, command string, argv []string, timeout int) int {
+	body := map[string]any{"machine": machine}
+	if command != "" {
+		body["command"] = command
+	} else {
+		body["argv"] = argv
+	}
 	if timeout > 0 {
 		body["timeout"] = timeout
 	}
@@ -143,6 +147,18 @@ func (c *client) Exec(machine, command string, timeout int) int {
 		fmt.Fprintln(os.Stderr, "mach: "+res.Error)
 	}
 	return res.ExitCode
+}
+
+// Exec runs a shell-mode command (parsed once by the remote sh -c).
+func (c *client) Exec(machine, command string, timeout int) int {
+	return c.runExec(machine, command, nil, timeout)
+}
+
+// ExecArgv runs in no-shell mode: each argument is delivered as its own
+// JSON string and exec'd directly on the machine — nothing parses anything,
+// so spaces, quotes, $, and newlines inside arguments survive exactly.
+func (c *client) ExecArgv(machine string, argv []string, timeout int) int {
+	return c.runExec(machine, "", argv, timeout)
 }
 
 // Console is the interactive mode: read lines, exec each on the machine.
