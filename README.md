@@ -132,6 +132,19 @@ command audit log). Put Caddy/nginx in front for TLS (agents speak wss://).
 - No signed release manifests for the agent binaries shipped in the
   container image (updates pushed at runtime ARE signature-verified).
 
+**Agents continuing this work**: needed changes and approaches live in
+the `mach-maintenance` skill (hermes config repo, `config/skills/`) —
+read it before opening a PR here. The short version of each gap and its
+intended fix:
+
+- Policy → seccomp allowlist (Linux), Seatbelt (macOS), Job Object
+  (Windows); acceptance = allowlist key cannot escape via shell
+  metacharacter tricks.
+- Console PTY → creack/pty behind a `pty: true` flag in StreamStart,
+  x/term raw mode locally, non-PTY fallback kept.
+- Release manifests → sha256 + control-plane-signed manifest emitted in
+  the image build; `mach verify` subcommand to check.
+
 ## Build
 
 Any host with Docker (no Go needed): `docker compose build` builds the
