@@ -1,6 +1,6 @@
 package agent
 
-// PTY-less streaming console: limitation #3 fixed with streaming chunks
+// Streaming console: live output via streaming chunks
 // rather than a kernel PTY. `mach console` opens a dedicated WebSocket
 // (auth: bearer on the upgrade request) and gets live stdout/stderr as
 // the command produces them; Ctrl-C sends a stream_kill frame. Wire types
