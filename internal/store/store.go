@@ -343,12 +343,20 @@ func (s *Store) CreatePairing(pubkey, hostname, os, arch, agentVer string, ttl t
 	return id, token, code, err
 }
 
+// pairingScanCap bounds how many candidate pairings a token lookup hashes
+// (most recent first). Each candidate costs a 50k-iteration stretched hash,
+// and this lookup runs on unauthenticated endpoints — the cap keeps the
+// per-request work constant instead of scaling with table size. Live
+// pairings are short-lived (pending TTL is minutes; approved-but-unclaimed
+// rows are cleaned up after a day), so 64 comfortably covers real traffic.
+const pairingScanCap = 64
+
 func (s *Store) PairingByToken(token string) (*Pairing, error) {
 	// Tokens are hashed under each pairing's own salt; one pass computes the
 	// candidate hash per live (non-consumed) pairing and constant-time
 	// compares. Non-consumed of any state: the agent poller must see the
 	// state transition (expired/denied), not a blind 404.
-	rows, err := s.db.Query(`SELECT id, code_salt, token_hash FROM pairings WHERE consumed=0`)
+	rows, err := s.db.Query(`SELECT id, code_salt, token_hash FROM pairings WHERE consumed=0 ORDER BY created_at DESC LIMIT ?`, pairingScanCap)
 	if err != nil {
 		return nil, err
 	}
@@ -387,7 +395,7 @@ func (s *Store) PairingState(p *Pairing) string {
 	}
 	if p.State == "pending" {
 		if exp, err := time.Parse(time.RFC3339, p.ExpiresAt); err == nil && time.Now().UTC().After(exp) {
-			s.db.Exec(`UPDATE pairings SET state='expired' WHERE id=?`, p.ID)
+			s.db.Exec(`UPDATE pairings SET state='expired' WHERE id=? AND state='pending'`, p.ID)
 			p.State = "expired"
 		}
 	}
@@ -410,7 +418,7 @@ func (s *Store) RecordPairingAttempt(pairID string, max int) (ok bool, err error
 		return false, err
 	}
 	if attempts >= max {
-		s.db.Exec(`UPDATE pairings SET state='expired' WHERE id=?`, pairID)
+		s.db.Exec(`UPDATE pairings SET state='expired' WHERE id=? AND state='pending'`, pairID)
 		return false, nil
 	}
 	return true, nil
@@ -431,39 +439,69 @@ func (s *Store) ApprovePairing(pairID, code, name string) (bool, string, error) 
 	if subtle.ConstantTimeCompare([]byte(HashSecret(code, codeSalt)), []byte(codeHash)) != 1 {
 		return false, "bad-code", nil
 	}
-	_, err = s.db.Exec(`UPDATE pairings SET state='approved', name=? WHERE id=?`, name, pairID)
-	return err == nil, "", err
+	// Guard on state: a concurrent DenyPairing must win over this approve —
+	// never resurrect a denied pairing.
+	res, err := s.db.Exec(`UPDATE pairings SET state='approved', name=? WHERE id=? AND state='pending'`, name, pairID)
+	if err != nil {
+		return false, "", err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return false, "not-pending", nil
+	}
+	return true, "", nil
 }
 
-func (s *Store) DenyPairing(pairID string) error {
-	_, err := s.db.Exec(`UPDATE pairings SET state='denied' WHERE id=? AND state='pending'`, pairID)
-	return err
-}
-
-// ReopenPairing returns an approved pairing to pending (invalid name retry).
-func (s *Store) ReopenPairing(pairID string) error {
-	_, err := s.db.Exec(`UPDATE pairings SET state='pending' WHERE id=? AND state='approved'`, pairID)
-	return err
-}
-
-// ConsumePairing atomically marks the pairing consumed (single use) and
-// creates the machine. Returns ok=false if it was already consumed.
-func (s *Store) ConsumePairing(p *Pairing) (bool, error) {
-	res, err := s.db.Exec(`UPDATE pairings SET consumed=1 WHERE id=? AND consumed=0`, p.ID)
+// DenyPairing transitions pending → denied. changed=false means the pairing
+// was already in another state (the caller should re-read and show it).
+func (s *Store) DenyPairing(pairID string) (changed bool, err error) {
+	res, err := s.db.Exec(`UPDATE pairings SET state='denied' WHERE id=? AND state='pending'`, pairID)
 	if err != nil {
 		return false, err
 	}
 	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// ConsumePairing atomically marks the pairing consumed (single use) and
+// creates the machine in one transaction: if the machine insert fails
+// (e.g. name UNIQUE conflict from two agents approved under the same name),
+// the pairing stays un-consumed and claimable/inspectable instead of being
+// permanently burned. Returns ok=false if it was already consumed or is no
+// longer approved.
+func (s *Store) ConsumePairing(p *Pairing) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE pairings SET consumed=1 WHERE id=? AND consumed=0 AND state='approved'`, p.ID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
 	if n == 0 {
 		return false, nil
 	}
-	return true, s.CreateMachine(p.Name, p.PubKey, p.Hostname, p.OS, p.Arch, p.AgentVer)
+	if _, err := tx.Exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at)
+		VALUES (?,?,?,?,?,?,?)`, p.Name, p.PubKey, p.Hostname, p.OS, p.Arch, p.AgentVer, now()); err != nil {
+		// consumed=1 rolls back with the transaction: the pairing survives
+		// and the agent surfaces the error (usually a name conflict).
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 // CleanupExpiredPairings deletes terminal-state pairings older than maxAge.
+// Approved-but-never-claimed pairings count as terminal after maxAge: they
+// are claimable indefinitely otherwise, and their token lookup cost is paid
+// on every unauthenticated pair-page request.
 func (s *Store) CleanupExpiredPairings(maxAge time.Duration) (int64, error) {
 	cutoff := time.Now().UTC().Add(-maxAge).Format(time.RFC3339)
-	res, err := s.db.Exec(`DELETE FROM pairings WHERE (state IN ('expired','denied') OR consumed=1) AND created_at < ?`, cutoff)
+	res, err := s.db.Exec(`DELETE FROM pairings WHERE (state IN ('expired','denied','approved') OR consumed=1) AND created_at < ?`, cutoff)
 	if err != nil {
 		return 0, err
 	}
@@ -505,7 +543,7 @@ func RedactScrubs(s string) string {
 
 func (s *Store) AuditInsert(ts, machine, command, source string, exitCode sql.NullInt64, stdout, stderr string) error {
 	_, err := s.db.Exec(`INSERT INTO audit (ts, machine, command, source, exit_code, stdout_snip, stderr_snip)
-		VALUES (?,?,?,?,?,?,?)`, ts, machine, command, source, exitCode,
+		VALUES (?,?,?,?,?,?,?)`, ts, machine, snippet(RedactScrubs(command), 4096), source, exitCode,
 		snippet(RedactScrubs(stdout), 4096), snippet(RedactScrubs(stderr), 4096))
 	return err
 }

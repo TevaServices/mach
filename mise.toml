@@ -3,9 +3,9 @@
 # Requires mise: https://mise.jdx.dev (curl https://mise.run | sh)
 
 [tools]
-go = "1.24"
+go = "1.26"
 jq = "1.7"
-curl = "latest"
+curl = "8"
 
 [env]
 CGO_ENABLED = "0"

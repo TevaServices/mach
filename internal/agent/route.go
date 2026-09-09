@@ -68,7 +68,7 @@ func Route(args []string) {
 		switch {
 		case *apiKey != "":
 			if *name == "" {
-				fmt.Print("Machine name (org-prefixed, e.g. "+*org+"-web-1): ")
+				fmt.Print("Machine name (org-prefixed, e.g. " + *org + "-web-1): ")
 				line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 				*name = strings.TrimSpace(line)
 			}

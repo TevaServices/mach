@@ -58,16 +58,16 @@ const pairPageTmpl = `<!doctype html>
 var pairTmpl = template.Must(template.New("pair").Parse(pairPageTmpl))
 
 type pairPageData struct {
-	Error     string
-	Done      bool
-	Name      string
-	State     string
-	Hostname  string
-	OS        string
-	Arch      string
-	AgentVer  string
-	Token     string
-	Orgs      []string
+	Error    string
+	Done     bool
+	Name     string
+	State    string
+	Hostname string
+	OS       string
+	Arch     string
+	AgentVer string
+	Token    string
+	Orgs     []string
 }
 
 func (s *Server) pairPageHandler(w http.ResponseWriter, r *http.Request) {
@@ -78,6 +78,13 @@ func (s *Server) pairPageHandler(w http.ResponseWriter, r *http.Request) {
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
 
+	// Token lookups hash candidates per request; keep the per-IP rate
+	// bounded (generous: a human with a slow connection is nowhere close).
+	if s.pairLookups.record(s.clientIP(r)) {
+		http.Error(w, "too many requests — try again in a few minutes", http.StatusTooManyRequests)
+		return
+	}
+
 	token := r.PathValue("token")
 	p, err := s.st.PairingByToken(token)
 	if err != nil || p == nil {
@@ -87,7 +94,7 @@ func (s *Server) pairPageHandler(w http.ResponseWriter, r *http.Request) {
 	state := s.st.PairingState(p)
 
 	if r.Method == http.MethodPost {
-		s.handlePairPost(w, r, p, state)
+		s.handlePairPost(w, r, p, state, token)
 		return
 	}
 
@@ -102,11 +109,19 @@ func (s *Server) pairPageHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store.Pairing, state string) {
-	_ = r.ParseForm()
+func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store.Pairing, state, token string) {
+	// token is the raw bearer token from the URL path — retry/error renders
+	// reuse it so the retry form posts back to the same working link.
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
 	if r.FormValue("deny") == "1" {
-		_ = s.st.DenyPairing(p.ID)
-		renderPair(w, pairPageData{State: "denied"})
+		if changed, err := s.st.DenyPairing(p.ID); err == nil && changed {
+			renderPair(w, pairPageData{State: "denied"})
+		} else {
+			renderPair(w, pairPageData{State: s.st.PairingState(p)})
+		}
 		return
 	}
 	if state != "pending" {
@@ -122,15 +137,15 @@ func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store
 	// composed name must satisfy the org-prefix rule. Conflicts error out
 	// and require a new name.
 	if !s.orgRegistered(org) {
-		renderPair(w, pairPageData{Error: "Unknown org " + strconv.Quote(org) + " — pick one from the list or use a registered org.", State: "pending-retry", Token: p.ID, Orgs: s.ListOrgs()})
+		renderPair(w, pairPageData{Error: "Unknown org " + strconv.Quote(org) + " — pick one from the list or use a registered org.", State: "pending-retry", Token: token, Orgs: s.ListOrgs()})
 		return
 	}
 	if !store.ValidOrgName(org, name) {
-		renderPair(w, pairPageData{Error: "Machine part must be 1-48 chars (letters/digits/hyphen). Final name: " + org + "-<machine>.", State: "pending-retry", Token: p.ID, Orgs: s.ListOrgs()})
+		renderPair(w, pairPageData{Error: "Machine part must be 1-48 chars (letters/digits/hyphen). Final name: " + org + "-<machine>.", State: "pending-retry", Token: token, Orgs: s.ListOrgs()})
 		return
 	}
 	if existing, _ := s.st.MachineByName(name); existing != nil {
-		renderPair(w, pairPageData{Error: "Machine name already taken — pick a new name (e.g. " + name + "-2).", State: "pending-retry", Token: p.ID, Orgs: s.ListOrgs()})
+		renderPair(w, pairPageData{Error: "Machine name already taken — pick a new name (e.g. " + name + "-2).", State: "pending-retry", Token: token, Orgs: s.ListOrgs()})
 		return
 	}
 
@@ -147,7 +162,12 @@ func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store
 				renderPair(w, pairPageData{Error: "Too many wrong code attempts — this pairing is expired. Run enrollment again on the machine.", State: "expired"})
 				return
 			}
-			renderPair(w, pairPageData{Error: "Wrong code. Do not approve unless you can read the agent's console.", State: "pending-retry", Token: p.ID, Orgs: s.ListOrgs()})
+			renderPair(w, pairPageData{Error: "Wrong code. Do not approve unless you can read the agent's console.", State: "pending-retry", Token: token, Orgs: s.ListOrgs()})
+			return
+		}
+		if why == "not-pending" {
+			// A concurrent deny/expiry won the race; show the real state.
+			renderPair(w, pairPageData{State: s.st.PairingState(p), Orgs: s.ListOrgs()})
 			return
 		}
 		renderPair(w, pairPageData{State: why, Orgs: s.ListOrgs()})

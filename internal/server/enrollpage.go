@@ -14,15 +14,7 @@ import (
 // agentDir locates the cross-compiled `mach` binaries. The container image
 // ships them at /opt/mach-agents; local dev builds to ./bin/cross.
 // Override with MACH_AGENT_DIR.
-func (s *Server) agentDir() string {
-	if v := os.Getenv("MACH_AGENT_DIR"); v != "" {
-		return v
-	}
-	if _, err := os.Stat("/opt/mach-agents"); err == nil {
-		return "/opt/mach-agents"
-	}
-	return "bin/cross"
-}
+func (s *Server) agentDir() string { return agentDirPath() }
 
 // knownAgentFiles is the strict allowlist of shippable binaries — download
 // requests must name exactly one of these; nothing user-controlled passes.
@@ -72,9 +64,9 @@ func detectArchFromUA(ua string) string {
 
 type enrollData struct {
 	Orgs      []string
-	PrimaryDL string   // /download/<file> for the detected OS
-	PrimaryFN string   // filename
-	PrimaryOS string   // pretty OS name detected
+	PrimaryDL string // /download/<file> for the detected OS
+	PrimaryFN string // filename
+	PrimaryOS string // pretty OS name detected
 	HasDL     bool
 	All       []platformRow
 }

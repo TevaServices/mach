@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -38,7 +39,8 @@ func StateDirDefault() string {
 
 func LoadConfig() (*Config, error) {
 	dir := StateDirDefault()
-	raw, err := os.ReadFile(filepath.Join(dir, "console.json"))
+	path := filepath.Join(dir, "console.json")
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, errNotConfigured{dir: dir}
 	}
@@ -48,6 +50,12 @@ func LoadConfig() (*Config, error) {
 	}
 	if c.Server == "" || c.APIKey == "" {
 		return nil, fmt.Errorf("console.json needs \"server\" and \"api_key\"")
+	}
+	// A config holding a bearer key must never be group/world-readable
+	// (e.g. restored from an archive with different perms).
+	if st, serr := os.Stat(path); serr == nil && st.Mode().Perm() != 0o600 {
+		fmt.Fprintf(os.Stderr, "mach: warning: %s had permissions %v; tightening to 0600\n", path, st.Mode().Perm())
+		_ = os.Chmod(path, 0o600)
 	}
 	return &c, nil
 }
@@ -62,17 +70,17 @@ func (e errNotConfigured) Error() string {
 }
 
 // DefaultClient builds a client from the saved console config.
-func DefaultClient() *client {
+func DefaultClient() (*client, error) {
 	cfg, err := LoadConfig()
 	if err != nil {
-		panic(err) // callers check config first
+		return nil, err
 	}
-	return New(cfg)
+	return New(cfg), nil
 }
 
 type client struct {
-	cfg    *Config
-	http   *http.Client
+	cfg  *Config
+	http *http.Client
 }
 
 func New(cfg *Config) *client {
@@ -101,7 +109,13 @@ func (c *client) do(method, path string, body any, out any) error {
 		return err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	const maxResp = 8 << 20
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, maxResp))
+	if len(data) == maxResp {
+		// Failing open here would surface as a confusing JSON unmarshal
+		// error; say what actually happened.
+		return fmt.Errorf("server response exceeded %d MiB", maxResp>>20)
+	}
 	if resp.StatusCode >= 300 {
 		var e struct {
 			Error string `json:"error"`
@@ -136,11 +150,11 @@ type ExecResult struct {
 }
 
 type auditEntry struct {
-	TS       string  `json:"ts"`
-	Machine  string  `json:"machine"`
-	Command  string  `json:"command"`
-	Source   string  `json:"source"`
-	ExitCode *int64  `json:"exit_code"`
+	TS       string `json:"ts"`
+	Machine  string `json:"machine"`
+	Command  string `json:"command"`
+	Source   string `json:"source"`
+	ExitCode *int64 `json:"exit_code"`
 }
 
 func (c *client) Machines() ([]MachineInfo, error) {
@@ -223,7 +237,7 @@ func (c *client) Console(machine string) int {
 func (c *client) Audit(machine string, limit int) int {
 	q := fmt.Sprintf("?limit=%d", limit)
 	if machine != "" && machine != "*" {
-		q += "&machine=" + machine
+		q += "&machine=" + url.QueryEscape(machine)
 	}
 	var resp struct {
 		Entries []auditEntry `json:"entries"`
@@ -244,13 +258,16 @@ func (c *client) Audit(machine string, limit int) int {
 
 func oneLine(s string) string {
 	s = strings.ReplaceAll(s, "\n", " ⏎ ")
-	if len(s) > 120 {
-		s = s[:117] + "..."
+	// Trim on a rune boundary so multi-byte UTF-8 isn't split.
+	if runes := []rune(s); len(runes) > 117 {
+		s = string(runes[:117]) + "..."
 	}
 	return s
 }
 
-// InterruptGuard cancels the in-flight request on Ctrl-C.
+// InterruptGuard exits immediately on Ctrl-C / SIGTERM. (There is no
+// in-flight request to cancel in the one-shot exec path; output printed
+// so far stands.)
 func InterruptGuard() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)

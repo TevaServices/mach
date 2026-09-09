@@ -248,6 +248,100 @@ func TestCleanupExpiredPairings(t *testing.T) {
 	}
 }
 
+func TestConsumePairingFailureDoesNotBurnToken(t *testing.T) {
+	st := testStore(t)
+	// A machine with the target name already exists: the claim insert will
+	// fail on UNIQUE. The pairing must survive un-consumed and inspectable.
+	if err := st.CreateMachine("bcross-x", "other-pub", "", "", "", ""); err != nil {
+		t.Fatalf("seed machine: %v", err)
+	}
+	id, token, code, err := st.CreatePairing("pubkey-hex", "host", "", "", "", time.Minute)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if ok, why, err := st.ApprovePairing(id, code, "bcross-x"); err != nil || !ok || why != "" {
+		t.Fatalf("approve: ok=%v why=%q err=%v", ok, why, err)
+	}
+	p := mustPairingByToken(t, st, token)
+	consumed, err := st.ConsumePairing(p)
+	if err == nil || consumed {
+		t.Fatalf("expected error from conflicting insert, got consumed=%v err=%v", consumed, err)
+	}
+	// The pairing must NOT be consumed: state still readable, machine absent.
+	if got := st.PairingState(p); got != "approved" {
+		t.Fatalf("state after failed claim = %q, want approved (token burned)", got)
+	}
+	if m, _ := st.MachineByPubKey("pubkey-hex"); m != nil {
+		t.Fatal("machine created despite insert failure")
+	}
+}
+
+func TestApproveAfterDenyCannotResurrect(t *testing.T) {
+	st := testStore(t)
+	id, _, code, err := st.CreatePairing("p", "h", "", "", "", time.Minute)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if changed, err := st.DenyPairing(id); err != nil || !changed {
+		t.Fatalf("deny: changed=%v err=%v", changed, err)
+	}
+	ok, why, err := st.ApprovePairing(id, code, "bcross-x")
+	// Either the pre-check sees "denied", or the guard catches the race and
+	// reports "not-pending" — either way a denied pairing must not resurrect.
+	if ok || err != nil || (why != "denied" && why != "not-pending") {
+		t.Fatalf("approve after deny: ok=%v why=%q err=%v (denied pairing resurrected)", ok, why, err)
+	}
+	// Read state by ID directly.
+	var state string
+	if err := st.db.QueryRow(`SELECT state FROM pairings WHERE id=?`, id).Scan(&state); err != nil {
+		t.Fatalf("state read: %v", err)
+	}
+	if state != "denied" {
+		t.Fatalf("state = %q, want denied (deny lost to a concurrent approve)", state)
+	}
+}
+
+func TestApprovedPairingCleanup(t *testing.T) {
+	st := testStore(t)
+	// Approved-but-never-claimed pairings age out of the table too: an
+	// approval token must not remain claimable forever.
+	id, token, code, err := st.CreatePairing("p", "h", "", "", "", time.Hour)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if ok, why, err := st.ApprovePairing(id, code, "bcross-old"); err != nil || !ok {
+		t.Fatalf("approve: %v %q %v", ok, why, err)
+	}
+	past := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	if _, err := st.db.Exec(`UPDATE pairings SET created_at=? WHERE id=?`, past, id); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	if n, err := st.CleanupExpiredPairings(0); err != nil || n != 1 {
+		t.Fatalf("cleanup removed %d (err %v), want 1", n, err)
+	}
+	if p, _ := st.PairingByToken(token); p != nil {
+		t.Fatal("stale approved pairing still claimable after cleanup")
+	}
+}
+
+func TestAuditCommandRedacted(t *testing.T) {
+	st := testStore(t)
+	if err := st.AuditInsert(now(), "bcross-a", `curl -H 'Authorization: Bearer tok123'`, "console:k",
+		sql.NullInt64{Int64: 0, Valid: true}, "", ""); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	entries, err := st.AuditList("bcross-a", 10)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("list: %v len=%d", err, len(entries))
+	}
+	if strings.Contains(entries[0].Command, "tok123") {
+		t.Fatalf("command stored unredacted: %q", entries[0].Command)
+	}
+	if !strings.Contains(entries[0].Command, "Authorization=[REDACTED]") {
+		t.Fatalf("redaction marker missing: %q", entries[0].Command)
+	}
+}
+
 func mustPairingByToken(t *testing.T, st *Store, token string) *Pairing {
 	t.Helper()
 	p, err := st.PairingByToken(token)

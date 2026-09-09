@@ -53,6 +53,11 @@ func LoadOrCreate(stateDir string) (*Identity, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The 0600 guarantee normally holds from first-run creation, but a
+	// manual copy or backup restore can leave the key loose: tighten it.
+	if st, serr := os.Stat(keyPath); serr == nil && st.Mode().Perm() != 0o600 {
+		_ = os.Chmod(keyPath, 0o600)
+	}
 	b, err := hex.DecodeString(string(raw))
 	if err != nil || len(b) != ed25519.PrivateKeySize {
 		return nil, errors.New("corrupt agent key at " + keyPath + " — delete it and re-enroll")

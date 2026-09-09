@@ -23,7 +23,7 @@ type AgentConn struct {
 
 type Broker struct {
 	mu      sync.RWMutex
-	agents  map[string]*AgentConn          // by machine name
+	agents  map[string]*AgentConn                 // by machine name
 	waiters map[string]map[chan struct{}]struct{} // name -> waiters for reconnect
 }
 
@@ -42,8 +42,19 @@ func (b *Broker) Add(a *AgentConn) {
 		go old.Conn.Close()
 	}
 	b.agents[a.Name] = a
+	// Wake anything waiting on this machine's reconnect.
+	var waiters []chan struct{}
+	for ch := range b.waiters[a.Name] {
+		waiters = append(waiters, ch)
+	}
 	b.mu.Unlock()
 	log.Printf("broker: agent online: %s (%s/%s %s)", a.Name, a.OS, a.Arch, a.AgentVer)
+	for _, ch := range waiters {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // Remove drops the agent connection if it is still the same one.

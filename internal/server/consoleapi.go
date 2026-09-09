@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bcross/mach/internal/protocol"
@@ -12,6 +13,8 @@ import (
 )
 
 // authConsole requires a valid API key (Bearer) and rate-limits failures.
+// Only FAILED attempts count toward the limit — successful requests from a
+// busy CI box must never trip the limiter.
 func (s *Server) authConsole(next func(w http.ResponseWriter, r *http.Request, keyName, scopes string)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
@@ -21,7 +24,7 @@ func (s *Server) authConsole(next func(w http.ResponseWriter, r *http.Request, k
 			return
 		}
 		ip := s.clientIP(r)
-		if s.authFails.tooMany(ip) {
+		if s.authFails.blocked(ip) {
 			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many failed auth attempts"})
 			return
 		}
@@ -31,6 +34,7 @@ func (s *Server) authConsole(next func(w http.ResponseWriter, r *http.Request, k
 			return
 		}
 		if !ok {
+			s.authFails.record(ip)
 			s.authFail(w, "invalid api key")
 			return
 		}
@@ -42,13 +46,14 @@ func (s *Server) authFail(w http.ResponseWriter, msg string) {
 	writeJSON(w, http.StatusForbidden, map[string]string{"error": msg})
 }
 
-// ---- GET /v1/machines (readonly or exec scope) ----
+// ---- GET /v1/machines (readonly, or exec keys — allowlist-filtered) ----
 
 func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
-	if scopes != "readonly" && !hasScope(scopes, "exec") && !hasScope(scopes, "enroll") {
+	if scopes != "readonly" && !hasScope(scopes, "exec") {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key lacks machine-list scope"})
 		return
 	}
+	allowed, all := execAllowlist(scopes)
 	machines, err := s.st.ListMachines()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
@@ -60,12 +65,24 @@ func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request, keyName,
 		if m.Revoked {
 			continue
 		}
+		if !all && !containsFold(allowed, m.Name) {
+			continue
+		}
 		resp.Machines = append(resp.Machines, protocol.MachineInfo{
 			Name: m.Name, Hostname: m.Hostname, OS: m.OS, Arch: m.Arch,
 			Online: online[m.Name], AgentVer: m.AgentVer, CreatedAt: m.CreatedAt,
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func containsFold(list []string, s string) bool {
+	for _, v := range list {
+		if strings.EqualFold(v, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- POST /v1/exec (exec scope; allowlist-checked per machine) ----
@@ -140,10 +157,22 @@ func (s *Server) auditExec(pe *pendingExec, exitCode int, stdout, stderr string)
 		sql.NullInt64{Int64: int64(exitCode), Valid: true}, stdout, stderr)
 }
 
-// ---- GET /v1/audit (readonly or exec scope) ----
+// ---- GET /v1/audit (readonly, or exec keys — allowlist-filtered) ----
 
 func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
+	// Audit entries carry command output: restrict to readonly (full) or
+	// exec keys (allowlist keys see only their machines). Enroll keys get
+	// nothing — they are distributed into provisioning pipelines.
+	if scopes != "readonly" && !hasScope(scopes, "exec") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key lacks audit scope"})
+		return
+	}
+	allowed, all := execAllowlist(scopes)
 	machine := r.URL.Query().Get("machine")
+	if !all && machine != "" && machine != "*" && !containsFold(allowed, machine) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key is not scoped for machine " + machine})
+		return
+	}
 	limit := 50
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
@@ -166,6 +195,9 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, keyName, sc
 	}
 	rows := make([]auditRow, 0, len(entries))
 	for _, e := range entries {
+		if !all && !containsFold(allowed, e.Machine) {
+			continue
+		}
 		var ec *int64
 		if e.ExitCode.Valid {
 			v := e.ExitCode.Int64
@@ -176,7 +208,7 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, keyName, sc
 	writeJSON(w, http.StatusOK, map[string]any{"entries": rows})
 }
 
-// ---- POST /v1/admin/revoke (enroll-scoped or exec:* keys) ----
+// ---- POST /v1/admin/revoke (exec:* keys only) ----
 
 func (s *Server) handleRevokeMachine(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
 	var req struct {
@@ -187,7 +219,11 @@ func (s *Server) handleRevokeMachine(w http.ResponseWriter, r *http.Request, key
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json"})
 		return
 	}
-	if !hasScope(scopes, "enroll") && scopes != "exec:*" {
+	// Revocation (and especially audit purging) is a destructive,
+	// fleet-wide admin action: require the unrestricted exec:* key.
+	// Enroll-scoped keys live in provisioning pipelines and must never
+	// revoke — or worse, erase another machine's audit trail.
+	if !hasScope(scopes, "exec") || !keyCanExecOn(scopes, "*") {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key lacks revoke scope"})
 		return
 	}
