@@ -153,10 +153,18 @@ func handleExec(conn *protocol.WSConn, env protocol.Envelope) {
 	case len(cmd.Argv) > 0:
 		// No-shell mode: execve exactly these arguments. argv[0] is the
 		// binary (PATH-looked-up); nothing on the agent side parses,
-		// splits, or re-quotes anything.
+		// splits, or re-quotes anything. On Windows, Go's os/exec applies
+		// standard Win32 argument escaping, preserving byte-exact args.
 		c = exec.CommandContext(ctx, cmd.Argv[0], cmd.Argv[1:]...)
 	default:
-		c = exec.CommandContext(ctx, "sh", "-c", cmd.Command)
+		// Shell mode: one parse by the OS-appropriate default shell
+		// (bash→sh on unix, PowerShell→cmd on Windows).
+		sh, err := resolveShell()
+		if err != nil {
+			replyExec(conn, env.ReqID, protocol.ExecResult{Error: err.Error(), ExitCode: 126})
+			return
+		}
+		c = exec.CommandContext(ctx, sh.path, sh.args(cmd.Command)...)
 	}
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout

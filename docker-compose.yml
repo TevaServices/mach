@@ -1,14 +1,16 @@
-# The control plane container also carries machctl as its entrypoint, so
-# `docker compose run --rm mach add-api-key ...` works against the same DB.
+# Control plane container. Admin commands against the same DB:
+#   docker compose run --rm mach-server add-api-key <name> <key>
 
 services:
-  mach:
+  mach-server:
     build: .
     image: mach-controlplane:latest
-    container_name: mach
+    container_name: mach-server
     restart: unless-stopped
     ports:
       - "127.0.0.1:8080:8080"   # put Caddy/nginx TLS in front for public exposure
     volumes:
       - ./data:/data
-    command: ["serve", "--listen", ":8080", "--public-url", "${MACH_PUBLIC_URL}"]
+    environment:
+      MACH_PUBLIC_URL: ${MACH_PUBLIC_URL}
+      MACH_LISTEN: ":8080"

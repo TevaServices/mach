@@ -137,7 +137,7 @@ approved:
 		return nil, err
 	}
 	fmt.Printf("Enrolled as machine %q.\n", cfg.Name)
-	fmt.Println("Start the daemon with:  machd run   (or install with: machd install)")
+	fmt.Println("Run the agent with:  mach run   (or make it permanent with: mach install)")
 	return cfg, nil
 }
 

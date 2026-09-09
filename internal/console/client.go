@@ -24,14 +24,23 @@ type Config struct {
 	APIKey string `json:"api_key"`
 }
 
-func LoadConfig() (*Config, error) {
-	dir, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
+// StateDirDefault is where console config lives (same state dir as the agent).
+func StateDirDefault() string {
+	if v := os.Getenv("MACH_STATE_DIR"); v != "" {
+		return v
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, ".mach", "console.json"))
+	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil, fmt.Errorf("console not configured: create ~/.mach/console.json with {\"server\": \"https://...\", \"api_key\": \"...\"}")
+		return ".mach"
+	}
+	return filepath.Join(home, ".mach")
+}
+
+func LoadConfig() (*Config, error) {
+	dir := StateDirDefault()
+	raw, err := os.ReadFile(filepath.Join(dir, "console.json"))
+	if err != nil {
+		return nil, errNotConfigured{dir: dir}
 	}
 	var c Config
 	if err := json.Unmarshal(raw, &c); err != nil {
@@ -41,6 +50,24 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("console.json needs \"server\" and \"api_key\"")
 	}
 	return &c, nil
+}
+
+type errNotConfigured struct{ dir string }
+
+// NotConfiguredError is returned when no console config exists yet.
+type NotConfiguredError = errNotConfigured
+
+func (e errNotConfigured) Error() string {
+	return "not configured yet — run plain `mach` for one-time setup (or create " + e.dir + "/console.json)"
+}
+
+// DefaultClient builds a client from the saved console config.
+func DefaultClient() *client {
+	cfg, err := LoadConfig()
+	if err != nil {
+		panic(err) // callers check config first
+	}
+	return New(cfg)
 }
 
 type client struct {
@@ -92,12 +119,13 @@ func (c *client) do(method, path string, body any, out any) error {
 }
 
 type MachineInfo struct {
-	Name     string `json:"name"`
-	Hostname string `json:"hostname"`
-	OS       string `json:"os"`
-	Arch     string `json:"arch"`
-	Online   bool   `json:"online"`
-	AgentVer string `json:"agent_version"`
+	Name      string `json:"name"`
+	Hostname  string `json:"hostname"`
+	OS        string `json:"os"`
+	Arch      string `json:"arch"`
+	Online    bool   `json:"online"`
+	AgentVer  string `json:"agent_version"`
+	CreatedAt string `json:"created_at"`
 }
 
 type ExecResult struct {
@@ -182,8 +210,7 @@ func (c *client) Console(machine string) int {
 			return 0
 		}
 		if strings.HasPrefix(line, ":!") {
-			local := execLocal(line[2:])
-			_ = local
+			LocalExec(strings.TrimSpace(strings.TrimPrefix(line, ":!")))
 			continue
 		}
 		code := c.Exec(machine, line, 0)
@@ -191,20 +218,6 @@ func (c *client) Console(machine string) int {
 			fmt.Printf("[exit %d]\n", code)
 		}
 	}
-}
-
-func execLocal(cmdline string) int {
-	fmt.Printf("(local) $ %s\n", cmdline)
-	cmd := execLocalCmd(cmdline)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return func() int {
-		if err := cmd.Run(); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		return 0
-	}()
 }
 
 func (c *client) Audit(machine string, limit int) int {
