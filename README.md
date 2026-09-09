@@ -101,13 +101,36 @@ command audit log). Put Caddy/nginx in front for TLS (agents speak wss://).
   key, exit code, output snippets) in the control plane's SQLite.
 - Control plane binds to loopback by default; expose only via your TLS proxy.
 
+### Features (post-limitations, v0.3)
+
+- **E2E encryption**: exec commands and results are sealed with X25519 +
+  ChaCha20-Poly1305 between console and agent; the control plane relays
+  ciphertext and audits a `[E2E sealed command]` placeholder (metadata
+  only: machine, timestamp, source key, exit code). Agents register an
+  X25519 public key at enrollment; consoles fetch it per target. Machines
+  enrolled before this feature re-enroll (or re-register) to get a key —
+  plaintext exec is the automatic fallback for keyless machines.
+- **Confinement**: every remote command runs in its own process group
+  (unix) and is SIGKILL-killed as a tree on timeout — detached
+  grandchildren no longer outlive commands. (Windows: timeout + output
+  caps only.)
+- **Streaming console**: `mach console` runs each command over the
+  streaming endpoint — output arrives live (32 KiB chunks) instead of
+  buffered-at-end; Ctrl-C kills the remote session. Falls back to
+  buffered exec automatically.
+- **Postgres backing (optional)**: `MACH_DB=postgres://…` swaps SQLite
+  for Postgres (same schema), removing the single-writer constraint for
+  larger fleets. SQLite stays the default (WAL + capped connections).
+
 ### Known limitations (pre-1.0, honest list)
 
-- No application-layer E2E encryption yet: the control plane can read
-  command content (TLS protects the wire). Obvious v1.1 item.
-- No per-machine command allow/deny policies yet.
-- `mach console` is line-based, not a PTY (no TUI apps / streaming).
-- SQLite = single-writer; fine for a household fleet, not a datacenter.
+- The policy layer (`deny:`/`allowonly`) is a foot-guard, not a sandbox —
+  OS confinement (pgroup/rlimit) bounds damage but no seccomp/Seatbelt
+  profile exists yet.
+- `mach console` streams output but is not a kernel PTY: no echo/line
+  discipline; full-screen TUI apps (vim, htop) still need a real PTY.
+- No signed release manifests for the agent binaries shipped in the
+  container image (updates pushed at runtime ARE signature-verified).
 
 ## Build
 

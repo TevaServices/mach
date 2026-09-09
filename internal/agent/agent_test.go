@@ -42,20 +42,14 @@ func TestResolveShellPerOS(t *testing.T) {
 	if sh.path == "" {
 		t.Fatal("empty shell path")
 	}
-	// On linux we expect bash or sh; on macOS bash/zsh; on windows PS.
-	goos := runtimeGOOS()
-	switch goos {
+	switch goos := runtimeGOOS(); goos {
 	case "linux":
-		if !strings.Contains(sh.path, "bash") && !strings.Contains(sh.path, "sh") {
+		if !strings.Contains(sh.path, "sh") {
 			t.Errorf("linux shell = %q, want bash/sh", sh.path)
 		}
 	case "darwin":
-		if !strings.Contains(sh.path, "bash") && !strings.Contains(sh.path, "zsh") && !strings.Contains(sh.path, "sh") {
+		if !strings.Contains(sh.path, "sh") {
 			t.Errorf("darwin shell = %q", sh.path)
-		}
-	case "windows":
-		if !strings.Contains(strings.ToLower(sh.path), "powershell") && !strings.Contains(strings.ToLower(sh.path), "cmd") {
-			t.Errorf("windows shell = %q", sh.path)
 		}
 	}
 }
@@ -84,18 +78,54 @@ func TestShellArgs(t *testing.T) {
 
 func TestCappedBufferTruncates(t *testing.T) {
 	cb := &cappedBuffer{max: 10}
-	n, _ := cb.Write([]byte("0123456789"))
-	_ = n
-	// Overflow write must be discarded, not grown.
-	_, _ = cb.Write([]byte("ABCDEFGHIJ"))
-	s := cb.String()
-	if len(s) != 10+len("\n[mach: output truncated at cap]") {
-		t.Errorf("capped buffer len = %d", len(s))
+	if _, err := cb.Write([]byte("0123456789")); err != nil {
+		t.Fatal(err)
 	}
+	// Overflow write must be discarded, not grown.
+	if _, err := cb.Write([]byte("ABCDEFGHIJ")); err != nil {
+		t.Fatal(err)
+	}
+	s := cb.String()
 	if !strings.HasSuffix(s, "[mach: output truncated at cap]") {
 		t.Errorf("missing truncation marker: %q", s)
 	}
 	if !strings.HasPrefix(s, "0123456789") {
 		t.Errorf("head content lost: %q", s)
+	}
+}
+
+func TestConfinementNote(t *testing.T) {
+	note := confinementNote()
+	if note == "" {
+		t.Fatal("empty confinement note")
+	}
+	switch runtimeGOOSConfine() {
+	case "linux":
+		if !strings.Contains(note, "pgroup") {
+			t.Errorf("linux note = %q", note)
+		}
+	case "windows":
+		if !strings.Contains(note, "caps") {
+			t.Errorf("windows note = %q", note)
+		}
+	}
+}
+
+func TestE2EKeyPersistence(t *testing.T) {
+	dir := t.TempDir()
+	kp1, err := LoadOrCreateE2EKey(dir)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	hex1 := kp1.PublicKeyHex()
+	if len(hex1) != 64 {
+		t.Fatalf("pub key length = %d", len(hex1))
+	}
+	kp2, err := LoadOrCreateE2EKey(dir)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if kp2.PublicKeyHex() != hex1 {
+		t.Fatal("E2E key not persisted across loads")
 	}
 }

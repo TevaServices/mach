@@ -41,21 +41,23 @@ console (mach) ──┘ (TLS, bearer key)
 | Pair-page security headers (CSP default-src 'none', XFO DENY, nosniff, no-referrer) | pairpages.go |
 | Hourly pairing cleanup (24h retention) | server.New goroutine |
 
-## Known gaps (pre-1.0 — do not treat as closed)
+## Known gaps (v0.3 — previously open items now closed are listed in README)
 
-1. **No app-layer E2E encryption**: the control plane can read command
-   content and output. TLS protects the wire only. Mitigation until E2E:
-   treat the control plane host as trusted/high-value.
-2. **Policy is a foot-guard, not a sandbox**: substring matching is
-   bypassable by creative commands; use OS-level confinement for real
-   isolation.
-3. **Single control plane** = availability + integrity SPOF (signed
+1. **Policy remains a foot-guard, not a sandbox**: OS confinement
+   (process-group kill, rlimits on linux, output caps, timeouts) bounds
+   damage but substring allow/deny is still bypassable by creative
+   commands; no seccomp/Seatbelt profile yet.
+2. **Single control plane** = availability + integrity SPOF (signed
    updates prevent code injection, but a malicious DB can still push
    any *correctly signed* binary).
-4. `mach console` is line-based, no PTY; `mach exec` buffers output
-   (capped) rather than streaming.
-5. No signed releases / reproducible-build manifest for the agent
+3. **Streaming console is not a PTY**: live output, yes; echo/line
+   discipline/full-screen TUIs, no.
+4. No signed releases / reproducible-build manifest for the agent
    binaries shipped in the container image.
+
+Closed since v0.2: E2E encryption (X25519+ChaCha20-Poly1305, control
+plane sees metadata only), SQLite single-writer (Postgres DSN support),
+line-based console (streaming endpoint + console rewrite).
 
 ## Deployment checklist
 

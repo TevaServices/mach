@@ -89,8 +89,11 @@ Agent side: `MACH_SERVER`, `MACH_ORG`, `MACH_STATE_DIR`, `MACH_POLICY`,
 
 ## Known limitations (documented, do not hide)
 
-- No end-to-end encryption console→agent yet; the control plane can read
-  command content (TLS protects the wire).
-- Policy layer (`deny:`/`allowonly`) is a foot-guard, not a sandbox.
-- `mach console` is line-based, not a PTY.
-- SQLite = single writer; sized for a household fleet.
+- **E2E encryption is now implemented** (X25519+ChaCha20-Poly1305,
+  control plane sees `[E2E sealed command]` audit placeholders) — but the
+  policy layer is still a foot-guard, not a sandbox.
+- **Streaming console is implemented** (live output chunks, Ctrl-C kills
+  the remote session) — it is still not a kernel PTY: no echo/line
+  discipline, full-screen TUIs need a real PTY.
+- **Postgres backing is implemented** (`MACH_DB=postgres://…`) alongside
+  SQLite (WAL, capped connections) — schema is identical.

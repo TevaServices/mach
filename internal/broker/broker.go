@@ -25,6 +25,7 @@ type Broker struct {
 	mu      sync.RWMutex
 	agents  map[string]*AgentConn                 // by machine name
 	waiters map[string]map[chan struct{}]struct{} // name -> waiters for reconnect
+	streams map[string]*streamBinding             // sessionID -> console relay
 }
 
 func New() *Broker {
@@ -131,4 +132,56 @@ func (b *Broker) OnlineNames() map[string]bool {
 		out[name] = true
 	}
 	return out
+}
+
+// ---- streaming session binding (console ↔ agent relay) ----
+
+// BindStream registers a console session's delivery channel against the
+// machine's live agent connection. The agent pump sends frames tagged with
+// the session ID here; SendToStream pushes them to the bound channel.
+func (b *Broker) BindStream(sessionID string, console chan protocol.Envelope, machine string) {
+	b.mu.Lock()
+	if b.streams == nil {
+		b.streams = map[string]*streamBinding{}
+	}
+	b.streams[sessionID] = &streamBinding{machine: machine, console: console}
+	b.mu.Unlock()
+}
+
+// UnbindStream drops the binding (console disconnect or stream end).
+func (b *Broker) UnbindStream(sessionID string) {
+	b.mu.Lock()
+	delete(b.streams, sessionID)
+	b.mu.Unlock()
+}
+
+// SendToStream routes a frame to the bound console channel, if any.
+func (b *Broker) SendToStream(sessionID string, env protocol.Envelope) {
+	b.mu.Lock()
+	bind, ok := b.streams[sessionID]
+	b.mu.Unlock()
+	if !ok {
+		return
+	}
+	select {
+	case bind.console <- env:
+	default: // slow console: drop the chunk (documented best-effort)
+	}
+}
+
+// StreamTarget returns the agent connection bound to a session's machine,
+// for the console-pump to write exec_stream frames onto.
+func (b *Broker) StreamTarget(sessionID string) *AgentConn {
+	b.mu.Lock()
+	bind, ok := b.streams[sessionID]
+	b.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	return b.Get(bind.machine)
+}
+
+type streamBinding struct {
+	machine string
+	console chan protocol.Envelope
 }

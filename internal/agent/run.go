@@ -83,7 +83,7 @@ func Run(stateDir string) error {
 	backoff := 2 * time.Second
 	for {
 		iterStart := time.Now()
-		err := dialAndServe(cfg, id)
+		err := dialAndServe(cfg, id, stateDir)
 		if errors.Is(err, errShutdown) {
 			return nil
 		}
@@ -115,7 +115,7 @@ var (
 	errRevoked  = errors.New("machine revoked")
 )
 
-func dialAndServe(cfg *Config, id *Identity) error {
+func dialAndServe(cfg *Config, id *Identity, stateDir string) error {
 	url := wsURL(cfg.Server) + "/v1/agent/ws?name=" + urlQueryEscape(cfg.Name)
 	ws, resp, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
@@ -226,7 +226,14 @@ func dialAndServe(cfg *Config, id *Identity) error {
 		}
 		switch env.Type {
 		case "exec":
-			go handleExec(conn, env, execSem)
+			go handleExecFrame(conn, env, execSem, stateDir)
+		case "exec_stream":
+			go handleStream(conn, env, execSem, stateDir)
+		case "stream_stdin", "stream_kill":
+			// Routed to a live session via the stream registry (server
+			// relays by session ID). Sessions not found are ignored —
+			// the console WS already closed.
+			handleStreamInput(env)
 		case "update":
 			if err := handleUpdate(cfg, env); err != nil {
 				log.Printf("agent: update failed: %v", err)
@@ -244,22 +251,21 @@ func dialAndServe(cfg *Config, id *Identity) error {
 // maxConcurrentExec bounds simultaneously running remote commands.
 const maxConcurrentExec = 8
 
-func handleExec(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{}) {
+// runCommandResult executes the ExecCommand JSON payload and returns the
+// result without replying (callers reply or seal as appropriate).
+func runCommandResult(cmdPayload []byte, sem chan struct{}) protocol.ExecResult {
 	var cmd protocol.ExecCommand
-	if err := json.Unmarshal(env.Payload, &cmd); err != nil {
-		replyExec(conn, env.ReqID, protocol.ExecResult{Error: "bad exec payload"})
-		return
+	if err := json.Unmarshal(cmdPayload, &cmd); err != nil {
+		return protocol.ExecResult{Error: "bad exec payload"}
 	}
 	select {
 	case sem <- struct{}{}:
 		defer func() { <-sem }()
 	case <-time.After(10 * time.Second):
-		replyExec(conn, env.ReqID, protocol.ExecResult{Error: "too many concurrent commands on this machine", ExitCode: 126})
-		return
+		return protocol.ExecResult{Error: "too many concurrent commands on this machine", ExitCode: 126}
 	}
 	if reason := globalPolicy.Evaluate(cmd.Command, cmd.Argv); reason != "" {
-		replyExec(conn, env.ReqID, protocol.ExecResult{Error: reason, ExitCode: 126})
-		return
+		return protocol.ExecResult{Error: reason, ExitCode: 126}
 	}
 	timeout := time.Duration(cmd.Timeout) * time.Second
 	if timeout <= 0 {
@@ -279,8 +285,7 @@ func handleExec(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{})
 		// Shell mode: one parse by the OS-appropriate default shell.
 		sh, err := resolveShell()
 		if err != nil {
-			replyExec(conn, env.ReqID, protocol.ExecResult{Error: err.Error(), ExitCode: 126})
-			return
+			return protocol.ExecResult{Error: err.Error(), ExitCode: 126}
 		}
 		c = exec.CommandContext(ctx, sh.path, sh.args(cmd.Command)...)
 	}
@@ -295,6 +300,7 @@ func handleExec(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{})
 	// wait — without it, `sleep 3600 &` style commands hang Wait() forever
 	// past the timeout, leaking the goroutine and losing the result.
 	c.WaitDelay = 10 * time.Second
+	applyConfinement(c)
 	// Do not leak the agent's own environment (MACH_USER, MACH_POLICY, ...)
 	// into every command the control plane runs.
 	c.Env = filteredEnv()
@@ -307,6 +313,9 @@ func handleExec(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{})
 	case ctx.Err() != nil:
 		res.Error = fmt.Sprintf("timed out after %s", timeout)
 		res.ExitCode = -1
+		// Confinement: kill the whole process group so detached
+		// grandchildren don't outlive the command (unix).
+		killProcessTree(c)
 	default:
 		var ee *exec.ExitError
 		if errors.As(runErr, &ee) {
@@ -316,6 +325,11 @@ func handleExec(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{})
 			res.ExitCode = 127
 		}
 	}
+	return res
+}
+
+func handleExec(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{}) {
+	res := runCommandResult(env.Payload, sem)
 	replyExec(conn, env.ReqID, res)
 }
 
