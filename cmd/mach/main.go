@@ -3,14 +3,13 @@
 // The control plane is a separate binary (mach-server) that ships as a
 // container; it is the only publicly reachable component.
 //
-// On an admin/ops machine:
+// On an admin/ops machine (console configured — one-time `mach` wizard):
 //
-//	mach                      → first run: one-time setup wizard; after that:
-//	                          → live machine list + auto-refresh, `!` for a local shell
-//	mach exec <m> <cmd...>    → run a command remotely (exit code = remote exit)
-//	mach exec <m> -- <argv>   → no-shell mode: args pass through byte-exact
-//	mach console <m>          → interactive line-based remote shell
-//	mach audit [m] [n]        → recent command audit log
+//	mach                      → fleet status table (same as `mach list`)
+//	mach exec <machine> <cmd> → one-shot; exit code = remote exit
+//	mach exec <machine> -- <argv> → no-shell mode: args pass through byte-exact
+//	mach console <machine>    → interactive line-based remote shell
+//	mach audit [machine] [n]  → recent command audit log
 //
 // On a machine to be enrolled as a target:
 //
@@ -75,34 +74,35 @@ The control plane is a separate binary: mach-server (runs in a container).
 func bootStrap() {
 	stateDir := agent.StateDir()
 
-	// Fresh target machine: enrollment, then the live connection right here
-	// in this console. The service (persistence across reboots) is a
-	// separate, explicit step: `mach install`.
+	// Admin box (console configured: control plane URL + API key)?
+	// Plain `mach` prints the fleet table — same as `mach list`.
+	if _, err := console.LoadConfig(); err == nil {
+		consoleMain([]string{"list"})
+		return
+	}
+
+	// Configured target (enrolled)? Plain `mach` re-establishes the
+	// machine's live connection in this console.
+	if agent.IsEnrolled(stateDir) {
+		agentMain([]string{"run"})
+		return
+	}
+
+	// Nothing configured: this is a fresh machine to wire in. Enroll via
+	// QR (one URL prompt), then hold the live connection here. Making it
+	// survive reboots is the separate, explicit `mach install`.
+	agentMain([]string{"register"})
 	if !agent.IsEnrolled(stateDir) {
-		agentMain([]string{"register"})
-		if !agent.IsEnrolled(stateDir) {
-			os.Exit(1)
-		}
-		fmt.Println("\nEnrolled. Holding the live connection in this console (Ctrl-C to stop).")
-		fmt.Println("Make it permanent (auto-start + reconnect after reboots):  mach install")
-		agentMain([]string{"run"})
-		return
+		os.Exit(1)
 	}
-
-	// Already a target (enrolled, no console config): start the live
-	// connection in this console.
-	if _, err := console.LoadConfig(); err != nil {
-		agentMain([]string{"run"})
-		return
-	}
-
-	// Admin machine: default fleet UI.
-	consoleMain([]string{})
+	fmt.Println("\nEnrolled. Holding the live connection in this console (Ctrl-C to stop).")
+	fmt.Println("Make it permanent (auto-start + reconnect after reboots):  mach install")
+	agentMain([]string{"run"})
 }
 
 func consoleMain(args []string) {
 	if len(args) == 0 {
-		// Default console UI.
+		// Default console UI: plain fleet status (one shot).
 		if _, err := console.LoadConfig(); err != nil {
 			if isNotConfigured(err) {
 				os.Exit(console.FirstRunWizard())

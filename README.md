@@ -43,7 +43,8 @@ mach
 ```
 
 with no arguments. First run asks for the control plane URL + API key (once);
-after that it shows the live fleet status. Explicit subcommands:
+after that bare `mach` prints the fleet status table — same as `mach list`.
+Explicit subcommands:
 
 | Command | Purpose |
 |---|---|
