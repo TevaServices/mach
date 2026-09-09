@@ -39,9 +39,13 @@ type ExecResult struct {
 
 type ExecRequest struct {
 	Machine string   `json:"machine"`
-	Command string   `json:"command"`           // shell mode: run via sh -c
-	Argv    []string `json:"argv,omitempty"`    // no-shell mode: execve directly, nothing parses anything
-	Timeout int      `json:"timeout,omitempty"` // seconds; 0 = 30
+	Command string   `json:"command"`            // shell mode: run via sh -c
+	Argv    []string `json:"argv,omitempty"`     // no-shell mode: execve directly, nothing parses anything
+	Timeout int      `json:"timeout,omitempty"`  // seconds; 0 = 30
+	Sealed  string   `json:"sealed,omitempty"`   // E2E: base64 sealed ExecCommand (server relays blind)
+	// E2EPub is the console's ephemeral X25519 public key (hex) the agent
+	// seals the result back to. Present only when Sealed is set.
+	E2EPub string `json:"e2e_pub,omitempty"`
 }
 
 type MachinesResponse struct {
@@ -65,6 +69,49 @@ type ExecCommand struct {
 	Command string   `json:"command,omitempty"` // shell mode
 	Argv    []string `json:"argv,omitempty"`    // no-shell mode (argv[0..] via execve)
 	Timeout int      `json:"timeout,omitempty"` // seconds; 0 = 30
+}
+
+// SealedExecCommand is the E2E variant of ExecCommand relayed to the
+// agent: an opaque sealed blob plus the console's ephemeral reply key.
+// The control plane cannot read either component.
+type SealedExecCommand struct {
+	SealedB64 string `json:"sealed_b64"`
+	ReplyPub  string `json:"reply_pub"` // console ephemeral X25519 pubkey (hex)
+	Timeout   int    `json:"timeout,omitempty"`
+}
+
+// ---- streaming console (limitation #3) ----
+
+// StreamStart initiates a streaming exec session (server → agent frame).
+// The agent runs the command, streaming chunks as they arrive, and
+// terminates with a stream_end frame carrying the exit code.
+type StreamStart struct {
+	Command string   `json:"command,omitempty"`
+	Argv    []string `json:"argv,omitempty"`
+}
+
+// StreamOut is a chunk of output (agent → server → console).
+type StreamOut struct {
+	Stream string `json:"stream"` // "stdout" | "stderr"
+	B64    string `json:"b64"`
+}
+
+// StreamEnd terminates a streaming session with the final exit code.
+type StreamEnd struct {
+	ExitCode int    `json:"exit_code"`
+	Error    string `json:"error,omitempty"`
+}
+
+// StreamStdin carries console stdin to the running command (agent-bound).
+type StreamStdin struct {
+	B64 string `json:"b64"`
+	EOF bool   `json:"eof,omitempty"`
+}
+
+// SealedExecResult is the agent's reply when E2E is on: the ExecResult JSON
+// sealed to the console's ephemeral public key carried in ExecRequest.E2EPub.
+type SealedExecResult struct {
+	SealedB64 string `json:"sealed_b64"`
 }
 
 // UpdateCommand pushes a new agent binary from the control plane. The
@@ -102,6 +149,7 @@ type PairApproveRequest struct {
 // completes enrollment and creates the machine (single-use token).
 type PairClaimRequest struct {
 	PubKey string `json:"pub_key"`
+	PubE2E string `json:"pub_e2e,omitempty"` // X25519 public key for E2E exec (hex)
 	Token  string `json:"token"`
 	Name   string `json:"name"`
 }
@@ -109,6 +157,7 @@ type PairClaimRequest struct {
 // PairStartReq is the agent's request to begin a pairing session.
 type PairStartReq struct {
 	PubKey   string `json:"pub_key"`
+	PubE2E   string `json:"pub_e2e,omitempty"` // X25519 public key for E2E exec (hex)
 	Hostname string `json:"hostname,omitempty"`
 	OS       string `json:"os,omitempty"`
 	Arch     string `json:"arch,omitempty"`
@@ -124,6 +173,7 @@ type PairStatusReq struct {
 type RegisterAPIKeyReq struct {
 	APIKey   string `json:"api_key"`
 	PubKey   string `json:"pub_key"`
+	PubE2E   string `json:"pub_e2e,omitempty"` // X25519 public key for E2E exec (hex)
 	Name     string `json:"name"`
 	Hostname string `json:"hostname,omitempty"`
 	OS       string `json:"os,omitempty"`

@@ -15,26 +15,54 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
 
 type Store struct {
-	db *sql.DB
+	db    *sql.DB
+	known string // "sqlite" or "postgres" — feature gating is driver-neutral
 }
 
+// Open opens the store. DSN forms:
+//   - filesystem path (e.g. /data/mach.db) → SQLite, WAL, busy_timeout 5s
+//   - postgres:// or postgresql:// URL      → Postgres (multi-writer-ready;
+//     identical schema via the same migration SQL)
+//
+// Postgres support removes the single-writer limitation for larger fleets;
+// the schema is deliberately portable (AUTOINCREMENT-free, TEXT timestamps).
 func Open(path string) (*Store, error) {
+	if strings.HasPrefix(path, "postgres://") || strings.HasPrefix(path, "postgresql://") {
+		db, err := sql.Open("pgx", path)
+		if err != nil {
+			return nil, err
+		}
+		db.SetMaxOpenConns(25)
+		s := &Store{db: db, known: "postgres"}
+		if err := s.migrate(); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("postgres migrate: %w", err)
+		}
+		return s, nil
+	}
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{db: db}
+	// WAL allows concurrent readers alongside the single writer; cap
+	// connections so writes serialize predictably in-process.
+	db.SetMaxOpenConns(1)
+	s := &Store{db: db, known: "sqlite"}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return s, nil
 }
+
+// Known reports the backing driver ("sqlite" or "postgres").
+func (s *Store) Known() string { return s.known }
 
 func (s *Store) Close() error { return s.db.Close() }
 
@@ -49,7 +77,8 @@ CREATE TABLE IF NOT EXISTS machines (
 	arch TEXT DEFAULT '',
 	agent_version TEXT DEFAULT '',
 	created_at TEXT NOT NULL,
-	revoked INTEGER DEFAULT 0
+	revoked INTEGER DEFAULT 0,
+	pub_e2e TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS api_keys (
 	id INTEGER PRIMARY KEY,
@@ -195,20 +224,21 @@ type Machine struct {
 	AgentVer  string
 	CreatedAt string
 	Revoked   bool
+	PubE2E    string // X25519 public key (hex) for E2E exec encryption
 }
 
-func (s *Store) CreateMachine(name, pubkey, hostname, os, arch, agentVer string) error {
-	_, err := s.db.Exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at)
-		VALUES (?,?,?,?,?,?,?)`, name, pubkey, hostname, os, arch, agentVer, now())
+func (s *Store) CreateMachine(name, pubkey, hostname, os, arch, agentVer, pubE2E string) error {
+	_, err := s.db.Exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at, pub_e2e)
+		VALUES (?,?,?,?,?,?,?,?)`, name, pubkey, hostname, os, arch, agentVer, now(), pubE2E)
 	return err
 }
 
-const machineCols = `id, name, pubkey, hostname, os, arch, agent_version, created_at, revoked`
+const machineCols = `id, name, pubkey, hostname, os, arch, agent_version, created_at, revoked, pub_e2e`
 
 func scanMachine(row interface{ Scan(...any) error }) (*Machine, error) {
 	m := &Machine{}
 	var revoked int
-	err := row.Scan(&m.ID, &m.Name, &m.PubKey, &m.Hostname, &m.OS, &m.Arch, &m.AgentVer, &m.CreatedAt, &revoked)
+	err := row.Scan(&m.ID, &m.Name, &m.PubKey, &m.Hostname, &m.OS, &m.Arch, &m.AgentVer, &m.CreatedAt, &revoked, &m.PubE2E)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -469,7 +499,7 @@ func (s *Store) DenyPairing(pairID string) (changed bool, err error) {
 // the pairing stays un-consumed and claimable/inspectable instead of being
 // permanently burned. Returns ok=false if it was already consumed or is no
 // longer approved.
-func (s *Store) ConsumePairing(p *Pairing) (bool, error) {
+func (s *Store) ConsumePairing(p *Pairing, pubE2E string) (bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, err
@@ -486,8 +516,8 @@ func (s *Store) ConsumePairing(p *Pairing) (bool, error) {
 	if n == 0 {
 		return false, nil
 	}
-	if _, err := tx.Exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at)
-		VALUES (?,?,?,?,?,?,?)`, p.Name, p.PubKey, p.Hostname, p.OS, p.Arch, p.AgentVer, now()); err != nil {
+	if _, err := tx.Exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at, pub_e2e)
+		VALUES (?,?,?,?,?,?,?,?)`, p.Name, p.PubKey, p.Hostname, p.OS, p.Arch, p.AgentVer, now(), pubE2E); err != nil {
 		// consumed=1 rolls back with the transaction: the pairing survives
 		// and the agent surfaces the error (usually a name conflict).
 		return false, err

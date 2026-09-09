@@ -76,6 +76,29 @@ func validPubKey(pk string) error {
 	return err
 }
 
+// validX25519Key checks an E2E public key (64 hex chars; also rejects the
+// all-zero key, which has no DH strength).
+func validX25519Key(pk string) error {
+	if len(pk) != 64 {
+		return errors.New("must be 64 hex chars (x25519)")
+	}
+	b, err := hex.DecodeString(pk)
+	if err != nil {
+		return err
+	}
+	var allZero = true
+	for _, c := range b {
+		if c != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		return errors.New("all-zero key rejected")
+	}
+	return nil
+}
+
 // ---- POST /v1/pair/status  (agent polls while waiting for approval) ----
 
 func (s *Server) handlePairStatus(w http.ResponseWriter, r *http.Request) {
@@ -123,6 +146,14 @@ func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	// Optional E2E key: 64 hex chars when present.
+	pubE2E := strings.TrimSpace(req.PubE2E)
+	if pubE2E != "" {
+		if err := validX25519Key(pubE2E); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "pub_e2e: " + err.Error()})
+			return
+		}
+	}
 	name := strings.TrimSpace(req.Name)
 	if existing, _ := s.st.MachineByPubKey(req.PubKey); existing != nil {
 		if existing.Revoked {
@@ -140,7 +171,7 @@ func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "machine name already taken — pick a new name (e.g. " + name + "-2)"})
 		return
 	}
-	if err := s.st.CreateMachine(name, req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer); err != nil {
+	if err := s.st.CreateMachine(name, req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer, pubE2E); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
 	}
@@ -292,6 +323,13 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key does not match pairing"})
 		return
 	}
+	pubE2E := strings.TrimSpace(req.PubE2E)
+	if pubE2E != "" {
+		if err := validX25519Key(pubE2E); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "pub_e2e: " + err.Error()})
+			return
+		}
+	}
 	state := s.st.PairingState(p)
 	if state != "approved" {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "pairing not approved (state: " + state + ")"})
@@ -301,7 +339,7 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": existing.Name, "server_key": s.serverKeyHex})
 		return
 	}
-	ok, err := s.st.ConsumePairing(p)
+	ok, err := s.st.ConsumePairing(p, pubE2E)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
@@ -317,7 +355,7 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 // ---- exec completion (called from the agent pump above) ----
 
 type pendingExec struct {
-	ch      chan protocol.ExecResult
+	ch      chan execReply
 	machine string
 	command string
 	source  string
@@ -325,7 +363,12 @@ type pendingExec struct {
 
 func (s *Server) completeExec(env protocol.Envelope, fromMachine string) {
 	var res protocol.ExecResult
-	if err := json.Unmarshal(env.Payload, &res); err != nil {
+	var sealed string
+	// Sealed reply (E2E): {"sealed_b64": "..."} — plaintext otherwise.
+	var sealedMsg protocol.SealedExecResult
+	if json.Unmarshal(env.Payload, &sealedMsg) == nil && sealedMsg.SealedB64 != "" {
+		sealed = sealedMsg.SealedB64
+	} else if err := json.Unmarshal(env.Payload, &res); err != nil {
 		res = protocol.ExecResult{Error: "bad exec_result payload"}
 	}
 	s.pendMu.Lock()
@@ -340,7 +383,7 @@ func (s *Server) completeExec(env protocol.Envelope, fromMachine string) {
 	s.pendMu.Unlock()
 	if ok {
 		select {
-		case pe.ch <- res:
+		case pe.ch <- execReply{Result: res, Sealed: sealed}:
 		default:
 		}
 	}

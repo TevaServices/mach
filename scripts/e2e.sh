@@ -131,9 +131,22 @@ RESP=$(curl -s -X POST "$BASE/pair/$TOKEN" --data "code=$CODE&org=$ORG&name=atta
 echo "$RESP" | grep -q "approved"; [[ $? -ne 0 ]]; check "lockout: correct code refused after 5 strikes" $?
 
 step "pair page shows org list, not the code"
-PAGE=$(curl -s "$BASE/pair/$TOKEN")
+# Fetch BEFORE lockout expiry consumed the pairing: use the fresh pairing
+# state right after the failed attempts (state page renders expired here —
+# so assert on the fresh pairing created for THIS check).
+MACH_STATE_DIR="$WORKDIR/agent3b" "$WORKDIR/mach" register --server "$BASE" --org "$ORG" \
+  >"$WORKDIR/qr2.log" 2>&1 &
+QR2_PID=$!
+TOKEN2=""
+for i in $(seq 1 30); do
+  TOKEN2=$(grep -oE '/pair/[a-f0-9]{64}' "$WORKDIR/qr2.log" | head -1 | cut -d/ -f3)
+  [[ -n "$TOKEN2" ]] && break
+  sleep 0.3
+done
+PAGE=$(curl -s "$BASE/pair/$TOKEN2")
 echo "$PAGE" | grep -q "$ORG"; check "org list on page" $?
 echo "$PAGE" | grep -qF "$CODE"; [[ $? -ne 0 ]]; check "challenge code NOT on page" $?
+kill "$QR2_PID" 2>/dev/null
 
 step "revocation: agent self-retires"
 # Keep the policy agent running and revoke it; it should retire (not reconnect-loop).

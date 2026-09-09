@@ -108,6 +108,9 @@ func (s *Server) Routes() http.Handler {
 
 	// Console API (mach CLI, bearer key)
 	mux.HandleFunc("GET /v1/machines", s.authConsole(s.handleMachines))
+	// E2E key distribution: consoles fetch the target machine's X25519
+	// public key (public information; still auth-scoped).
+	mux.HandleFunc("GET /v1/machines/{name}/e2epub", s.authConsole(s.handleE2EPub))
 	mux.HandleFunc("POST /v1/exec", s.authConsole(s.handleExec))
 	mux.HandleFunc("GET /v1/audit", s.authConsole(s.handleAudit))
 
@@ -117,6 +120,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok\n"))
 	})
+	// Streaming console (limitation #3): live output relay. authConsole
+	// works for WS too (bearer header on the upgrade request).
+	mux.HandleFunc("GET /v1/console/stream", s.authConsole(func(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
+		s.handleConsoleStreamWS(w, r, keyName, scopes)
+	}))
 	// Enrollment landing page: OS-detected agent downloads.
 	mux.HandleFunc("GET /{$}", s.handleEnrollRoot)
 	mux.HandleFunc("GET /download/{file}", s.handleAgentDownload)
