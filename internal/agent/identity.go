@@ -1,4 +1,4 @@
-// Package agent implements machd: enrollment (QR or API key), the
+// Package agent implements the mach agent: enrollment (QR or API key), the
 // outbound-only daemon connection, and command execution.
 package agent
 

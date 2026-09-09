@@ -72,7 +72,7 @@ WantedBy=multi-user.target
 			return fmt.Errorf("%s: %v: %s", strings.Join(args, " "), err, out)
 		}
 	}
-	fmt.Printf("Installed and started machd.service (machine %q). It reconnects automatically after reboots and network loss.\n", name)
+	fmt.Printf("Installed and started the mach agent service (machine %q). It reconnects automatically after reboots and network loss.\n", name)
 	return nil
 }
 

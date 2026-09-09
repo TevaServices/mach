@@ -19,7 +19,7 @@ func configPath(stateDir string) string { return filepath.Join(stateDir, "config
 func LoadConfig(stateDir string) (*Config, error) {
 	raw, err := os.ReadFile(configPath(stateDir))
 	if err != nil {
-		return nil, errors.New("not enrolled yet: run `machd register` first (config.json missing in " + stateDir + ")")
+		return nil, errors.New("not enrolled yet: run `mach register` first (config.json missing in " + stateDir + ")")
 	}
 	var c Config
 	if err := json.Unmarshal(raw, &c); err != nil {
