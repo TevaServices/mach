@@ -7,11 +7,12 @@ import (
 	"path/filepath"
 )
 
-// Config is the agent's enrollment state: where the control plane is and
-// what name this machine was given.
+// Config is the agent's enrollment state: where the (pinned) control plane
+// is, what name this machine was given, and the server's public key.
 type Config struct {
-	Server string `json:"server"`
-	Name   string `json:"name"`
+	Server    string `json:"server"`
+	Name      string `json:"name"`
+	ServerKey string `json:"server_key,omitempty"` // hex ed25519 pubkey, pinned at enrollment
 }
 
 func configPath(stateDir string) string { return filepath.Join(stateDir, "config.json") }

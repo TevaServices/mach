@@ -28,11 +28,12 @@ func Route(args []string) {
 	switch cmd {
 	case "register":
 		fs := flag.NewFlagSet("register", flag.ContinueOnError)
-		server := fs.String("server", envOr("MACH_SERVER", ""), "control plane base URL (https://…)")
-		apiKey := fs.String("api-key", "", "enroll headlessly with an API key instead of QR")
-		name := fs.String("name", "", "machine name (api-key enrollment)")
+		serverURL := fs.String("server", envOr("MACH_SERVER", ""), "control plane base URL (https://…)")
+		apiKey := fs.String("api-key", "", "enroll headlessly with an enroll-scoped API key")
+		name := fs.String("name", "", "machine name, org-prefixed: <org>-<machine>")
+		org := fs.String("org", envOr("MACH_ORG", ""), "org prefix (or MACH_ORG env; prompted if empty)")
 		_ = fs.Parse(args[1:])
-		if *server == "" {
+		if *serverURL == "" {
 			// Zero-parameter UX: ask once. (Env MACH_SERVER pre-fills/default.)
 			def := envOr("MACH_SERVER", "")
 			if def != "" {
@@ -41,12 +42,21 @@ func Route(args []string) {
 				fmt.Print("Control plane URL (e.g. https://mach.example.com): ")
 			}
 			line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-			*server = strings.TrimSpace(line)
-			if *server == "" {
-				*server = def
+			*serverURL = strings.TrimSpace(line)
+			if *serverURL == "" {
+				*serverURL = def
 			}
-			if *server == "" {
+			if *serverURL == "" {
 				fmt.Fprintln(os.Stderr, "mach: a control plane URL is required (pass --server or set MACH_SERVER to skip the prompt)")
+				os.Exit(2)
+			}
+		}
+		if *org == "" {
+			fmt.Print("Org prefix for machine names (e.g. bcross): ")
+			line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+			*org = strings.TrimSpace(line)
+			if *org == "" {
+				fmt.Fprintln(os.Stderr, "mach: an org prefix is required (pass --org or set MACH_ORG)")
 				os.Exit(2)
 			}
 		}
@@ -54,12 +64,17 @@ func Route(args []string) {
 		switch {
 		case *apiKey != "":
 			if *name == "" {
-				fmt.Fprintln(os.Stderr, "mach: --name is required with --api-key")
+				fmt.Print("Machine name (org-prefixed, e.g. "+*org+"-web-1): ")
+				line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+				*name = strings.TrimSpace(line)
+			}
+			if *name == "" {
+				fmt.Fprintln(os.Stderr, "mach: a machine name is required")
 				os.Exit(2)
 			}
-			_, err = RegisterAPIKey(*server, *apiKey, *name, stateDir)
+			_, err = RegisterAPIKey(*serverURL, *apiKey, *name, *org, stateDir)
 		default:
-			_, err = RegisterQR(*server, stateDir)
+			_, err = RegisterQR(*serverURL, *org, stateDir)
 		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "mach: "+err.Error())
@@ -96,14 +111,15 @@ func IsEnrolled(stateDir string) bool {
 func usageAgent() {
 	fmt.Fprint(os.Stderr, `mach — agent commands (remote-connection binary)
 
-  mach register [--server URL]            enroll via QR (scan with phone; approve + name it)
-  mach register --api-key K --name N      enroll headlessly
-  mach run                                run the agent daemon (outbound-only connection)
-  mach install                            register the agent as an OS service
-                                          (linux: systemd / macOS: launchd / windows: Task Scheduler)
+  mach register [--server URL] [--org ORG]          enroll via QR (type challenge code on phone)
+  mach register --api-key K --name ORG-machine      enroll headlessly (enroll-scoped key)
+  mach run                                          run the agent daemon (outbound-only connection)
+  mach install                                      register the agent as an OS service
+                                                    (linux: systemd / macOS: launchd / windows: Task Scheduler)
   mach version
 
-The control plane is a separate binary: mach-server (serve, add-api-key, remove-machine).
-Environment: MACH_SERVER, MACH_STATE_DIR
+Machine names are org-prefixed: <org>-<machine> (unique; conflicts error out).
+The control plane is a separate binary: mach-server (serve, add-api-key, revoke-machine).
+Environment: MACH_SERVER, MACH_ORG, MACH_STATE_DIR
 `)
 }

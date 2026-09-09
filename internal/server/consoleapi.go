@@ -11,36 +11,44 @@ import (
 	"github.com/bcross/mach/internal/store"
 )
 
-type ctxKey string
-
-const keyNameKey ctxKey = "key_name"
-
-// authConsole requires a valid API key (Bearer) for the console API.
-func (s *Server) authConsole(next func(w http.ResponseWriter, r *http.Request, keyName string)) http.HandlerFunc {
+// authConsole requires a valid API key (Bearer) and rate-limits failures.
+func (s *Server) authConsole(next func(w http.ResponseWriter, r *http.Request, keyName, scopes string)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		const prefix = "Bearer "
 		if len(auth) <= len(prefix) || auth[:len(prefix)] != prefix {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing bearer key"})
+			s.authFail(w, "missing bearer key")
 			return
 		}
-		key := auth[len(prefix):]
-		ok, name, err := s.st.APIKeyExists(key)
+		ip := s.clientIP(r)
+		if s.authFails.tooMany(ip) {
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many failed auth attempts"})
+			return
+		}
+		ok, name, scopes, err := s.st.APIKeyExists(auth[len(prefix):])
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 			return
 		}
 		if !ok {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid api key"})
+			s.authFail(w, "invalid api key")
 			return
 		}
-		next(w, r, name)
+		next(w, r, name, scopes)
 	}
 }
 
-// ---- GET /v1/machines ----
+func (s *Server) authFail(w http.ResponseWriter, msg string) {
+	writeJSON(w, http.StatusForbidden, map[string]string{"error": msg})
+}
 
-func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request, keyName string) {
+// ---- GET /v1/machines (readonly or exec scope) ----
+
+func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
+	if scopes != "readonly" && !hasScope(scopes, "exec") && !hasScope(scopes, "enroll") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key lacks machine-list scope"})
+		return
+	}
 	machines, err := s.st.ListMachines()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
@@ -49,6 +57,9 @@ func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request, keyName 
 	online := s.br.OnlineNames()
 	resp := protocol.MachinesResponse{Machines: []protocol.MachineInfo{}}
 	for _, m := range machines {
+		if m.Revoked {
+			continue
+		}
 		resp.Machines = append(resp.Machines, protocol.MachineInfo{
 			Name: m.Name, Hostname: m.Hostname, OS: m.OS, Arch: m.Arch,
 			Online: online[m.Name], AgentVer: m.AgentVer, CreatedAt: m.CreatedAt,
@@ -57,9 +68,9 @@ func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request, keyName 
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// ---- POST /v1/exec ----
+// ---- POST /v1/exec (exec scope; allowlist-checked per machine) ----
 
-func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName string) {
+func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
 	var req protocol.ExecRequest
 	if err := readJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json"})
@@ -71,6 +82,10 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName stri
 	}
 	if req.Command != "" && len(req.Argv) > 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provide command or argv, not both"})
+		return
+	}
+	if !keyCanExecOn(scopes, req.Machine) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key is not scoped for machine " + req.Machine})
 		return
 	}
 	if req.Timeout <= 0 {
@@ -121,13 +136,13 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName stri
 }
 
 func (s *Server) auditExec(pe *pendingExec, exitCode int, stdout, stderr string) {
-	s.st.AuditInsert(time.Now().UTC().Format(time.RFC3339), pe.machine, pe.command, pe.source,
+	s.st.AuditInsert(nowRFC3339(), pe.machine, pe.command, pe.source,
 		sql.NullInt64{Int64: int64(exitCode), Valid: true}, stdout, stderr)
 }
 
-// ---- GET /v1/audit ----
+// ---- GET /v1/audit (readonly or exec scope) ----
 
-func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, keyName string) {
+func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
 	machine := r.URL.Query().Get("machine")
 	limit := 50
 	if v := r.URL.Query().Get("limit"); v != "" {
@@ -160,3 +175,40 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, keyName str
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"entries": rows})
 }
+
+// ---- POST /v1/admin/revoke (enroll-scoped or exec:* keys) ----
+
+func (s *Server) handleRevokeMachine(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
+	var req struct {
+		Machine    string `json:"machine"`
+		PurgeAudit bool   `json:"purge_audit"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json"})
+		return
+	}
+	if !hasScope(scopes, "enroll") && scopes != "exec:*" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key lacks revoke scope"})
+		return
+	}
+	m, err := s.st.MachineByName(req.Machine)
+	if err != nil || m == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown machine"})
+		return
+	}
+	if err := s.st.RevokeMachine(req.Machine); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
+		return
+	}
+	if ac := s.br.Get(req.Machine); ac != nil {
+		_ = ac.Conn.WriteEnvelope(protocol.Envelope{Type: "revoked"})
+		ac.Conn.Close()
+	}
+	if req.PurgeAudit {
+		_ = s.st.RemoveMachineAudit(req.Machine)
+	}
+	s.logf("machine revoked: %s (by %s)", req.Machine, keyName)
+	writeJSON(w, http.StatusOK, map[string]string{"ok": "revoked", "machine": req.Machine})
+}
+
+func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }

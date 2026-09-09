@@ -68,8 +68,8 @@ func bold(s string) string { return "\033[1m" + s + "\033[0m" }
 // QR + challenge code on this machine's console, wait for phone approval,
 // then claim the enrollment. The QR points at the CONTROL PLANE — the
 // phone never needs to reach this machine, and the challenge code is never
-// embedded in the QR (the human compares phone page vs this console).
-func RegisterQR(server, stateDir string) (*Config, error) {
+// embedded in the QR (the human reads it HERE and types it on the phone).
+func RegisterQR(server, org, stateDir string) (*Config, error) {
 	id, err := LoadOrCreate(stateDir)
 	if err != nil {
 		return nil, err
@@ -96,17 +96,18 @@ func RegisterQR(server, stateDir string) (*Config, error) {
 	fmt.Println()
 	fmt.Println(qr.ToSmallString(false))
 	fmt.Printf("     %s\n", pairURL)
-	fmt.Println("  2. The phone page shows a challenge code. It must match")
-	fmt.Printf("     this machine's code:  %s\n", bold(start.Code))
-	fmt.Println("  3. Approve and pick a machine name on the phone.")
+	fmt.Println("  2. On the phone page, TYPE this machine's challenge code")
+	fmt.Printf("     (the page never shows it — read it here):  %s\n", bold(start.Code))
+	fmt.Printf("  3. Approve and pick a name starting with your org prefix\n")
+	fmt.Printf("     (%s-<machine>; the operator knows the org).\n", org)
 	fmt.Println()
-	fmt.Println("Waiting for approval (this pairing expires in ~10 minutes)...")
+	fmt.Println("Waiting for approval (this pairing expires in ~10 minutes; 5 wrong code attempts expire it)...")
 	fmt.Println("==========================================================")
 
 	deadline := time.Now().Add(11 * time.Minute)
 	for {
 		if time.Now().After(deadline) {
-			return nil, errors.New("pairing expired before approval — run `machd register` again")
+			return nil, errors.New("pairing expired before approval — run `mach register` again")
 		}
 		st, err := postJSON2[protocol.PairStatusResponse](server, "/v1/pair/status", protocol.PairStatusReq{Token: start.Token})
 		if err != nil {
@@ -116,40 +117,42 @@ func RegisterQR(server, stateDir string) (*Config, error) {
 		case "approved":
 			goto approved
 		case "denied":
-			return nil, errors.New("pairing denied on the phone — run `machd register` again")
+			return nil, errors.New("pairing denied on the phone — run `mach register` again")
 		case "expired":
-			return nil, errors.New("pairing expired — run `machd register` again")
+			return nil, errors.New("pairing expired (or too many wrong code attempts) — run `mach register` again")
 		}
 		time.Sleep(2 * time.Second)
 	}
 approved:
 	// The phone verified the challenge code; claim creates the machine and
-	// burns the one-time token.
+	// burns the one-time token. Response carries the server's public key.
 	claim, err := postJSON2[struct {
-		OK      string `json:"ok"`
-		Machine string `json:"machine"`
+		OK        string `json:"ok"`
+		Machine   string `json:"machine"`
+		ServerKey string `json:"server_key"`
 	}](server, "/v1/pair/claim", protocol.PairClaimRequest{PubKey: id.PubHex, Token: start.Token})
 	if err != nil {
 		return nil, fmt.Errorf("pair claim: %w", err)
 	}
-	cfg := &Config{Server: server, Name: claim.Machine}
+	cfg := &Config{Server: server, Name: claim.Machine, ServerKey: claim.ServerKey}
 	if err := SaveConfig(stateDir, cfg); err != nil {
 		return nil, err
 	}
-	fmt.Printf("Enrolled as machine %q.\n", cfg.Name)
+	fmt.Printf("Enrolled as machine %q (server key pinned).\n", cfg.Name)
 	fmt.Println("Run the agent with:  mach run   (or make it permanent with: mach install)")
 	return cfg, nil
 }
 
-// RegisterAPIKey enrolls headlessly with a pre-shared console API key.
-func RegisterAPIKey(server, apiKey, name, stateDir string) (*Config, error) {
+// RegisterAPIKey enrolls headlessly with an enroll-scoped API key.
+func RegisterAPIKey(server, apiKey, name, org, stateDir string) (*Config, error) {
 	id, err := LoadOrCreate(stateDir)
 	if err != nil {
 		return nil, err
 	}
 	resp, err := postJSON2[struct {
-		OK      string `json:"ok"`
-		Machine string `json:"machine"`
+		OK        string `json:"ok"`
+		Machine   string `json:"machine"`
+		ServerKey string `json:"server_key"`
 	}](server, "/v1/register/apikey", protocol.RegisterAPIKeyReq{
 		APIKey: apiKey, PubKey: id.PubHex, Name: name,
 		Hostname: hostname(), OS: runtime.GOOS, Arch: runtime.GOARCH, AgentVer: Version,
@@ -157,7 +160,7 @@ func RegisterAPIKey(server, apiKey, name, stateDir string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg := &Config{Server: server, Name: resp.Machine}
+	cfg := &Config{Server: server, Name: resp.Machine, ServerKey: resp.ServerKey}
 	if err := SaveConfig(stateDir, cfg); err != nil {
 		return nil, err
 	}

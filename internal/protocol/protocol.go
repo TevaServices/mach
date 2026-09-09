@@ -1,7 +1,3 @@
-// Package protocol defines the wire types shared by machd (agent), the
-// control plane, and the console CLI. All transport framing is JSON over
-// WebSocket, inside an Envelope. Agent identity is an Ed25519 keypair; the
-// control plane knows agents by their public key (hex) + machine name.
 package protocol
 
 import "encoding/json"
@@ -16,19 +12,18 @@ type Envelope struct {
 // ---- agent -> control plane ----
 
 type HelloRequest struct {
-	Auth        string `json:"auth"`                  // "v1 <base64 ed25519 signature>" over name|timestamp
-	PubKey      string `json:"pub_key"`               // hex
-	Name        string `json:"name"`                  // machine name (must match enrollment)
-	Timestamp   string `json:"timestamp"`             // RFC3339, replay window ±5 min
-	AgentVer    string `json:"agent_version,omitempty"`
-	Hostname    string `json:"hostname,omitempty"`
-	OS          string `json:"os,omitempty"`          // e.g. linux
-	Arch        string `json:"arch,omitempty"`        // e.g. arm64
+	Auth      string `json:"auth"`       // "v1 <base64 ed25519 signature>" over name|challenge (connection-bound)
+	PubKey    string `json:"pub_key"`    // hex
+	Name      string `json:"name"`       // machine name (must match enrollment)
+	AgentVer  string `json:"agent_version,omitempty"`
+	Hostname  string `json:"hostname,omitempty"`
+	OS        string `json:"os,omitempty"`
+	Arch      string `json:"arch,omitempty"`
 }
 
 type HelloResponse struct {
-	OK      bool   `json:"ok"`
-	Error   string `json:"error,omitempty"`
+	OK        bool   `json:"ok"`
+	Error     string `json:"error,omitempty"`
 	ServerVer string `json:"server_version,omitempty"`
 }
 
@@ -36,16 +31,16 @@ type ExecResult struct {
 	ExitCode int    `json:"exit_code"`
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
-	Error    string `json:"error,omitempty"` // e.g. binary not found, timeout
+	Error    string `json:"error,omitempty"`
 }
 
 // ---- console/authenticated-clients -> control plane ----
 
 type ExecRequest struct {
 	Machine string   `json:"machine"`
-	Command string   `json:"command"`            // shell mode: run via sh -c
-	Argv    []string `json:"argv,omitempty"`     // no-shell mode: execve directly, nothing parses anything
-	Timeout int      `json:"timeout,omitempty"`  // seconds; 0 = 30
+	Command string   `json:"command"`           // shell mode: run via sh -c
+	Argv    []string `json:"argv,omitempty"`    // no-shell mode: execve directly, nothing parses anything
+	Timeout int      `json:"timeout,omitempty"` // seconds; 0 = 30
 }
 
 type MachinesResponse struct {
@@ -59,8 +54,8 @@ type MachineInfo struct {
 	Arch      string `json:"arch,omitempty"`
 	Online    bool   `json:"online"`
 	AgentVer  string `json:"agent_version,omitempty"`
-	LastSeen  string `json:"last_seen,omitempty"` // RFC3339
-	CreatedAt string `json:"created_at"`          // RFC3339
+	LastSeen  string `json:"last_seen,omitempty"`
+	CreatedAt string `json:"created_at"`
 }
 
 // ---- control plane -> agent ----
@@ -71,12 +66,24 @@ type ExecCommand struct {
 	Timeout int      `json:"timeout,omitempty"` // seconds; 0 = 30
 }
 
+// UpdateCommand pushes a new agent binary from the control plane. The
+// manifest (version + sha256) is signed by the control plane's identity
+// key — agents pin that key at enrollment, so only the genuine control
+// plane can push an update, even over a hijacked channel.
+type UpdateCommand struct {
+	URL     string `json:"url,omitempty"`      // optional direct download (https)
+	DataB64 string `json:"data_b64,omitempty"` // inline binary (small updates)
+	Sha256  string `json:"sha256"`             // integrity: hex digest of the payload
+	Version string `json:"version"`            // target version string
+	SigB64  string `json:"sig"`                // ed25519 sig by server key over "version|sha256"
+}
+
 // ---- QR pairing (unauthenticated browser/phone side) ----
 
 type PairStartResponse struct {
 	PairID  string `json:"pair_id"`
-	Token   string `json:"token"`   // one-time token embedded in the QR URL
-	Code    string `json:"code"`    // challenge code to print on the agent console
+	Token   string `json:"token"`
+	Code    string `json:"code"`    // challenge code to print on the agent console ONLY
 	Expires string `json:"expires"` // RFC3339
 }
 
@@ -86,8 +93,8 @@ type PairStatusResponse struct {
 }
 
 type PairApproveRequest struct {
-	Code    string `json:"code"`    // challenge code typed/compared by human
-	Name    string `json:"name"`    // machine name assigned at approval
+	Code string `json:"code"`
+	Name string `json:"name"`
 }
 
 // PairClaimRequest is sent by the agent after the phone approves; it
@@ -98,8 +105,7 @@ type PairClaimRequest struct {
 	Name   string `json:"name"`
 }
 
-// ---- shared request types (agent enrollment + console API) ----
-
+// PairStartReq is the agent's request to begin a pairing session.
 type PairStartReq struct {
 	PubKey   string `json:"pub_key"`
 	Hostname string `json:"hostname,omitempty"`
@@ -108,10 +114,12 @@ type PairStartReq struct {
 	AgentVer string `json:"agent_version,omitempty"`
 }
 
+// PairStatusReq is the agent's poll while waiting for phone approval.
 type PairStatusReq struct {
 	Token string `json:"token"`
 }
 
+// RegisterAPIKeyReq is headless enrollment (requires an enroll-scoped key).
 type RegisterAPIKeyReq struct {
 	APIKey   string `json:"api_key"`
 	PubKey   string `json:"pub_key"`

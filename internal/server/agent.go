@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bcross/mach/internal/broker"
@@ -30,7 +31,7 @@ func readJSON(r *http.Request, v any) error {
 // ---- POST /v1/pair/start  (agent, unauthenticated but ungranted) ----
 
 func (s *Server) handlePairStart(w http.ResponseWriter, r *http.Request) {
-	if s.tooManyPairStarts(clientIP(r)) {
+	if s.tooManyPairStarts(s.clientIP(r)) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many pairing attempts; try later"})
 		return
 	}
@@ -44,16 +45,21 @@ func (s *Server) handlePairStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if existing, _ := s.st.MachineByPubKey(req.PubKey); existing != nil {
+		if existing.Revoked {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "this agent key is revoked; ask the operator to delete it first"})
+			return
+		}
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "this agent key is already enrolled as " + existing.Name})
 		return
 	}
-	code := store.NewPairingCode()
-	id, token, err := s.st.CreatePairing(req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer, code, "", s.pairingTTL)
+	id, token, code, err := s.st.CreatePairing(req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer, s.pairingTTL)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
 	}
-	s.logf("pair start: id=%s host=%q code=%s", id, req.Hostname, code)
+	s.logf("pair start: id=%s host=%q", id, req.Hostname)
+	// code goes ONLY to the agent console (never into the QR); the phone
+	// must type it blind — that's the anti-QR-theft property.
 	writeJSON(w, http.StatusOK, protocol.PairStartResponse{
 		PairID:  id,
 		Token:   token,
@@ -90,7 +96,7 @@ func (s *Server) handlePairStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// ---- POST /v1/register/apikey  (headless enrollment) ----
+// ---- POST /v1/register/apikey  (headless enrollment; requires an enroll-scoped key) ----
 
 func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
 	var req protocol.RegisterAPIKeyReq
@@ -98,12 +104,12 @@ func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json"})
 		return
 	}
-	ok, _, err := s.st.APIKeyExists(strings.TrimSpace(req.APIKey))
+	ok, _, scopes, err := s.st.APIKeyExists(strings.TrimSpace(req.APIKey))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
 	}
-	if !ok {
+	if !ok || !hasScope(scopes, "enroll") {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid api key"})
 		return
 	}
@@ -112,16 +118,20 @@ func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := strings.TrimSpace(req.Name)
-	if !validMachineName(name) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name must be 1-63 chars: letters, digits, '-'"})
-		return
-	}
 	if existing, _ := s.st.MachineByPubKey(req.PubKey); existing != nil {
+		if existing.Revoked {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "this agent key is revoked"})
+			return
+		}
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "already enrolled as " + existing.Name})
 		return
 	}
+	if !store.ValidOrgName(s.org, name) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name must be org-prefixed (<org>-<machine>, letters/digits/hyphen, machine part 1-48 chars)"})
+		return
+	}
 	if existing, _ := s.st.MachineByName(name); existing != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "machine name already taken"})
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "machine name already taken — pick a new name (e.g. " + name + "-2)"})
 		return
 	}
 	if err := s.st.CreateMachine(name, req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer); err != nil {
@@ -129,19 +139,7 @@ func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logf("api-key enrollment: machine=%s host=%q", name, req.Hostname)
-	writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": name})
-}
-
-func validMachineName(name string) bool {
-	if len(name) < 1 || len(name) > 63 {
-		return false
-	}
-	for _, c := range name {
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
-			return false
-		}
-	}
-	return true
+	writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": name, "server_key": s.serverKeyHex})
 }
 
 // ---- GET /v1/agent/ws  (agent main connection; identity via ed25519) ----
@@ -153,6 +151,15 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown machine", http.StatusUnauthorized)
 		return
 	}
+	if machine.Revoked {
+		ws2, err2 := s.upgrader.Upgrade(w, r, nil)
+		if err2 == nil {
+			conn0 := protocol.NewWSConn(ws2)
+			_ = conn0.WriteEnvelope(protocol.Envelope{Type: "revoked"})
+			conn0.Close()
+		}
+		return
+	}
 	ws, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -160,8 +167,10 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	conn := protocol.NewWSConn(ws)
 	defer conn.Close()
 
-	// Handshake: server sends hello-required, agent replies with signed hello.
-	if err := conn.WriteEnvelope(protocol.Envelope{Type: "hello"}); err != nil {
+	// Replay-proof hello: server sends a random challenge; the agent signs
+	// name|challenge. Captured hellos are worthless on other connections.
+	nonce := store.RandToken(32)
+	if err := conn.WriteEnvelope(protocol.Envelope{Type: "hello", ReqID: nonce}); err != nil {
 		return
 	}
 	env, err := conn.ReadEnvelope()
@@ -170,7 +179,7 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var hr protocol.HelloRequest
-	if err := json.Unmarshal(env.Payload, &hr); err != nil || hr.PubKey != machine.PubKey || verifyAgentHello(machine.PubKey, hr) != nil {
+	if err := json.Unmarshal(env.Payload, &hr); err != nil || hr.PubKey != machine.PubKey || verifyAgentHello(machine.PubKey, hr, nonce) != nil {
 		_ = conn.WriteEnvelope(protocol.Envelope{Type: "hello_result", Payload: mustJSON(protocol.HelloResponse{OK: false, Error: "bad signature or key"})})
 		return
 	}
@@ -180,8 +189,20 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	s.br.Add(ac)
 	defer s.br.Remove(ac)
 
-	// Best-effort runtime metadata refresh.
 	_ = s.st.UpdateMachineMeta(machine.ID, hr.Hostname, hr.OS, hr.Arch, hr.AgentVer)
+
+	// Deliver any queued, signed update before the command loop.
+	if version, sha256Hex, url, dataB64, sigB64, ok, err := s.st.PopPendingUpdate(machine.Name); err == nil && ok {
+		manifest, _ := json.Marshal(protocol.UpdateCommand{
+			URL: url, DataB64: dataB64, Sha256: sha256Hex, Version: version, SigB64: sigB64,
+		})
+		if err := conn.WriteEnvelope(protocol.Envelope{Type: "update", Payload: manifest}); err != nil {
+			// Re-queue on failure so it isn't lost.
+			_ = s.st.QueueUpdate(machine.Name, version, sha256Hex, url, dataB64, sigB64)
+		} else {
+			s.logf("update pushed to %s (v%s)", machine.Name, version)
+		}
+	}
 
 	// Pump: read envelopes from the agent until it disconnects.
 	for {
@@ -201,8 +222,9 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// verifyAgentHello checks the ed25519 signature over (name || "|" || timestamp).
-func verifyAgentHello(pubHex string, hr protocol.HelloRequest) error {
+// verifyAgentHello checks the ed25519 signature over (name|nonce). The
+// nonce is unique per connection, so captured hellos can't be replayed.
+func verifyAgentHello(pubHex string, hr protocol.HelloRequest, nonce string) error {
 	pub, err := hex.DecodeString(pubHex)
 	if err != nil || len(pub) != ed25519.PublicKeySize {
 		return errors.New("bad key")
@@ -211,42 +233,17 @@ func verifyAgentHello(pubHex string, hr protocol.HelloRequest) error {
 	if err != nil {
 		return err
 	}
-	if !ed25519.Verify(ed25519.PublicKey(pub), []byte(helloMessage(hr.Name, hr.Timestamp)), sig) {
+	if !ed25519.Verify(ed25519.PublicKey(pub), []byte(helloMessage(hr.Name, nonce)), sig) {
 		return errors.New("signature mismatch")
-	}
-	ts, err := time.Parse(time.RFC3339, hr.Timestamp)
-	if err != nil {
-		return errors.New("bad timestamp")
-	}
-	if d := time.Since(ts); d > 5*time.Minute || d < -5*time.Minute {
-		return errors.New("stale hello")
 	}
 	return nil
 }
 
-func helloMessage(name, timestamp string) string { return name + "|" + timestamp }
+func helloMessage(name, nonce string) string { return name + "|" + nonce }
 
 func mustJSON(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
-}
-
-// ---- exec completion (called from the agent pump above) ----
-
-func (s *Server) completeExec(env protocol.Envelope) {
-	var res protocol.ExecResult
-	if err := json.Unmarshal(env.Payload, &res); err != nil {
-		res = protocol.ExecResult{Error: "bad exec_result payload"}
-	}
-	s.pendMu.Lock()
-	pe, ok := s.pending[env.ReqID]
-	if ok {
-		delete(s.pending, env.ReqID)
-	}
-	s.pendMu.Unlock()
-	if ok {
-		pe.ch <- res
-	}
 }
 
 // ---- POST /v1/pair/claim  (agent completes enrollment after phone approval) ----
@@ -272,8 +269,7 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if existing, _ := s.st.MachineByPubKey(p.PubKey); existing != nil {
-		// Idempotent: enrolled between approve and claim.
-		writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": existing.Name})
+		writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": existing.Name, "server_key": s.serverKeyHex})
 		return
 	}
 	ok, err := s.st.ConsumePairing(p)
@@ -286,5 +282,61 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logf("pair claimed: machine=%s", p.Name)
-	writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": p.Name})
+	writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": p.Name, "server_key": s.serverKeyHex})
+}
+
+// ---- exec completion (called from the agent pump above) ----
+
+type pendingExec struct {
+	ch      chan protocol.ExecResult
+	machine string
+	command string
+	source  string
+}
+
+func (s *Server) completeExec(env protocol.Envelope) {
+	var res protocol.ExecResult
+	if err := json.Unmarshal(env.Payload, &res); err != nil {
+		res = protocol.ExecResult{Error: "bad exec_result payload"}
+	}
+	s.pendMu.Lock()
+	pe, ok := s.pending[env.ReqID]
+	if ok {
+		delete(s.pending, env.ReqID)
+	}
+	s.pendMu.Unlock()
+	if ok {
+		select {
+		case pe.ch <- res:
+		default:
+		}
+	}
+}
+
+// authFailures tracks failed console-auth attempts per IP for rate limiting.
+type authLimiter struct {
+	mu      sync.Mutex
+	fails   map[string][]time.Time
+}
+
+func (a *authLimiter) tooMany(ip string) bool {
+	now := time.Now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.fails == nil {
+		a.fails = map[string][]time.Time{}
+	}
+	times := a.fails[ip][:0]
+	for _, t := range a.fails[ip] {
+		if now.Sub(t) < 10*time.Minute {
+			times = append(times, t)
+		}
+	}
+	if len(times) >= 20 {
+		a.fails[ip] = times
+		return true
+	}
+	times = append(times, now)
+	a.fails[ip] = times
+	return false
 }
