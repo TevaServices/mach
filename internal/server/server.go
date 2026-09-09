@@ -109,18 +109,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok\n"))
 	})
-	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Write([]byte("mach control plane\n"))
-	})
+	// Enrollment landing page: OS-detected agent downloads.
+	mux.HandleFunc("GET /{$}", s.handleEnrollRoot)
+	mux.HandleFunc("GET /download/{file}", s.handleAgentDownload)
 	return mux
 }
-
-// pairURL is no longer needed (QR encodes the URL client-side).
-func (s *Server) pairURL(token string) string { return s.pubURL + "/pair/" + token }
 
 // clientIP: trust X-Forwarded-For only when the operator enabled proxy mode.
 func (s *Server) clientIP(r *http.Request) string {

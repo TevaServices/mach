@@ -60,16 +60,18 @@ func (p *policy) parse(spec string) {
 	}
 }
 
-// Evaluate returns a refusal reason, or "" to allow.
-func (p *policy) Check(command string, argv []string) string {
+// Evaluate returns a refusal reason, or "" to allow. Matching is done on a
+// whitespace-normalized, lowercased form so deny rules survive arg-splicing
+// (argv joins collapse spaces) — matching is best-effort by design.
+func (p *policy) Evaluate(command string, argv []string) string {
 	p.ensure()
-	lower := strings.ToLower(command)
-	joined := lower
+	joined := strings.ToLower(command)
 	if len(argv) > 0 {
 		joined = strings.ToLower(strings.Join(argv, " "))
 	}
+	joined = strings.Join(strings.Fields(joined), " ")
 	for _, d := range p.deny {
-		if d != "" && strings.Contains(joined, d) {
+		if d != "" && strings.Contains(joined, strings.Join(strings.Fields(d), " ")) {
 			return "denied by policy (matched: " + d + ")"
 		}
 	}
@@ -77,7 +79,7 @@ func (p *policy) Check(command string, argv []string) string {
 		return ""
 	}
 	for _, a := range p.allow {
-		if a != "" && strings.Contains(joined, a) {
+		if a != "" && strings.Contains(joined, strings.Join(strings.Fields(a), " ")) {
 			return ""
 		}
 	}

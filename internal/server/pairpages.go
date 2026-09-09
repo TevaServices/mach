@@ -3,6 +3,7 @@ package server
 import (
 	"html/template"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/bcross/mach/internal/store"
@@ -38,12 +39,15 @@ const pairPageTmpl = `<!doctype html>
 <tr><td style="padding-right:1rem;color:#555;">reports hostname</td><td>{{.Hostname}}</td></tr>
 <tr><td style="color:#555;">reports platform</td><td>{{.OS}}/{{.Arch}} — agent {{.AgentVer}}</td></tr>
 </table>
-<p>Type the <b>6-digit challenge code shown on the agent's console</b> (the machine being enrolled). It is <i>not</i> in this QR/page.</p>
+<p>Type the <b>challenge code shown on the agent's console</b> (12 characters, XXXX-XXXX-XXXX format — the machine being enrolled). It is <i>not</i> in this QR/page.</p>
 <form method="POST" action="/pair/{{.Token}}">
 <label>Challenge code:<br>
-<input name="code" inputmode="numeric" autocomplete="off" required maxlength="6" style="font-size:1.2rem;width:7em;padding:0.4rem;letter-spacing:0.3em;"></label>
-<p><label>Machine name (must start with your org prefix, e.g. <code>{{.OrgPrefix}}</code>):<br>
-<input name="name" required style="font-size:1.2rem;width:16em;padding:0.4rem;" placeholder="{{.OrgPrefix}}&lt;machine&gt;"></label></p>
+<input name="code" autocomplete="off" autocapitalize="characters" spellcheck="false" required minlength="12" maxlength="19" style="font-size:1.2rem;width:16em;padding:0.4rem;letter-spacing:0.15em;text-transform:uppercase;"></label>
+<p><label>Org (pick from the list or free-type a registered one):<br>
+<input name="org" list="orgs" required minlength="2" maxlength="20" style="font-size:1.2rem;width:12em;padding:0.4rem;" placeholder="org">
+<datalist id="orgs">{{range .Orgs}}<option value="{{.}}">{{end}}</datalist></label></p>
+<p><label>Machine name (full name = <code>&lt;org&gt;-&lt;machine&gt;</code>):<br>
+<input name="name" required style="font-size:1.2rem;width:16em;padding:0.4rem;" placeholder="machine-part"></label></p>
 <p><button type="submit" name="approve" value="1" style="font-size:1.1rem;padding:0.6rem 1.4rem;">Approve</button>
 <button type="submit" name="deny" value="1" style="font-size:1.1rem;padding:0.6rem 1.4rem;background:#eee;">Deny</button></p>
 </form>
@@ -63,7 +67,7 @@ type pairPageData struct {
 	Arch      string
 	AgentVer  string
 	Token     string
-	OrgPrefix string
+	Orgs      []string
 }
 
 func (s *Server) pairPageHandler(w http.ResponseWriter, r *http.Request) {
@@ -93,7 +97,7 @@ func (s *Server) pairPageHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		renderPair(w, pairPageData{
 			Hostname: p.Hostname, OS: p.OS, Arch: p.Arch, AgentVer: p.AgentVer,
-			Token: token,
+			Token: token, Orgs: s.ListOrgs(),
 		})
 	}
 }
@@ -109,17 +113,24 @@ func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store
 		renderPair(w, pairPageData{State: state})
 		return
 	}
-	code := strings.TrimSpace(r.FormValue("code"))
-	name := strings.TrimSpace(r.FormValue("name"))
+	code := normalizeCode(r.FormValue("code"))
+	org := strings.ToLower(strings.TrimSpace(r.FormValue("org")))
+	machinePart := strings.TrimSpace(r.FormValue("name"))
+	name := org + "-" + machinePart
 
-	// Org-prefix naming: names must be "<org>-<machine>"; org comes from
-	// server config. Conflicts error out and require a new name.
-	if !store.ValidOrgName(s.org, name) {
-		renderPair(w, pairPageData{Error: "Name must be <org>-<machine> (org " + s.org + "; letters/digits/hyphen). Pick a new name.", State: "pending-retry", Token: p.ID})
+	// Org must be a registered org (dropdown or free-typed), and the
+	// composed name must satisfy the org-prefix rule. Conflicts error out
+	// and require a new name.
+	if !s.orgRegistered(org) {
+		renderPair(w, pairPageData{Error: "Unknown org " + strconv.Quote(org) + " — pick one from the list or use a registered org.", State: "pending-retry", Token: p.ID, Orgs: s.ListOrgs()})
+		return
+	}
+	if !store.ValidOrgName(org, name) {
+		renderPair(w, pairPageData{Error: "Machine part must be 1-48 chars (letters/digits/hyphen). Final name: " + org + "-<machine>.", State: "pending-retry", Token: p.ID, Orgs: s.ListOrgs()})
 		return
 	}
 	if existing, _ := s.st.MachineByName(name); existing != nil {
-		renderPair(w, pairPageData{Error: "Machine name already taken — pick a new name (e.g. " + name + "-2).", State: "pending-retry", Token: p.ID})
+		renderPair(w, pairPageData{Error: "Machine name already taken — pick a new name (e.g. " + name + "-2).", State: "pending-retry", Token: p.ID, Orgs: s.ListOrgs()})
 		return
 	}
 
@@ -136,20 +147,10 @@ func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store
 				renderPair(w, pairPageData{Error: "Too many wrong code attempts — this pairing is expired. Run enrollment again on the machine.", State: "expired"})
 				return
 			}
-			renderPair(w, pairPageData{Error: "Wrong code. Do not approve unless you can read the agent's console. Attempts remaining shown after retry.", State: "pending-retry", Token: p.ID})
+			renderPair(w, pairPageData{Error: "Wrong code. Do not approve unless you can read the agent's console.", State: "pending-retry", Token: p.ID, Orgs: s.ListOrgs()})
 			return
 		}
-		renderPair(w, pairPageData{State: why})
-		return
-	}
-	if !store.ValidOrgName(s.org, name) {
-		_ = s.st.ReopenPairing(p.ID)
-		renderPair(w, pairPageData{Error: "Name must be <org>-<machine>. Pick a new name.", State: "pending-retry", Token: p.ID})
-		return
-	}
-	if existing, _ := s.st.MachineByName(name); existing != nil {
-		_ = s.st.ReopenPairing(p.ID)
-		renderPair(w, pairPageData{Error: "Machine name already taken. Pick a new name.", State: "pending-retry", Token: p.ID})
+		renderPair(w, pairPageData{State: why, Orgs: s.ListOrgs()})
 		return
 	}
 	s.logf("pair approved: id=%s name=%s", p.ID, name)
@@ -160,4 +161,17 @@ func renderPair(w http.ResponseWriter, data pairPageData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = pairTmpl.Execute(w, data)
+}
+
+// normalizeCode uppercases and strips separators so XXXX-XXXX-XXXX can be
+// typed with or without dashes/spaces.
+func normalizeCode(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToUpper(strings.TrimSpace(s)) {
+		if r == '-' || r == ' ' {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

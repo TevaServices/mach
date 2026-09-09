@@ -205,7 +205,7 @@ func handleExec(conn *protocol.WSConn, env protocol.Envelope) {
 		replyExec(conn, env.ReqID, protocol.ExecResult{Error: "bad exec payload"})
 		return
 	}
-	if reason := globalPolicy.Check(cmd.Command, cmd.Argv); reason != "" {
+	if reason := globalPolicy.Evaluate(cmd.Command, cmd.Argv); reason != "" {
 		replyExec(conn, env.ReqID, protocol.ExecResult{Error: reason, ExitCode: 126})
 		return
 	}

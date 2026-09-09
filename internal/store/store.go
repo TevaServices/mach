@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -111,13 +112,28 @@ func randHex(n int) string {
 // RandToken returns a cryptographically random hex token.
 func RandToken(nBytes int) string { return randHex(nBytes) }
 
-// NewPairingCode returns the human challenge code: 6 digits.
-func NewPairingCode() string {
-	b := make([]byte, 3)
+// challengeAlphabet is Crockford-like: no I/L/O/0/1 to avoid transcription
+// errors between a console screen and a phone keyboard.
+const challengeAlphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+// ChallengeCodeLen: 12 chars over a 31-symbol alphabet ≈ 60 bits of
+// entropy. Short numeric codes are disallowed: with the 5-attempt lockout
+// the guessing probability per pairing is ~2^-58.
+const ChallengeCodeLen = 12
+
+// NewChallengeCode returns a human-typeable, high-entropy challenge code,
+// formatted XXXX-XXXX-XXXX.
+func NewChallengeCode() string {
+	b := make([]byte, ChallengeCodeLen)
 	if _, err := rand.Read(b); err != nil {
 		panic(err)
 	}
-	return fmt.Sprintf("%06d", int(b[0])<<16|int(b[1])<<8|int(b[2]))
+	out := make([]byte, ChallengeCodeLen)
+	for i, c := range b {
+		out[i] = challengeAlphabet[int(c)%len(challengeAlphabet)]
+	}
+	s := string(out)
+	return s[0:4] + "-" + s[4:8] + "-" + s[8:12]
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339) }
@@ -316,8 +332,8 @@ func scanPairing(row interface{ Scan(...any) error }) (*Pairing, error) {
 
 func (s *Store) CreatePairing(pubkey, hostname, os, arch, agentVer string, ttl time.Duration) (id, token, code string, err error) {
 	id = randHex(8)
-	token = randHex(16)
-	code = NewPairingCode()
+	token = randHex(32) // 256-bit one-time bearer token in the QR URL
+	code = NewChallengeCode()
 	codeSalt := randHex(16)
 	_, err = s.db.Exec(`INSERT INTO pairings (id, token_hash, pubkey, hostname, os, arch, agent_version, code_hash, code_salt, state, created_at, expires_at)
 		VALUES (?,?,?,?,?,?,?,?,?,'pending',?,?)`,
@@ -329,8 +345,10 @@ func (s *Store) CreatePairing(pubkey, hostname, os, arch, agentVer string, ttl t
 
 func (s *Store) PairingByToken(token string) (*Pairing, error) {
 	// Tokens are hashed under each pairing's own salt; one pass computes the
-	// candidate hash per pending pairing and constant-time compares.
-	rows, err := s.db.Query(`SELECT id, code_salt, token_hash FROM pairings WHERE state IN ('pending','approved') AND consumed=0`)
+	// candidate hash per live (non-consumed) pairing and constant-time
+	// compares. Non-consumed of any state: the agent poller must see the
+	// state transition (expired/denied), not a blind 404.
+	rows, err := s.db.Query(`SELECT id, code_salt, token_hash FROM pairings WHERE consumed=0`)
 	if err != nil {
 		return nil, err
 	}
@@ -360,8 +378,13 @@ func (s *Store) pairingByID(id string) (*Pairing, error) {
 	return scanPairing(s.db.QueryRow(`SELECT `+pairingCols+` FROM pairings WHERE id = ?`, id))
 }
 
-// ExpireIfStale marks a pairing expired if past its expiry.
+// ExpireIfStale marks a pairing expired if past its expiry. Always re-reads
+// state from the DB so callers see attempt-based expirations too.
 func (s *Store) PairingState(p *Pairing) string {
+	fresh, err := s.pairingByID(p.ID)
+	if err == nil && fresh != nil {
+		p.State = fresh.State
+	}
 	if p.State == "pending" {
 		if exp, err := time.Parse(time.RFC3339, p.ExpiresAt); err == nil && time.Now().UTC().After(exp) {
 			s.db.Exec(`UPDATE pairings SET state='expired' WHERE id=?`, p.ID)
@@ -469,22 +492,15 @@ func snippet(s string, n int) string {
 	return s
 }
 
-// RedactScrubs common secret-bearing patterns out of audit snippets.
+// RedactScrubs masks values next to secret-bearing keywords while keeping
+// the keyword visible for audit readability. Everything from the separator
+// to end of line after a keyword is masked (covers "password=x",
+// "password: x", "Bearer xyz", multi-word tokens).
+var secretPattern = regexp.MustCompile(`(?i)(password|passwd|secret|token|api[_-]?key|authorization|private key)\s*[=:]\s*([^'"\n]{0,1000})`)
+
 func RedactScrubs(s string) string {
-	pats := []string{"password", "passwd", "secret", "token", "api_key", "apikey", "BEGIN PRIVATE KEY", "PRIVATE KEY"}
-	lower := strings.ToLower(s)
-	for _, p := range pats {
-		if i := strings.Index(lower, p); i >= 0 {
-			// Redact 200 chars from the match onward (bounded).
-			end := i + 200
-			if end > len(s) {
-				end = len(s)
-			}
-			s = s[:i] + "[REDACTED]" + s[end:]
-			lower = strings.ToLower(s)
-		}
-	}
-	return s
+	s = strings.ReplaceAll(s, "\x00", "")
+	return secretPattern.ReplaceAllString(s, "$1=[REDACTED]")
 }
 
 func (s *Store) AuditInsert(ts, machine, command, source string, exitCode sql.NullInt64, stdout, stderr string) error {

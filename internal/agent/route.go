@@ -51,12 +51,16 @@ func Route(args []string) {
 				os.Exit(2)
 			}
 		}
+		// Infer org from an org-prefixed --name (e.g. bcross-test-01 → bcross).
+		if *org == "" && strings.Contains(*name, "-") {
+			*org = strings.SplitN(*name, "-", 2)[0]
+		}
 		if *org == "" {
 			fmt.Print("Org prefix for machine names (e.g. bcross): ")
 			line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 			*org = strings.TrimSpace(line)
 			if *org == "" {
-				fmt.Fprintln(os.Stderr, "mach: an org prefix is required (pass --org or set MACH_ORG)")
+				fmt.Fprintln(os.Stderr, "mach: an org prefix is required (pass --org/--name or set MACH_ORG)")
 				os.Exit(2)
 			}
 		}
