@@ -6,7 +6,6 @@ package console
 import (
 	"bufio"
 	"bytes"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -21,8 +20,7 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/crypto/curve25519"
+	"github.com/bcross/mach/internal/e2e"
 )
 
 // Config is the console client's local config (~/.mach/console.json).
@@ -251,8 +249,8 @@ func (c *client) sealedExec(machine, command string, argv []string, timeout int,
 		"command": command, "argv": argv,
 		"timeout": mapDefaultTimeout(timeout),
 	})
-	var consoleE2E E2EKeyPair
-	if err := consoleE2E.Generate(); err != nil {
+	consoleE2E, err := newConsoleE2E()
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "mach: e2e: "+err.Error())
 		return 3, true
 	}
@@ -370,103 +368,52 @@ type e2eTarget struct {
 	Note    string `json:"note"`
 }
 
-// E2EKeyPair is the console-side ephemeral X25519 keypair for one exec.
-type E2EKeyPair struct {
-	Private [32]byte
-	Public  [32]byte
+// consoleE2E is the console's half of one sealed exec: a fresh X25519 keypair
+// per command, plus the seal/open helpers.
+//
+// The crypto and the envelope format live in internal/e2e — the same code the
+// agent runs — rather than in a local copy of them. A second implementation of a
+// sealed-message format is how a version field goes missing on one side and
+// sealing fails on a machine that is otherwise perfectly healthy; there is no
+// import cycle to avoid (internal/e2e depends on nothing but the standard library
+// and x/crypto), so there is no reason to carry one.
+type consoleE2E struct {
+	kp *e2e.KeyPair
 }
 
-// Generate creates a fresh keypair.
-func (k *E2EKeyPair) Generate() error {
-	if _, err := rand.Read(k.Private[:]); err != nil {
-		return err
-	}
-	pub, err := curve25519.X25519(k.Private[:], curve25519.Basepoint)
+// newConsoleE2E creates the ephemeral keypair for one command.
+func newConsoleE2E() (*consoleE2E, error) {
+	kp, err := e2e.GenerateKeyPair()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	copy(k.Public[:], pub)
-	return nil
+	return &consoleE2E{kp: kp}, nil
 }
 
-// PublicKeyHex hex-encodes the public half.
-func (k *E2EKeyPair) PublicKeyHex() string {
-	return hex.EncodeToString(k.Public[:])
-}
+// PublicKeyHex is the reply key the agent seals the result back to (hex).
+func (c *consoleE2E) PublicKeyHex() string { return c.kp.PublicKeyHex() }
 
-// Seal encrypts plaintext to a recipient X25519 public key (hex).
-func (k *E2EKeyPair) Seal(recipientPubHex string, plaintext []byte) (sealedB64Payload string, err error) {
+// Seal encrypts the inner command to the machine's X25519 key, returning the
+// base64 blob that goes in the "sealed" field.
+func (c *consoleE2E) Seal(recipientPubHex string, plaintext []byte) (string, error) {
 	pub, err := hex.DecodeString(recipientPubHex)
 	if err != nil {
 		return "", err
 	}
-	senderPub, err := curve25519.X25519(k.Private[:], curve25519.Basepoint)
+	sealed, err := e2e.Seal(pub, plaintext)
 	if err != nil {
 		return "", err
 	}
-	shared, err := curve25519.X25519(k.Private[:], pub)
-	if err != nil {
-		return "", err
-	}
-	aead, err := chacha20poly1305.New(shared)
-	if err != nil {
-		return "", err
-	}
-	nonce := make([]byte, aead.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return "", err
-	}
-	sealed := aead.Seal(nil, nonce, plaintext, senderPub)
-	msg := e2eWire{V: 1, Eph: base64.StdEncoding.EncodeToString(senderPub), Body: base64.StdEncoding.EncodeToString(append(nonce, sealed...))}
-	raw, err := json.Marshal(msg)
-	if err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(raw), nil
+	return base64.StdEncoding.EncodeToString(sealed), nil
 }
 
-// OpenB64 opens a base64(e2e.SealedMessage JSON) with this keypair.
-func (k *E2EKeyPair) OpenB64(b64 string) ([]byte, error) {
+// OpenB64 opens the base64 sealed reply from the machine.
+func (c *consoleE2E) OpenB64(b64 string) ([]byte, error) {
 	raw, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
 		return nil, err
 	}
-	return e2eOpenRaw(&k.Private, raw)
-}
-
-// e2eOpenRaw decrypts a marshaled SealedMessage with the given private key.
-// (Local copy to avoid importing internal/e2e from console — the wire JSON
-// is identical: {"v":1,"eph":...,"body":...}.)
-func e2eOpenRaw(privateKey *[32]byte, sealed []byte) ([]byte, error) {
-	var msg e2eWire
-	if err := json.Unmarshal(sealed, &msg); err != nil {
-		return nil, err
-	}
-	ephPub, err := base64.StdEncoding.DecodeString(msg.Eph)
-	if err != nil || len(ephPub) != 32 {
-		return nil, fmt.Errorf("e2e: bad ephemeral key")
-	}
-	body, err := base64.StdEncoding.DecodeString(msg.Body)
-	if err != nil || len(body) < chacha20poly1305.NonceSize+16 {
-		return nil, fmt.Errorf("e2e: sealed body too short")
-	}
-	nonce, ct := body[:chacha20poly1305.NonceSize], body[chacha20poly1305.NonceSize:]
-	shared, err := curve25519.X25519(privateKey[:], ephPub)
-	if err != nil {
-		return nil, err
-	}
-	aead, err := chacha20poly1305.New(shared)
-	if err != nil {
-		return nil, err
-	}
-	return aead.Open(nil, nonce, ct, ephPub)
-}
-
-// e2eWire mirrors e2e.SealedMessage for the console (kept in sync: v=1).
-type e2eWire struct {
-	V    int    `json:"v"`
-	Eph  string `json:"eph"`
-	Body string `json:"body"`
+	return e2e.Open(&c.kp.Private, raw)
 }
 
 // Exec runs a shell-mode command (parsed once by the remote sh -c).

@@ -203,13 +203,22 @@ only covered at the SQL-translation level.
   layer, so keep new SQL in the `{{ID}}`/`?` style the store's wrappers expect
   rather than hand-writing a dialect.
 - **SealedB64 is base64 of the SealedMessage JSON**
-  (`{"v":1,"eph":...,"body":...}`), and the console's local `e2eWire`
-  copy MUST carry the `v:1` field — a missing `v` fails on the agent
-  with "unsupported sealed message version". The console keeps its own copy of
-  the sealed-message code deliberately (the two packages must not share a
-  dependency edge); `internal/console/client_test.go`'s sealed cases drive a
-  real round trip through `internal/e2e`, so a drift between the copies fails a
-  test rather than a machine.
+  (`{"v":2,"eph":...,"body":...}`). There is exactly one implementation of that
+  format — `internal/e2e`, used by the agent, the console and the tests. Do not
+  reintroduce a copy of it in the console: a second implementation is how a
+  field goes missing on one side and sealing fails on a machine that is
+  otherwise healthy, and there is no dependency edge to avoid (internal/e2e
+  imports only the standard library and x/crypto).
+- **The AEAD key is derived, not the raw DH output.** `deriveKey` runs HKDF over
+  the X25519 shared secret with the recipient's public key and the version bound
+  into the info string, so a ciphertext cannot be re-pointed at another
+  recipient. The nonce stays random per message, which is safe because the
+  sender's key is fresh per message.
+- **The format version is checked on the way in, and only one version is
+  accepted.** An upgrade that has reached one end and not the other therefore
+  fails with "unsupported sealed message version N (this build speaks 2)" rather
+  than an AEAD error that reads like a wrong key. Bumping the derivation means
+  bumping `sealedVersion`; the machine's own key is unaffected by that.
 - **Nonce size**: chacha20poly1305.NonceSize (12 bytes), NOT
   NonceSizeX — mixing them panics on Open.
 - **AAD is the sender's ephemeral pubkey** — both Seal and Open must

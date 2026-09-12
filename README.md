@@ -145,7 +145,8 @@ Put Caddy/nginx in front for TLS (agents speak wss://).
 ### Features (post-limitations, v0.3)
 
 - **E2E encryption, optional and per org**: exec commands and results are
-  sealed with X25519 + ChaCha20-Poly1305 between console and agent; the control
+  sealed with X25519 + ChaCha20-Poly1305 (AEAD key derived with HKDF) between
+  console and agent; the control
   plane relays ciphertext and audits a `[E2E sealed command]` placeholder
   (metadata only: machine, timestamp, source key, exit code). It is a
   server-side setting per org — `mach-server e2e on|off --org X`, default on,
