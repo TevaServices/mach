@@ -49,6 +49,9 @@ type Server struct {
 	// to justify a tighter limit here is gone.
 	pairLookups *ipLimiter
 
+	// global exec policy: server-side block list applied to every client
+	execPolicy execPolicy
+
 	// cleanup ticker stop
 	cleanupStop chan struct{}
 }
@@ -74,10 +77,19 @@ func New(st *store.Store, br *broker.Broker, org, keyPath string) *Server {
 		// its identity key breaks every enrolled agent's update pin.
 		panic("server: identity key: " + err.Error())
 	}
-	// Housekeeping: purge terminal pairings hourly (keep 24h for forensics).
+	if err := s.execPolicy.loadEnv(); err != nil {
+		// Also deliberate: booting without a configured block list because a
+		// volume was not mounted yet is a silent loss of a security control.
+		panic("server: " + execPolicyFileEnv + ": " + err.Error())
+	}
+	s.logExecPolicy()
+	// Housekeeping: purge terminal pairings hourly (keep 24h for forensics),
+	// and pick up global exec-policy edits without a restart.
 	go func() {
 		t := time.NewTicker(time.Hour)
+		pt := time.NewTicker(execPolicyPollInterval)
 		defer t.Stop()
+		defer pt.Stop()
 		for {
 			select {
 			case <-s.cleanupStop:
@@ -89,10 +101,35 @@ func New(st *store.Store, br *broker.Broker, org, keyPath string) *Server {
 				} else if n > 0 {
 					log.Printf("server: pairing cleanup: removed %d", n)
 				}
+			case <-pt.C:
+				if s.execPolicy.reloadFile() {
+					log.Printf("server: %s changed on disk; reloaded", s.execPolicy.Source())
+					s.logExecPolicy()
+				}
 			}
 		}
 	}()
 	return s
+}
+
+// logExecPolicy prints the active global policy at startup (and on reload).
+// The rules are logged even when there are none: "the fleet has no server-side
+// block list" is itself operational information, and its absence from the log
+// is how you would notice the policy was configured in the wrong place.
+func (s *Server) logExecPolicy() {
+	rules := s.execPolicy.Rules()
+	if len(rules) == 0 {
+		log.Printf("server: global exec policy: none configured (%s / %s unset)", execPolicyEnv, execPolicyFileEnv)
+		return
+	}
+	log.Printf("server: global exec policy from %s: %s", s.execPolicy.Source(), strings.Join(rules, " "))
+}
+
+// SetExecPolicy installs global exec rules at runtime and reports what is
+// active. Rules replace (never append to) the previous set.
+func (s *Server) SetExecPolicy(spec string) {
+	s.execPolicy.Replace(spec, "SetExecPolicy")
+	s.logExecPolicy()
 }
 
 // SetTrustProxy controls whether X-Forwarded-For is honored. Only enable

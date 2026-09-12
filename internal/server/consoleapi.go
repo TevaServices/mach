@@ -126,6 +126,18 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key is not scoped for machine " + req.Machine})
 		return
 	}
+	// The fleet-wide block list, checked here — after the caller is
+	// authorized, before anything is dispatched — so every key, every scope
+	// and every machine is subject to it. The refusal is a plain HTTP error
+	// (no stream has started) and is audited like any other attempt, so a
+	// blocked command shows up in the record rather than vanishing.
+	display := commandForDisplay(req.Command, req.Argv)
+	if reason := s.execPolicyCheck(req.Command, req.Argv); reason != "" {
+		s.auditExec(&pendingExec{machine: req.Machine, command: display, source: "console:" + keyName},
+			execRefused, "", reason)
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "blocked by the server's global exec policy: " + reason})
+		return
+	}
 	if req.Timeout <= 0 {
 		req.Timeout = 30
 	}
@@ -143,7 +155,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 	pe := &pendingExec{
 		ch:      make(chan protocol.ExecResult, 1),
 		machine: req.Machine,
-		command: req.Command,
+		command: display,
 		source:  "console:" + keyName,
 	}
 	s.pendMu.Lock()
