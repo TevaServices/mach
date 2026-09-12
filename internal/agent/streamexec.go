@@ -118,18 +118,25 @@ func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{
 
 	runErr := c.Wait()
 
-	// Drain remaining pump output briefly (pipes close after Wait on
-	// most platforms; give pumps a grace period to flush).
-	timer := time.NewTimer(2 * time.Second)
-drain:
+	// Drain remaining pump output briefly (pipes close after Wait on most
+	// platforms; give the pumps a grace period to flush).
+	//
+	// The grace is per pump, not one budget shared between them: the console
+	// stops reading at the terminal record, so whatever is still in flight when
+	// that record is written is output nobody will ever see, and a shared timer
+	// lets one pump's slow flush consume the time the other pump needed. A pump
+	// that is still not at EOF after the process is gone means something else
+	// holds the pipe open (a grandchild that inherited it), which is why the
+	// wait is bounded at all — and why the record says the output may be cut
+	// short instead of presenting a truncated stream as the whole of it.
+	cut := false
 	for i := 0; i < 2; i++ {
 		select {
 		case <-done:
-		case <-timer.C:
-			break drain
+		case <-time.After(streamDrainGrace):
+			cut = true
 		}
 	}
-	timer.Stop()
 
 	exitCode := 0
 	errText := ""
@@ -147,9 +154,30 @@ drain:
 			errText = fmt.Sprintf("%v", runErr)
 		}
 	}
+	errText = withDrainNote(errText, cut)
 	_ = stdinPipe
 	_ = conn.WriteEnvelope(protocol.Envelope{
 		Type: "stream_end", ReqID: env.ReqID,
 		Payload: mustJSONStream(protocol.StreamEnd{ExitCode: exitCode, Error: errText}),
 	})
+}
+
+// streamDrainGrace bounds how long the terminal record waits for the output pumps
+// after the process has exited.
+const streamDrainGrace = 2 * time.Second
+
+// withDrainNote reports output that may have been cut short. It is a separate
+// function (and a separate sentence) from the exit-status error because it is not
+// a failure of the command: the command finished, and its last bytes may simply
+// not have made it, which a reader needs to know to avoid reading a truncated
+// stream as the whole of it.
+func withDrainNote(errText string, cut bool) string {
+	if !cut {
+		return errText
+	}
+	const note = "output may be incomplete: a process still holds the output pipe"
+	if errText == "" {
+		return note
+	}
+	return errText + "; " + note
 }

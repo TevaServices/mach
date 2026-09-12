@@ -49,6 +49,12 @@ message saying they cannot do what they were asked to.
   tries. Every command for that org runs in plaintext, where the control plane
   itself can read and refuse it before dispatching anything.
 
+What the seal is worth, stated plainly: it keeps the command and its output from
+the control plane, and it is authenticated (a tampered envelope fails to open) —
+but it is not protection from the control plane substituting the key it hands
+out (`/e2epub` is that same party's word), and it is not protection from the
+machine's own operator. There is no key-transparency mechanism behind it.
+
 **Nothing on any agent changes in either direction.** An agent keeps its
 `e2e.key`, keeps registering the public half at enrollment, and keeps opening
 whatever sealed frame reaches it. With the setting off no sealed frame ever
@@ -90,7 +96,7 @@ from the broker; nothing protects content from the machine's own operator.
 | **E2E as a per-org server setting** (`mach-server e2e on\|off\|inherit --org X`, stored in `settings`; `MACH_E2E` pins every org), with the control signal clients obey or refuse on | server/e2eflag.go, consoleapi.go handleExec/handleE2EPub |
 | Sealed exec refused while the setting is off, before dispatch, and no key advertised — so a client cannot believe it sealed | consoleapi.go handleExec, handleE2EPub |
 | Per-machine command policy on the agent itself (`MACH_POLICY` / `policy.txt`), evaluated where no upstream can override it, on both paths | agent/policy.go, internal/policy |
-| E2E sealing of one-shot exec (X25519 + ChaCha20-Poly1305, ephemeral-per-command, AAD = sender's ephemeral pubkey) | internal/e2e, agent/e2eexec.go |
+| E2E sealing of one-shot exec: X25519 + ChaCha20-Poly1305, ephemeral sender key per command, AEAD key derived with HKDF (recipient and format version bound into the info string), AAD = the sender's ephemeral pubkey, format version checked on the way in | internal/e2e, agent/e2eexec.go |
 | `readonly` keys refused on the streaming endpoint (it is command execution, not observation) | stream.go handleConsoleStreamWS |
 | Confinement of remote commands: own process group (unix), SIGKILL as a tree on timeout (Windows: timeout + caps only) | agent/confine*.go |
 | Output caps per path, with visible truncation markers; streamed frames dropped rather than stalling an agent whose console stopped reading | agent/run.go, agent/streamexec.go |

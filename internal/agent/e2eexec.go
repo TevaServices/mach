@@ -28,8 +28,14 @@ func handleSealedExec(conn *protocol.WSConn, env protocol.Envelope, sealed proto
 	inner, err := openSealedCommand(stateDir, sealed)
 	if err != nil {
 		// Cannot read the command; tell the console in the clear only that
-		// decryption failed (no content, since we have none).
-		replyExec(conn, env.ReqID, protocol.ExecResult{Error: "e2e: sealed command failed to open (wrong machine?)", ExitCode: 126})
+		// decryption failed (no content, since we have none) — but say why, since
+		// the reason is about the envelope and not the command. "wrong machine"
+		// and "the other end speaks a different format version" are the two that
+		// happen in practice, and they have different fixes.
+		replyExec(conn, env.ReqID, protocol.ExecResult{
+			Error:    "e2e: sealed command failed to open: " + err.Error(),
+			ExitCode: 126,
+		})
 		return
 	}
 	replyKey, err := hex.DecodeString(sealed.ReplyPub)

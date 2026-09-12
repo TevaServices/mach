@@ -203,3 +203,23 @@ func TestPolicyFrameRejectsAnOversizeRuleset(t *testing.T) {
 		t.Errorf("an oversize frame changed the rules in force: %q", reason)
 	}
 }
+
+// Output that may have been cut short is reported as such. The console stops
+// reading at the terminal record, so bytes still in flight when it is written are
+// bytes nobody ever sees — and a truncated stream that looks complete is worse
+// than one that says it was cut.
+func TestIncompleteOutputIsReported(t *testing.T) {
+	if got := withDrainNote("", false); got != "" {
+		t.Errorf("a clean drain carried a note: %q", got)
+	}
+	got := withDrainNote("", true)
+	if !strings.Contains(got, "incomplete") {
+		t.Errorf("note = %q, want it to say the output may be incomplete", got)
+	}
+	// A command that also failed says both things: the exit status is not
+	// replaced by the drain note.
+	got = withDrainNote("timed out", true)
+	if !strings.Contains(got, "timed out") || !strings.Contains(got, "incomplete") {
+		t.Errorf("note = %q, want the failure and the truncation", got)
+	}
+}
