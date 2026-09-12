@@ -40,6 +40,13 @@ type Server struct {
 	authFails *ipLimiter
 
 	// pair-token lookups (page views, agent polls): generous but bounded
+	//
+	// Only the endpoints that create state or hash a low-entropy secret need
+	// a limiter. Token and API-key lookups are a single indexed probe against
+	// a deterministic hash (see store.LookupHash), so an unauthenticated
+	// caller cannot make the server do per-request work proportional to a
+	// secret's length or to the size of a table — the amplification that used
+	// to justify a tighter limit here is gone.
 	pairLookups *ipLimiter
 
 	// cleanup ticker stop
@@ -59,7 +66,7 @@ func New(st *store.Store, br *broker.Broker, org, keyPath string) *Server {
 		pending:     map[string]*pendingExec{},
 		pairStarts:  newIPLimiter(5, 10*time.Minute),
 		authFails:   newIPLimiter(20, 10*time.Minute),
-		pairLookups: newIPLimiter(240, 10*time.Minute),
+		pairLookups: newIPLimiter(600, 10*time.Minute),
 		cleanupStop: make(chan struct{}),
 	}
 	if err := s.loadOrCreateServerKey(keyPath); err != nil {
@@ -147,6 +154,13 @@ func (s *Server) clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
+// maxTrackedIPs caps an ipLimiter's map. It is reachable only under a large
+// distributed flood — the case a per-IP limiter cannot help with anyway — and
+// the cap exists so that flood cannot turn into unbounded memory growth. At
+// the cap we sweep fully-aged-out entries; if that frees nothing we decline to
+// track the new source rather than evicting a source already being limited.
+const maxTrackedIPs = 50_000
+
 // ipLimiter is a mutex-guarded sliding-window counter per client IP.
 // Entries (and keys) that age out of the window are dropped so the map
 // cannot grow without bound.
@@ -166,6 +180,17 @@ func (l *ipLimiter) record(ip string) bool {
 	now := time.Now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	_, tracked := l.hits[ip]
+	if !tracked && len(l.hits) >= maxTrackedIPs {
+		l.sweepLocked(now)
+		if len(l.hits) >= maxTrackedIPs {
+			// Nothing to reclaim: allow this request untracked. Every other
+			// source keeps its own limit, so single-source floods are still
+			// stopped; only a flood wide enough to fill the map escapes it.
+			return false
+		}
+	}
+	// Filter in place (write index never passes the read index).
 	times := l.hits[ip][:0]
 	for _, t := range l.hits[ip] {
 		if now.Sub(t) < l.window {
@@ -176,8 +201,29 @@ func (l *ipLimiter) record(ip string) bool {
 	if !over {
 		times = append(times, now)
 	}
+	if len(times) == 0 {
+		delete(l.hits, ip)
+		return over
+	}
 	l.hits[ip] = times
 	return over
+}
+
+// sweepLocked drops entries whose hits have all aged out. Only called at the
+// cap, so it never runs on the hot path.
+func (l *ipLimiter) sweepLocked(now time.Time) {
+	for ip, times := range l.hits {
+		live := false
+		for _, t := range times {
+			if now.Sub(t) < l.window {
+				live = true
+				break
+			}
+		}
+		if !live {
+			delete(l.hits, ip)
+		}
+	}
 }
 
 // blocked reports whether the IP is at/over its limit without recording

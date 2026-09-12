@@ -8,7 +8,6 @@ import (
 	"errors"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/bcross/mach/internal/broker"
@@ -49,7 +48,11 @@ func (s *Server) handlePairStart(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "this agent key is revoked; ask the operator to delete it first"})
 			return
 		}
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "this agent key is already enrolled as " + existing.Name})
+		// The machine name is deliberately not echoed back: this endpoint is
+		// unauthenticated, so anyone holding a public key (an agent's key is
+		// not a secret once it has been used anywhere) could otherwise confirm
+		// which machine it belongs to. The agent already knows its own name.
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "this agent key is already enrolled; delete the existing machine to re-enroll it"})
 		return
 	}
 	id, token, code, err := s.st.CreatePairing(req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer, s.pairingTTL)
@@ -57,7 +60,7 @@ func (s *Server) handlePairStart(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
 	}
-	s.logf("pair start: id=%s host=%q", id, req.Hostname)
+	s.logf("pair start: id=%q host=%q", id, req.Hostname)
 	// code goes ONLY to the agent console (never into the QR); the phone
 	// must type it blind — that's the anti-QR-theft property.
 	writeJSON(w, http.StatusOK, protocol.PairStartResponse{
@@ -79,8 +82,9 @@ func validPubKey(pk string) error {
 // ---- POST /v1/pair/status  (agent polls while waiting for approval) ----
 
 func (s *Server) handlePairStatus(w http.ResponseWriter, r *http.Request) {
-	// Token lookups hash candidates per request; keep the per-IP rate
-	// bounded (generous: real agents poll every ~2s).
+	// Bounded per IP, and generous: real agents poll every ~2s for the whole
+	// 10-minute pairing window (~300 requests), so the limit has to sit well
+	// above that or legitimate enrollment starves behind its own polling.
 	if s.pairLookups.record(s.clientIP(r)) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many requests"})
 		return
@@ -229,7 +233,7 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 			// Re-queue on failure so it isn't lost.
 			_ = s.st.QueueUpdate(machine.Name, version, sha256Hex, url, dataB64, sigB64)
 		} else {
-			s.logf("update pushed to %s (v%s)", machine.Name, version)
+			s.logf("update pushed to %q (v%q)", machine.Name, version)
 		}
 	}
 
@@ -310,7 +314,7 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "pairing already claimed"})
 		return
 	}
-	s.logf("pair claimed: machine=%s", p.Name)
+	s.logf("pair claimed: machine=%q", p.Name)
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": p.Name, "server_key": s.serverKeyHex})
 }
 
@@ -344,32 +348,4 @@ func (s *Server) completeExec(env protocol.Envelope, fromMachine string) {
 		default:
 		}
 	}
-}
-
-// authFailures tracks failed console-auth attempts per IP for rate limiting.
-type authLimiter struct {
-	mu    sync.Mutex
-	fails map[string][]time.Time
-}
-
-func (a *authLimiter) tooMany(ip string) bool {
-	now := time.Now()
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.fails == nil {
-		a.fails = map[string][]time.Time{}
-	}
-	times := a.fails[ip][:0]
-	for _, t := range a.fails[ip] {
-		if now.Sub(t) < 10*time.Minute {
-			times = append(times, t)
-		}
-	}
-	if len(times) >= 20 {
-		a.fails[ip] = times
-		return true
-	}
-	times = append(times, now)
-	a.fails[ip] = times
-	return false
 }
