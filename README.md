@@ -102,6 +102,16 @@ deny:mkfs" docker compose up -d
 # optional: turn end-to-end encryption off for one org, so its commands are
 # readable by the block list above (no restart; agents are unaffected)
 docker compose exec mach-server mach-server e2e off --org acme
+
+# optional: the web UI. All three OIDC variables or none — a partial set is a
+# startup error naming what is missing, and with none set there is no /ui route
+# at all. Also set MACH_OIDC_ALLOWED_DOMAINS unless you mean "anyone this
+# issuer verifies may manage the fleet".
+MACH_OIDC_ISSUER=https://accounts.example.com \
+MACH_OIDC_CLIENT_ID=mach-ui \
+MACH_OIDC_CLIENT_SECRET='…' \
+MACH_OIDC_ALLOWED_DOMAINS=example.com \
+MACH_PUBLIC_URL=https://mach.example.com docker compose up -d
 ```
 
 The image also ships prebuilt agent binaries for all six OS/arch targets
@@ -169,6 +179,17 @@ Put Caddy/nginx in front for TLS (agents speak wss://).
 - **Postgres backing (optional)**: `MACH_DB=postgres://…` swaps SQLite
   for Postgres (same schema), removing the single-writer constraint for
   larger fleets. SQLite stays the default (WAL + capped connections).
+- **Web UI with OIDC sign-in** (optional, off by default): a browser view of the
+  fleet with per-machine **block** (freeze dispatch — the agent stays connected),
+  **revoke** (the sticky tombstone) and **delete** (remove the machine and its
+  key, freeing the name so a re-imaged box can enroll again), plus org
+  management: add or remove org prefixes, set sealed-exec per org, and see which
+  machines and keys belong to each. Deleting needs the machine name typed.
+  Set `MACH_OIDC_ISSUER`, `MACH_OIDC_CLIENT_ID` and `MACH_OIDC_CLIENT_SECRET` to
+  turn it on — all three or none; with none, `/ui` does not exist. The pages are
+  server-rendered with a vendored htmx (no CDN, no build step), so state stays
+  live without a JavaScript toolchain, and every action works as a plain form
+  post too.
 
 ### Known limitations (pre-1.0, honest list)
 
@@ -196,6 +217,22 @@ Put Caddy/nginx in front for TLS (agents speak wss://).
 - Release attestations cover binaries pushed at runtime through
   `push-update --attestation`; the copies baked into the container image are
   not attested by that path yet.
+- **The web UI's only gate is your identity provider.** Block is fleet-wide and
+  delete is irreversible, so any identity the issuer verifies can do both —
+  and with an issuer that permits self-registration, that is the internet. Set
+  `MACH_OIDC_ALLOWED_DOMAINS` unless you mean that; with it unset the control
+  plane says so at startup. (For calibration: `mach-server delete-machine` from
+  a shell on the control-plane host already grants the same power with no
+  authentication at all.)
+- **Block is a freeze on dispatch, not containment.** A blocked machine is still
+  connected and still running whatever already runs on that host; it is sent no
+  new commands. A command already running is not cancelled.
+- **A deleted machine that is offline is not told.** The control plane answers
+  its reconnect exactly as it answers a name that never existed — deliberately,
+  so the unauthenticated endpoint cannot be used to enumerate machines — so it
+  retries on backoff until it is stopped on the host.
+- **UI sessions are in memory**, so restarting the control plane signs operators
+  out. Nothing about UI authorization is on disk, which is the point.
 
 Follow-up work tracks in GitHub issues (#2 sandboxing, #3 PTY, #4 signed
 manifests, #5 multi-server) — not in this file.

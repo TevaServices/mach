@@ -2,8 +2,10 @@
 # e2e.sh — end-to-end test of mach: control plane, enrollment (QR + API key),
 # scoped keys (exec, readonly), exec (shell + argv), streaming output, the
 # output-is-data guarantee, agent-local and server-wide command policy, audit,
-# revocation, signed update push with in-toto attestation, and the
-# challenge-code lockout. Run via `mise run e2e` or directly.
+# revocation, signed update push with in-toto attestation, the
+# challenge-code lockout, and the OIDC web UI (block / revoke / delete, org
+# management) driven against a loopback identity provider.
+# Run via `mise run e2e` or directly.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."

@@ -8,7 +8,8 @@ control plane beyond a household.
 ```
 phone ──TLS──▶ control plane ◀──TLS(wss)── agents (outbound only)
                  ▲
-console (mach) ──┘ (TLS, bearer key)
+console (mach) ──┤ (TLS, bearer key)
+operator browser ┘ (TLS, OIDC — the web UI, optional)
 ```
 
 - The control plane is the **only public component** and the **single
@@ -16,6 +17,12 @@ console (mach) ──┘ (TLS, bearer key)
   can read command content on the streaming path (sealed one-shot execs are
   opaque to it — see below). Treat its host as high-value; access to its
   DB = control of every machine, and the ability to push a signed update.
+- The **operator browser** is a fourth client, and it is the least constrained
+  one: OIDC establishes *who* someone is, not *whether they should be here*, and
+  any identity the issuer verifies may block, revoke, delete and add orgs. It is
+  therefore the issuer's registration policy that gates access unless
+  `MACH_OIDC_ALLOWED_DOMAINS` is set. The UI is off unless it is fully
+  configured, so a deployment that does not want it has no such surface.
 - Agents trust exactly: (a) their pinned control-plane identity key
   (`server_key` in config.json), (b) TLS to the enrolled URL.
 - The phone/admin is trusted only after presenting the challenge code
@@ -132,6 +139,15 @@ from the broker; nothing protects content from the machine's own operator.
 | Agent privilege drop on linux root (MACH_USER, default nobody) | agent/droppriv_linux.go |
 | X-Forwarded-For honored only with MACH_TRUST_PROXY=1 | server.New + SetTrustProxy |
 | Pair-page security headers (CSP default-src 'none', XFO DENY, nosniff, no-referrer); cross-site POST refused | pairpages.go |
+| **Web UI is off unless fully configured**: no `MACH_OIDC_*` means the `/ui` routes are not registered (404, nothing to probe); a partial set is a fatal startup error naming the variable | server/uiconfig.go, server.go Routes |
+| **OIDC sign-in**: discovery-backed ID token verification by `coreos/go-oidc` (signature, issuer, audience, expiry), signing algorithms pinned to RS256/ES256/PS256, nonce compared by us because the library does not, empty subject refused. Discovery is lazy and a failure is not cached | server/uicallback, internal/oidcauth |
+| **Login CSRF**: the callback must carry the same browser's state cookie, and the state is consumed only after that check — so a captured code cannot be replayed and a stray callback cannot burn the operator's state | server/uihandlers handleUICallback |
+| **UI session and CSRF**: in-memory bounded session store (token stored as a digest, 12h TTL, nothing on disk); `HttpOnly`/`SameSite=Lax`/`Secure`-when-https cookies scoped to `/ui`; per-session synchronizer token compared in constant time; `Sec-Fetch-Site` check; no `next` parameter and no reflected text (open redirect / injection) | server/uisession.go, uihandlers.go uiPost |
+| **Soft block** (`blocked` on the machine, stored in the database so it survives a restart): every server→agent command path refuses — one-shot exec and the streaming relay's `exec_stream`, `stream_stdin` **and** `stream_kill` — with the refusal audited; live console sessions for the machine are torn down | server/machineadmin.go dispatchRefusal, stream.go |
+| **Non-reserving delete**: removes the machine row and its key, tells a connected agent to retire (so it exits rather than reconnecting), and keeps the audit trail; ordering is delete-then-notify so a failed notice cannot leave a live authenticated socket for a row that is gone | server/machineadmin.go deleteMachine, store.DeleteMachine |
+| **Org management**: orgs stored in the database with `MACH_ORG`/`MACH_ORGS` as a non-removable pin; an org with machines cannot be removed; adding one is validated by the same label rule the naming invariant uses | server/orgadmin.go, orgs.go, store.ValidOrgLabel |
+| The API-key listing the membership view renders has no field for `salt`, `key_lookup` or `key_hash` — the absent fields, not a promise, are what stops a leak | store.ListAPIKeys, org_test.go |
+| **Agent supervision restarts on failure, not on any exit**, so exit 0 means stop: a retirement actually retires, and the update path's detached replacement is not raced by a resurrected old image | agent/install.go systemdUnit, launchdPlist |
 | Hourly pairing cleanup (24h retention) | server.New goroutine |
 
 ## Command policy: where it is enforced, and what it can promise
@@ -332,6 +348,52 @@ signature protects delivery, the attestation records provenance.
 8. **The copies of the agent binaries baked into the container image are not
    attested** by `push-update --attestation`, which covers runtime pushes only
    (issue #4).
+9. **The web UI's only gate is the identity provider.** Block is fleet-wide and
+   delete is irreversible, so anyone who can obtain an identity the configured
+   issuer verifies can do both. With a public issuer that permits
+   self-registration, that is the internet. The honest calibration: the CLI's
+   `mach-server delete-machine` already grants equivalent power **with no
+   authentication at all** to anyone with a shell on the control-plane host, so
+   the UI extends an existing authority rather than inventing one — but
+   **adding an org is a new capability with no CLI equivalent**, since it makes a
+   prefix enrollable. `MACH_OIDC_ALLOWED_DOMAINS` is the knob; with it unset, the
+   issuer's registration policy *is* the authorization model, and the control
+   plane says so at startup rather than leaving it to be discovered.
+10. **The UI relaxes the CSP on two pages, and that is a real widening.**
+    `/ui/*` and the public enrollment page need `script-src 'self'` for the
+    vendored htmx and the copy button. No `'unsafe-eval'` and no inline script:
+    htmx's `Function()` call sites are reachable only through `hx-on:` and
+    JS-valued `hx-vals`, which these templates never use, and `form-action
+    'self'` is required because `default-src 'none'` falls back to it. The pair
+    page keeps its strict `default-src 'none'` — it is the page a phone reaches
+    from a QR code and it needs no script. The enrollment page is
+    unauthenticated, so this is the one place the widening touches an anonymous
+    visitor.
+11. **Block is a freeze on dispatch, not containment.** A blocked machine is
+    still connected and still running whatever already executes on that host; it
+    is sent no *new* commands. An in-flight exec is not cancelled, and an
+    interactive session's command keeps running when the session is torn down —
+    that is the existing "a command is not cancelled by the console going away"
+    rule, and synthesising a `stream_kill` here would be a new remote-kill
+    capability rather than a freeze. Use OS-level confinement for real isolation.
+12. **UI sessions are in-memory**, so a control-plane restart signs every
+    operator out. That is the safe direction — no part of UI authorization is on
+    disk, so a leaked database grants no UI access — but it is worth knowing
+    before someone reports it as a bug.
+13. **A delete cannot be delivered to an agent that is offline, and the two
+    cases are deliberately indistinguishable.** An agent that restarts after its
+    machine was deleted dials a name that no longer exists, which the control
+    plane answers exactly as it answers a typo — upgrade, close, no frame — to
+    keep the unauthenticated endpoint free of a name-enumeration oracle. So it
+    retries on backoff until it is stopped on the host. Harmless (it holds no
+    privilege), not graceful, and the UI says so on the confirmation page.
+14. **The CLI admin commands do not touch live connections.** `mach-server
+    revoke-machine` and `delete-machine` open their own store in a separate
+    process and write the flag; only the HTTP paths — the console API
+    (`/v1/admin/*`) and the UI — also terminate the socket and end live sessions.
+    So a machine revoked from the CLI keeps accepting commands until it next
+    reconnects. There is no `block-machine` subcommand: blocking is reachable
+    over HTTP and from the UI, and a CLI version would have the same gap.
 
 ## Deployment checklist
 
