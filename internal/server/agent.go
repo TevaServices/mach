@@ -167,8 +167,13 @@ func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "already enrolled as " + existing.Name})
 		return
 	}
-	if !store.ValidOrgName(s.org, name) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name must be org-prefixed (<org>-<machine>, letters/digits/hyphen, machine part 1-48 chars)"})
+	// Any *configured* org, not just the primary one. The pair page has always
+	// accepted every configured org; this path used to check MACH_ORG alone, so
+	// adding an org from the UI would have worked for QR enrollment and silently
+	// not for API-key enrollment. The naming invariant is unchanged: the name
+	// must still be <org>-<machine>.
+	if _, ok := s.resolveOrgForName(name); !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name must be org-prefixed (<org>-<machine>, letters/digits/hyphen, machine part 1-48 chars) for a configured org"})
 		return
 	}
 	if existing, _ := s.st.MachineByName(name); existing != nil {

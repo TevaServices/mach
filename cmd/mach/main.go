@@ -142,6 +142,13 @@ func consoleMain(args []string) {
 			if m.Online {
 				status = "online"
 			}
+			// An operator's soft block is marked distinctly from offline: the
+			// machine is still connected (or would be), it is commands that are
+			// refused. Without this, "online" next to a refused every command is
+			// a confusing pair to read.
+			if m.Blocked {
+				status = "blocked"
+			}
 			// The E2E column is here, not in a separate command, because it is
 			// a property of what you can do to that machine: whether a command
 			// sent to it is sealed or readable by the control plane.

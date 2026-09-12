@@ -150,6 +150,11 @@ type MachineInfo struct {
 	// E2E is this machine's org's E2E setting ("on"/"off"): whether the control
 	// plane will accept a sealed command for it.
 	E2E string `json:"e2e"`
+	// Blocked is the operator's soft block: the machine is enrolled and may even
+	// be connected, but the control plane will not dispatch to it. Reported so
+	// `mach list` can say so, rather than leaving an operator to wonder why every
+	// command against a machine that looks online comes back refused.
+	Blocked bool `json:"blocked"`
 }
 
 type ExecResult struct {
