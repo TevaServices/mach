@@ -154,6 +154,7 @@ func TestExecPolicyFileReloadAndFailure(t *testing.T) {
 	}
 	defer st.Close()
 	s := New(st, nil, "bcross", filepath.Join(dir, "key"))
+	t.Cleanup(s.Close)
 
 	if s.execPolicyCheck("mkfs.ext4 /dev/sda", nil) == "" {
 		t.Fatal("a rule from the policy file was not loaded")
