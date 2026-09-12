@@ -236,6 +236,15 @@ func dialAndServe(cfg *Config, id *Identity, stateDir string) error {
 			// relays by session ID). Sessions not found are ignored —
 			// the console WS already closed.
 			handleStreamInput(env)
+		case "policy":
+			// The control plane's fleet-wide rules, mirrored onto the machine.
+			// This is how a block list applies to a sealed command: the server
+			// cannot read one, so the rules are evaluated where the plaintext
+			// is. The machine's own guardrail is untouched by this — both are
+			// evaluated, and a refusal from either stands.
+			if err := handlePolicyFrame(conn, env); err != nil {
+				log.Printf("agent: installing fleet policy failed: %v", err)
+			}
 		case "update":
 			if err := handleUpdate(cfg, env); err != nil {
 				log.Printf("agent: update failed: %v", err)
@@ -266,7 +275,7 @@ func runCommandResult(cmdPayload []byte, sem chan struct{}) protocol.ExecResult 
 	case <-time.After(10 * time.Second):
 		return protocol.ExecResult{Error: "too many concurrent commands on this machine", ExitCode: 126}
 	}
-	if reason := globalPolicy.Evaluate(cmd.Command, cmd.Argv); reason != "" {
+	if reason := checkCommand(cmd.Command, cmd.Argv); reason != "" {
 		return protocol.ExecResult{Error: reason, ExitCode: 126}
 	}
 	timeout := time.Duration(cmd.Timeout) * time.Second

@@ -70,15 +70,22 @@ This is `mach`: remote CLI access to registered machines, outbound-only
 10. **Revocation** is sticky: revoked machines self-retire, their keys
     cannot re-enroll, and their names stay reserved.
 11. `X-Forwarded-For` is honored ONLY when `MACH_TRUST_PROXY=1`.
-12. **Two command policies, both enforced on both paths**: the agent's own
+12. **Two command policies, both enforced on every path**: the agent's own
     (`MACH_POLICY`/`policy.txt`, which no upstream can override) and the
     control plane's fleet-wide one (`MACH_EXEC_POLICY`/`_FILE`, checked after
     authorization and before dispatch — including on `exec_stream`, so typing a
     blocked command into the console is refused exactly like passing it to
-    `exec`). Both check every *plaintext* command whatever the E2E setting is;
-    what they cannot check is a sealed command, which has no text to match —
-    turn E2E off if the fleet-wide block list has to bite on the one-shot path.
-    Neither is a sandbox — keep `SECURITY-NOTES.md` honest about that rather
+    `exec`).
+    **The fleet rules are also mirrored onto every machine** (`protocol.PolicyUpdate`,
+    pushed at connect and on every change, acknowledged with the version held)
+    and evaluated at the same point as the local guardrail. That is what makes
+    the block list apply to a *sealed* command: the control plane cannot read one,
+    so the text-matching rule has to run where the plaintext is. Both layers are
+    evaluated and a refusal from either stands — the mirror can never loosen the
+    machine's own rules, and an empty ruleset is an instruction to stop, not a
+    licence. Change the rules in one place (`execPolicy.Replace`,
+    `reloadFile`) and the broadcast is what makes them current everywhere;
+    neither is a sandbox — keep `SECURITY-NOTES.md` honest about that rather
     than overselling it.
 13. **Release attestations**: `mach-server attest` signs an in-toto statement
     with the identity key agents pin; `push-update --attestation` verifies the
@@ -130,8 +137,9 @@ only covered at the SQL-translation level.
 
 - `mise run test` — unit tests (`-race -cover`). Store (both drivers, SQL
   translation), server (scopes, orgs, normalizeCode, pair page, fleet-wide
-  policy, the streaming relay, the per-org E2E flag and its control signal),
-  agent (policy, shells, streaming writers, confinement), console
+  policy, the streaming relay, the per-org E2E flag and its control signal, the
+  fleet-rules mirror and its propagation), agent (policy — including fleet rules
+  binding a sealed command — shells, streaming writers, confinement), console
   (output-is-data, lost-stream, obeying/refusing the E2E signal), policy,
   protocol, release and in-toto all have coverage; keep it that way for touched
   code.
@@ -142,7 +150,10 @@ only covered at the SQL-translation level.
   revocation, and an attested update push). It also flips the E2E setting for
   one org at runtime and checks the sealed path end to end (the audit row
   becomes a placeholder because the control plane cannot read what it relayed),
-  which is the live proof of the per-org control signal. Green = 61 checks.
+  which is the live proof of the per-org control signal. It also proves the
+  fleet block list applies to SEALED commands (the rules reach the machine and
+  refuse them there) and that a rule added to the policy file on disk reaches a
+  machine that is already connected. Green = 70 checks.
 - Timing-sensitive e2e checks (streaming) use a real sleep and a real
   background process; if one flakes, make the sleep longer rather than
   weakening the assertion.
@@ -222,6 +233,14 @@ only covered at the SQL-translation level.
   they need `MACH_TRUST_PROXY=1` or every client shares the proxy IP.
 - **Time-based tests**: pairing TTL/expiry tests sleep tiny amounts;
   keep tolerances loose or they flake on loaded machines.
+- **A policy change has to be broadcast, not just applied.** The fleet rules
+  are enforced on the machines, so `SetExecPolicy` and a `MACH_EXEC_POLICY_FILE`
+  reload both call `broadcastFleetPolicy()`. Forget that and the control plane
+  holds the new list while every connected machine keeps enforcing the old one
+  until it reconnects — regression-tested by
+  `TestPolicyFileReloadReachesConnectedAgents`. A push is sent at every connect
+  even when the ruleset is empty: "stop enforcing what you were sent" cannot be
+  said by staying silent.
 - **E2E is per org and the server is the authority** (`mach-server e2e
   [on|off|inherit] --org X`; `MACH_E2E` pins every org). A client never decides
   on its own: it reads the signal and either obeys or exits with a message.

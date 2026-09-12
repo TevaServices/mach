@@ -47,12 +47,16 @@ step "control plane up"
 # step turns E2E back on for one org, at runtime, to exercise the sealed path.
 MACH_ORG="$ORG" MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" e2e off >/dev/null
 
-# MACH_EXEC_POLICY is set for the whole run: the fleet-wide block list applies
-# to every key and every machine, so it has to be exercised against the same
-# control plane the other steps use.
+# The fleet-wide block list is configured from a FILE for the whole run. It
+# applies to every key and every machine, so it has to be exercised against the
+# same control plane the other steps use — and a file is also what makes the
+# live-reload path testable: the rules are enforced on the machines (that is the
+# only place a sealed command is readable), so editing this file has to reach
+# agents that are already connected.
+printf 'deny:fleet-blocked-marker\n' > "$WORKDIR/fleet.policy"
 MACH_DB="$WORKDIR/mach.db" MACH_LISTEN="127.0.0.1:$PORT" \
   MACH_PUBLIC_URL="$BASE" MACH_ORG="$ORG" MACH_TRUST_PROXY=1 \
-  MACH_EXEC_POLICY="deny:fleet-blocked-marker" \
+  MACH_EXEC_POLICY_FILE="$WORKDIR/fleet.policy" \
   "$WORKDIR/mach-server" serve >"$WORKDIR/server.log" 2>&1 &
 SERVER_PID=$!
 for i in $(seq 1 20); do
@@ -171,10 +175,14 @@ CODE=$(curl -s -o "$WORKDIR/blocked.json" -w '%{http_code}' -X POST "$BASE/v1/ex
   -d "{\"machine\":\"$MACHINE\",\"command\":\"echo fleet-blocked-marker\"}")
 [[ "$CODE" == "403" ]]; check "fleet-wide deny refused an exec:* key" $?
 grep -q "global exec policy" "$WORKDIR/blocked.json"; check "refusal names the policy" $?
-# The strongest assertion available here: the agent never saw it. The marker
-# appears nowhere in the agent's log, because the command was refused upstream
-# of the machine.
-grep -q fleet-blocked-marker "$WORKDIR/agent1.log"; [[ $? -ne 0 ]]; check "blocked command never reached the agent" $?
+# The strongest assertion available here: the command was never dispatched. The
+# marker text does appear in this log — as a RULE, because the fleet policy is
+# mirrored onto the machine (that is how it applies to sealed commands) — so the
+# check excludes the policy lines and requires that nothing else mentions it.
+grep -q "fleet exec policy installed.*fleet-blocked-marker" "$WORKDIR/agent1.log"
+check "the machine holds the fleet rule as a rule" $?
+grep -v "fleet exec policy installed" "$WORKDIR/agent1.log" | grep -q fleet-blocked-marker
+[[ $? -ne 0 ]]; check "blocked command never reached the agent" $?
 # A refused command is audited, so blocks are visible in the record.
 sleep 1
 AUDIT=$(machc audit "$MACHINE" 5 2>/dev/null)
@@ -234,6 +242,49 @@ grep -q must-not-run "$WORKDIR/agent1.log"; [[ $? -ne 0 ]]; check "the refused c
 # this org: the same command the placeholder hid above is refused outright now.
 OUT=$(machc exec "$MACHINE" 'echo fleet-blocked-marker' 2>&1)
 [[ "$OUT" == *"global exec policy"* ]]; check "policy governs again once sealing is off" $?
+
+step "the fleet block list applies to sealed commands too"
+# The headline property. The control plane cannot read a sealed command, so it
+# cannot apply its own rules to one — so the rules are mirrored onto the machine
+# at connect (and on every change) and evaluated where the plaintext is. Sealing
+# is turned back on for this org, and the blocked command must still be refused:
+# by the machine this time, with the seal intact in both directions.
+MACH_ORG="$ORG" MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" e2e on --org "$ORG" >/dev/null
+# The agent confirms which ruleset it holds, so "is this machine enforcing the
+# current rules" has an answer rather than an assumption.
+grep -q "fleet exec policy installed" "$WORKDIR/agent1.log"; check "machine installed the mirrored rules" $?
+OUT=$(machc exec "$MACHINE" 'echo fleet-blocked-marker' 2>&1) && CODE=0 || CODE=$?
+[[ "$CODE" -eq 126 ]]; check "sealed command refused (exit 126)" $?
+[[ "$OUT" == *"fleet-blocked-marker"* ]]; check "refusal names the rule, through the seal" $?
+[[ "$OUT" == *"fleet-wide exec policy"* ]]; check "refusal names the layer that refused it" $?
+# Sealed it was: the audit row is the placeholder, so the control plane never saw
+# the command — and the block list applied anyway.
+sleep 1
+AUDIT=$(machc audit "$MACHINE" 1 2>/dev/null | head -1)
+[[ "$AUDIT" == *"[E2E sealed command]"* ]]; check "the refused command stayed sealed in the record" $?
+[[ "$AUDIT" != *"fleet-blocked-marker"* ]]; check "the control plane still cannot read it" $?
+# A rule added to the fleet list after this machine connected must reach it
+# without a restart or a reconnect: the rules are enforced on the machines, so a
+# change that only updated the control plane would leave every running agent
+# enforcing the previous version.
+#
+# These two commands are SEALED (E2E is on for this org here). That matters: a
+# plaintext command is judged by the control plane, which would pass whether or
+# not the machine ever got the new rules. Only the machine can judge a sealed
+# one, so only a sealed one tests propagation.
+machc exec "$MACHINE" 'echo rotated-marker' | grep -q rotated-marker
+check "baseline: the new marker is not blocked yet" $?
+# Edit the file the control plane watches: it re-reads on mtime change and pushes
+# the new ruleset to every connected agent.
+printf 'deny:fleet-blocked-marker\ndeny:rotated-marker\n' > "$WORKDIR/fleet.policy"
+BLOCKED=1
+for i in $(seq 1 40); do
+  OUT=$(machc exec "$MACHINE" 'echo rotated-marker' 2>&1) || true
+  if [[ "$OUT" == *"rotated-marker"* && "$OUT" == *"fleet-wide exec policy"* ]]; then BLOCKED=0; break; fi
+  sleep 1
+done
+[[ "$BLOCKED" -eq 0 ]] || echo "    last output: $OUT"
+[[ "$BLOCKED" -eq 0 ]]; check "a rule added live reached the connected machine" $?
 
 step "readonly key: sees the whole fleet, runs nothing"
 curl -fsS "$BASE/v1/machines" -H "Authorization: Bearer $RO_KEY" >"$WORKDIR/ro.json"

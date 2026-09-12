@@ -14,6 +14,8 @@
 package policy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,6 +94,15 @@ func (p *Policy) Describe() []string {
 		out = append(out, "allow:"+a)
 	}
 	return out
+}
+
+// Fingerprint is a short content hash of a ruleset. Two ends of a connection
+// use it to tell one version of the rules from another without shipping the
+// rules back and forth: the control plane names the version it pushed, and an
+// agent echoes the version it is enforcing.
+func Fingerprint(spec string) string {
+	sum := sha256.Sum256([]byte(spec))
+	return hex.EncodeToString(sum[:8])
 }
 
 // Evaluate returns a refusal reason, or "" to allow. command is the
