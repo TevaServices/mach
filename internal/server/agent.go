@@ -260,19 +260,22 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	// machine, so that is where the fleet block list has to run; and an empty
 	// ruleset is a real instruction ("stop enforcing what you were sent
 	// before"), which is why this is not skipped when the policy is empty.
+	//
+	// Note this is NOT gated on the operator's soft block, deliberately. A policy
+	// frame is control-plane configuration, not a command: a blocked machine must
+	// still hold current rules, or the moment it is unblocked it would enforce a
+	// stale list against sealed commands it decrypts. Block gates commands, not
+	// configuration.
 	s.pushFleetPolicy(ac)
 
-	// Deliver any queued, signed update before the command loop.
-	if version, sha256Hex, url, dataB64, sigB64, ok, err := s.st.PopPendingUpdate(machine.Name); err == nil && ok {
-		manifest, _ := json.Marshal(protocol.UpdateCommand{
-			URL: url, DataB64: dataB64, Sha256: sha256Hex, Version: version, SigB64: sigB64,
-		})
-		if err := conn.WriteEnvelope(protocol.Envelope{Type: "update", Payload: manifest}); err != nil {
-			// Re-queue on failure so it isn't lost.
-			_ = s.st.QueueUpdate(machine.Name, version, sha256Hex, url, dataB64, sigB64)
-		} else {
-			s.logf("update pushed to %q (v%q)", machine.Name, version)
-		}
+	// Deliver any queued, signed update before the command loop — unless the
+	// machine is blocked, in which case the update stays queued and is delivered
+	// when the block is lifted. The row is not merely left alone: PopPendingUpdate
+	// *deletes* it, so a blocked machine must not be popped at all.
+	if machine.Blocked {
+		s.logf("agent %q is blocked: queued update held until it is unblocked", machine.Name)
+	} else {
+		s.pushQueuedUpdate(conn, machine.Name)
 	}
 
 	// Pump: read envelopes from the agent until it disconnects.
@@ -304,6 +307,31 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 			s.logf("agent %s sent unknown frame %q", machine.Name, env.Type)
 		}
 	}
+}
+
+// pushQueuedUpdate delivers a machine's queued, signed update over a live
+// connection and clears it, re-queueing on a write failure so it is not lost.
+//
+// Called at agent connect, and again when an operator unblocks a machine that is
+// already online — which is why the pop underneath it is a single statement
+// rather than a read followed by a delete.
+//
+// Writing to a connection owned by the agent pump is safe from another
+// goroutine: protocol.WSConn serialises writes.
+func (s *Server) pushQueuedUpdate(conn *protocol.WSConn, machineName string) {
+	version, sha256Hex, url, dataB64, sigB64, ok, err := s.st.PopPendingUpdate(machineName)
+	if err != nil || !ok {
+		return
+	}
+	manifest, _ := json.Marshal(protocol.UpdateCommand{
+		URL: url, DataB64: dataB64, Sha256: sha256Hex, Version: version, SigB64: sigB64,
+	})
+	if err := conn.WriteEnvelope(protocol.Envelope{Type: "update", Payload: manifest}); err != nil {
+		// Re-queue on failure so it isn't lost.
+		_ = s.st.QueueUpdate(machineName, version, sha256Hex, url, dataB64, sigB64)
+		return
+	}
+	s.logf("update pushed to %q (v%q)", machineName, version)
 }
 
 // verifyAgentHello checks the ed25519 signature over (name|nonce). The
