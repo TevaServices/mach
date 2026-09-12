@@ -83,18 +83,25 @@ func Run(stateDir string) error {
 		return err
 	}
 	DropPrivileges()
-	return serveLoop(cfg, id, e2eKey)
+	return serveLoop(cfg, id, e2eKey, nil)
 }
 
 // serveLoop is the reconnect loop, shared by the installed agent and the
 // temporary session. The two differ only in where their secrets come from —
 // files under the state directory, or nothing but this process's memory — so
 // everything below is common, including what a terminal frame means.
-func serveLoop(cfg *Config, id *Identity, e2eKey *E2EKeyPair) error {
+//
+// ctl is non-nil only for a temporary session, and lets an interrupt end the
+// loop and retire the enrollment instead of reconnecting. A temporary session
+// must not leave its record looking like a machine that stopped working.
+func serveLoop(cfg *Config, id *Identity, e2eKey *E2EKeyPair, ctl *sessionCtl) error {
 	backoff := 2 * time.Second
 	for {
+		if ctl.stopped() {
+			return nil
+		}
 		iterStart := time.Now()
-		err := dialAndServe(cfg, id, e2eKey)
+		err := dialAndServe(cfg, id, e2eKey, ctl)
 		if errors.Is(err, errShutdown) {
 			return nil
 		}
@@ -124,7 +131,12 @@ func serveLoop(cfg *Config, id *Identity, e2eKey *E2EKeyPair) error {
 		}
 		// Jitter ±25% so a fleet restart doesn't reconnect in lockstep.
 		jittered := backoff - backoff/4 + time.Duration(mrand.Int63n(int64(backoff/2)+1))
-		time.Sleep(jittered)
+		// A temporary session waits interruptibly: a Ctrl-C during a backoff of
+		// up to two minutes must not have to wait it out before the process can
+		// say it ended.
+		if ctl.wait(jittered) {
+			return nil
+		}
 		backoff *= 2
 		if backoff > 2*time.Minute {
 			backoff = 2 * time.Minute
@@ -156,7 +168,7 @@ func terminalFrame(frameType string) error {
 	return nil
 }
 
-func dialAndServe(cfg *Config, id *Identity, e2eKey *E2EKeyPair) error {
+func dialAndServe(cfg *Config, id *Identity, e2eKey *E2EKeyPair, ctl *sessionCtl) error {
 	url := wsURL(cfg.Server) + "/v1/agent/ws?name=" + urlQueryEscape(cfg.Name)
 	ws, resp, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
@@ -239,6 +251,16 @@ func dialAndServe(cfg *Config, id *Identity, e2eKey *E2EKeyPair) error {
 	}
 	log.Printf("agent: connected to %s as %q (control plane identity verified)", cfg.Server, cfg.Name)
 
+	// A temporary session publishes this connection so an interrupt can retire
+	// the enrollment on it. Registered after the handshake, because the retire
+	// frame is only meaningful — and only accepted — on an authenticated
+	// connection, and detached on the way out so a reconnect does not leave a
+	// stale pointer behind.
+	if ctl != nil {
+		ctl.attach(conn)
+		defer ctl.detach()
+	}
+
 	// Keepalive pinger: sends pings; pong (or any data frame) refreshes the
 	// read deadline, so a black-holed connection tears down within pongWait.
 	pingCtx, cancelPings := context.WithCancel(context.Background())
@@ -265,6 +287,13 @@ func dialAndServe(cfg *Config, id *Identity, e2eKey *E2EKeyPair) error {
 		_ = ws.SetReadDeadline(time.Now().Add(pongWait))
 		env, err := conn.ReadEnvelope()
 		if err != nil {
+			// A shutdown closes this socket to unblock the read, so the failure
+			// here is the interrupt arriving, not a fault — reporting it as
+			// errShutdown keeps the loop from treating it as a disconnect and
+			// reconnecting.
+			if ctl.stopped() {
+				return errShutdown
+			}
 			return err // deadline, clean disconnect, or protocol error
 		}
 		// A terminal frame ends the reconnect loop rather than this connection

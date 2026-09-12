@@ -109,7 +109,8 @@ const schemaSQL = `CREATE TABLE IF NOT EXISTS machines (
 	created_at TEXT NOT NULL,
 	revoked INTEGER DEFAULT 0,
 	pub_e2e TEXT DEFAULT '',
-	blocked INTEGER DEFAULT 0
+	blocked INTEGER DEFAULT 0,
+	temporary INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS api_keys (
 	id {{ID}},
@@ -279,6 +280,9 @@ func (s *Store) verifySchema() error {
 	if !cols["blocked"] {
 		return errors.New("database predates the current schema (machines.blocked missing); run `ALTER TABLE machines ADD COLUMN blocked INTEGER DEFAULT 0` to keep this fleet, or delete the database and re-enroll — pre-1.0, no automatic migration")
 	}
+	if !cols["temporary"] {
+		return errors.New("database predates the current schema (machines.temporary missing); run `ALTER TABLE machines ADD COLUMN temporary INTEGER DEFAULT 0` to keep this fleet, or delete the database and re-enroll — pre-1.0, no automatic migration")
+	}
 	return nil
 }
 
@@ -326,8 +330,36 @@ const challengeAlphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 // the guessing probability per pairing is ~2^-58.
 const ChallengeCodeLen = 12
 
+// NormalizeCode is the canonical form of a challenge code: uppercase, with the
+// display dashes and any spaces removed.
+//
+// It lives here, beside the hashing, because the two MUST agree, and they did
+// not. NewChallengeCode returns the code dashed for display, CreatePairing hashed
+// that dashed form, and the pair page normalized what the operator typed before
+// comparing — so a correct code could never match, and every legitimate approval
+// was counted as a wrong attempt (five of them expiring the pairing). The store's
+// own tests passed the raw code straight from CreatePairing, and the server's
+// tests exercised normalizeCode on its own; nothing covered the seam between
+// them, which is where the bug lived.
+//
+// One function, used by both sides, is what stops that drifting again: anything
+// that hashes or compares a code goes through it.
+func NormalizeCode(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToUpper(strings.TrimSpace(s)) {
+		if r == '-' || r == ' ' {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 // NewChallengeCode returns a human-typeable, high-entropy challenge code,
 // formatted XXXX-XXXX-XXXX.
+//
+// The dashes are display only: what is hashed is the normalized form, so the
+// operator may type the code with or without them.
 func NewChallengeCode() string {
 	b := make([]byte, ChallengeCodeLen)
 	if _, err := rand.Read(b); err != nil {
@@ -423,20 +455,36 @@ type Machine struct {
 	// and services no requests for it. Independent of Revoked — see
 	// SetMachineBlocked.
 	Blocked bool
+	// Temporary marks an enrollment that belongs to a session rather than to a
+	// machine: plain `mach` on a target, which keeps nothing on disk and revokes
+	// itself on the way out. It is what lets that session be re-enrolled under
+	// its own name without the operator revoking or deleting anything first —
+	// including after a Ctrl-C that never got the chance to self-revoke, or a
+	// power cut. A permanent enrollment clears it. See ReenrollMachine.
+	Temporary bool
 }
 
-func (s *Store) CreateMachine(name, pubkey, hostname, os, arch, agentVer, pubE2E string) error {
-	_, err := s.exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at, pub_e2e)
-		VALUES (?,?,?,?,?,?,?,?)`, name, pubkey, hostname, os, arch, agentVer, now(), pubE2E)
+func (s *Store) CreateMachine(name, pubkey, hostname, os, arch, agentVer, pubE2E string, temporary bool) error {
+	_, err := s.exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at, pub_e2e, temporary)
+		VALUES (?,?,?,?,?,?,?,?,?)`, name, pubkey, hostname, os, arch, agentVer, now(), pubE2E, boolInt(temporary))
 	return err
 }
 
-const machineCols = `id, name, pubkey, hostname, os, arch, agent_version, created_at, revoked, pub_e2e, blocked`
+// boolInt spells a bool the way every boolean column here is stored (INTEGER,
+// scanned back with != 0), so the two drivers agree.
+func boolInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+const machineCols = `id, name, pubkey, hostname, os, arch, agent_version, created_at, revoked, pub_e2e, blocked, temporary`
 
 func scanMachine(row interface{ Scan(...any) error }) (*Machine, error) {
 	m := &Machine{}
-	var revoked, blocked int
-	err := row.Scan(&m.ID, &m.Name, &m.PubKey, &m.Hostname, &m.OS, &m.Arch, &m.AgentVer, &m.CreatedAt, &revoked, &m.PubE2E, &blocked)
+	var revoked, blocked, temporary int
+	err := row.Scan(&m.ID, &m.Name, &m.PubKey, &m.Hostname, &m.OS, &m.Arch, &m.AgentVer, &m.CreatedAt, &revoked, &m.PubE2E, &blocked, &temporary)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -445,6 +493,7 @@ func scanMachine(row interface{ Scan(...any) error }) (*Machine, error) {
 	}
 	m.Revoked = revoked != 0
 	m.Blocked = blocked != 0
+	m.Temporary = temporary != 0
 	return m, nil
 }
 
@@ -504,41 +553,56 @@ type execer interface {
 	exec(q string, args ...any) (sql.Result, error)
 }
 
-// reactivateRevoked re-keys a revoked machine in place and clears the
-// revocation, reporting whether a row was actually revived.
+// reenroll takes over an existing row for a new enrollment, re-keying it and
+// clearing any revocation, and reports whether it actually matched one.
 //
-// Enrollment may revive a REVOKED machine and nothing else. That guard is the
-// WHERE clause rather than a check-then-write in Go on purpose: "do not displace
-// an active agent" has to hold against a race between a caller's existence check
-// and this write, and only the SQL can promise it.
+// Two conditions admit a takeover, and together they are the whole guard:
+//
+//   - REVOKED — revocation is a forced re-enrollment, so enrolling again is how
+//     a revoked machine comes back. That is what makes revoke recoverable
+//     without handing out the delete power.
+//   - TEMPORARY — an enrollment that belongs to a session rather than to a
+//     machine. Such a session revokes itself on the way out, but it may not get
+//     the chance (a kill, a crash, a power cut), and the record it leaves must
+//     not wedge its own name. This is what lets the next run reuse it without
+//     the operator revoking or deleting anything first.
+//
+// Everything else is refused, and the guard is the WHERE clause rather than a
+// check-then-write in Go: "never displace an active, permanent machine" has to
+// hold against a race between a caller's existence check and this write, and
+// only the SQL can promise that.
+//
+// The new enrollment states whether it is temporary, so it OVERWRITES the flag:
+// re-enrolling a throwaway session permanently — `mach install` on a host that
+// ran plain `mach` — records it as permanent, which is the point of recording it.
 //
 // blocked is deliberately left alone. It is an independent axis — neither block
 // nor revoke writes the other's field — and a block left in place announces
 // itself as a refusal that names the block, which is discoverable, where
 // silently clearing an operator's block would not be.
-func reactivateRevoked(ex execer, name, pubkey, hostname, os, arch, agentVer, pubE2E string) (bool, error) {
+func reenroll(ex execer, name, pubkey, hostname, os, arch, agentVer, pubE2E string, temporary bool) (bool, error) {
 	res, err := ex.exec(`UPDATE machines
-		SET pubkey=?, hostname=?, os=?, arch=?, agent_version=?, pub_e2e=?, revoked=0
-		WHERE name=? AND revoked=1`,
-		pubkey, hostname, os, arch, agentVer, pubE2E, name)
+		SET pubkey=?, hostname=?, os=?, arch=?, agent_version=?, pub_e2e=?, revoked=0, temporary=?
+		WHERE name=? AND (revoked=1 OR temporary=1)`,
+		pubkey, hostname, os, arch, agentVer, pubE2E, boolInt(temporary), name)
 	if err != nil {
 		return false, err
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
 		// Both drivers report this, but a driver that could not means the caller
-		// cannot tell "revived" from "no such revoked machine" — and guessing
-		// wrong either skips the insert or duplicates the row.
+		// cannot tell "took over" from "no row to take over" — and guessing wrong
+		// either skips the insert or duplicates the row.
 		return false, err
 	}
 	return n > 0, nil
 }
 
-// ReactivateMachine revives a revoked machine for a new enrollment, re-keying it
-// if the agent presents a different key (which a temporary session always does).
-// ok is false when there is no revoked machine by that name.
-func (s *Store) ReactivateMachine(name, pubkey, hostname, os, arch, agentVer, pubE2E string) (bool, error) {
-	return reactivateRevoked(s, name, pubkey, hostname, os, arch, agentVer, pubE2E)
+// ReenrollMachine takes over an existing machine row for a new enrollment —
+// revoked or temporary only; see reenroll for why those two and nothing else.
+// ok is false when no such row exists, in which case the caller inserts.
+func (s *Store) ReenrollMachine(name, pubkey, hostname, os, arch, agentVer, pubE2E string, temporary bool) (bool, error) {
+	return reenroll(s, name, pubkey, hostname, os, arch, agentVer, pubE2E, temporary)
 }
 
 // SetMachineBlocked sets or clears the operator's soft block on a machine.
@@ -793,7 +857,7 @@ func (s *Store) CreatePairing(pubkey, hostname, os, arch, agentVer string, ttl t
 	_, err = s.exec(`INSERT INTO pairings (id, token_hash, pubkey, hostname, os, arch, agent_version, code_hash, code_salt, state, created_at, expires_at)
 		VALUES (?,?,?,?,?,?,?,?,?,'pending',?,?)`,
 		id, LookupHash(token), pubkey, hostname, os, arch, agentVer,
-		HashSecret(code, codeSalt), codeSalt, now(),
+		HashSecret(NormalizeCode(code), codeSalt), codeSalt, now(),
 		time.Now().UTC().Add(ttl).Format(time.RFC3339))
 	return id, token, code, err
 }
@@ -872,7 +936,7 @@ func (s *Store) ApprovePairing(pairID, code, name string) (bool, string, error) 
 	if state != "pending" {
 		return false, state, nil
 	}
-	if subtle.ConstantTimeCompare([]byte(HashSecret(code, codeSalt)), []byte(codeHash)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(HashSecret(NormalizeCode(code), codeSalt)), []byte(codeHash)) != 1 {
 		return false, "bad-code", nil
 	}
 	// Guard on state: a concurrent DenyPairing must win over this approve —
@@ -905,7 +969,7 @@ func (s *Store) DenyPairing(pairID string) (changed bool, err error) {
 // the pairing stays un-consumed and claimable/inspectable instead of being
 // permanently burned. Returns ok=false if it was already consumed or is no
 // longer approved.
-func (s *Store) ConsumePairing(p *Pairing, pubE2E string) (bool, error) {
+func (s *Store) ConsumePairing(p *Pairing, pubE2E string, temporary bool) (bool, error) {
 	sqltx, err := s.db.Begin()
 	if err != nil {
 		return false, err
@@ -923,16 +987,16 @@ func (s *Store) ConsumePairing(p *Pairing, pubE2E string) (bool, error) {
 	if n == 0 {
 		return false, nil
 	}
-	// Revive a revoked machine in place, or create a new one. A revoked row is
-	// the only case enrollment may take over, and reactivateRevoked's WHERE
-	// clause is what enforces that — not a check in the caller.
-	revived, err := reactivateRevoked(tx, p.Name, p.PubKey, p.Hostname, p.OS, p.Arch, p.AgentVer, pubE2E)
+	// Take over a revoked or temporary machine in place, or create a new one.
+	// reenroll's WHERE clause is what enforces which rows may be taken over —
+	// not a check in the caller.
+	took, err := reenroll(tx, p.Name, p.PubKey, p.Hostname, p.OS, p.Arch, p.AgentVer, pubE2E, temporary)
 	if err != nil {
 		return false, err
 	}
-	if !revived {
-		if _, err := tx.exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at, pub_e2e)
-			VALUES (?,?,?,?,?,?,?,?)`, p.Name, p.PubKey, p.Hostname, p.OS, p.Arch, p.AgentVer, now(), pubE2E); err != nil {
+	if !took {
+		if _, err := tx.exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at, pub_e2e, temporary)
+			VALUES (?,?,?,?,?,?,?,?,?)`, p.Name, p.PubKey, p.Hostname, p.OS, p.Arch, p.AgentVer, now(), pubE2E, boolInt(temporary)); err != nil {
 			// consumed=1 rolls back with the transaction: the pairing survives
 			// and the agent surfaces the error (usually a name conflict).
 			return false, err

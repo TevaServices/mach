@@ -140,7 +140,7 @@ func TestPairingApproveFlow(t *testing.T) {
 		t.Fatalf("approve: ok=%v why=%q err=%v", ok, why, err)
 	}
 	p := mustPairingByToken(t, st, token)
-	consumed, err := st.ConsumePairing(p, "")
+	consumed, err := st.ConsumePairing(p, "", false)
 	if err != nil || !consumed {
 		t.Fatalf("consume: %v %v", consumed, err)
 	}
@@ -148,7 +148,7 @@ func TestPairingApproveFlow(t *testing.T) {
 		t.Fatalf("machine missing after consume: %v", err)
 	}
 	// Second consume attempt fails (single use).
-	consumed2, _ := st.ConsumePairing(p, "")
+	consumed2, _ := st.ConsumePairing(p, "", false)
 	if consumed2 {
 		t.Fatal("pairing consumable twice")
 	}
@@ -216,7 +216,7 @@ func TestAuditInsertList(t *testing.T) {
 
 func TestMachineRevocation(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateMachine("bcross-a", "pub", "host", "linux", "arm64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub", "host", "linux", "arm64", "v", "", false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if err := st.RevokeMachine("bcross-a"); err != nil {
@@ -256,7 +256,7 @@ func TestConsumePairingFailureDoesNotBurnToken(t *testing.T) {
 	st := testStore(t)
 	// A machine with the target name already exists: the claim insert will
 	// fail on UNIQUE. The pairing must survive un-consumed and inspectable.
-	if err := st.CreateMachine("bcross-x", "other-pub", "", "", "", "", ""); err != nil {
+	if err := st.CreateMachine("bcross-x", "other-pub", "", "", "", "", "", false); err != nil {
 		t.Fatalf("seed machine: %v", err)
 	}
 	id, token, code, err := st.CreatePairing("pubkey-hex", "host", "", "", "", time.Minute)
@@ -267,7 +267,7 @@ func TestConsumePairingFailureDoesNotBurnToken(t *testing.T) {
 		t.Fatalf("approve: ok=%v why=%q err=%v", ok, why, err)
 	}
 	p := mustPairingByToken(t, st, token)
-	consumed, err := st.ConsumePairing(p, "")
+	consumed, err := st.ConsumePairing(p, "", false)
 	if err == nil || consumed {
 		t.Fatalf("expected error from conflicting insert, got consumed=%v err=%v", consumed, err)
 	}
@@ -488,7 +488,7 @@ func TestPostgresStoreEndToEnd(t *testing.T) {
 
 	// An auto-assigned primary key (BIGSERIAL, not INTEGER PRIMARY KEY).
 	name := "pgtest-" + RandToken(4)
-	if err := st.CreateMachine(name, "pub-"+name, "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine(name, "pub-"+name, "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("create machine: %v", err)
 	}
 	if m, err := st.MachineByName(name); err != nil || m == nil {

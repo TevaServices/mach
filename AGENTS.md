@@ -75,12 +75,14 @@ This is `mach`: remote CLI access to registered machines, outbound-only
 10. **Revocation is a forced re-enrollment, and its door is narrow.** A revoked
     machine self-retires, its name and key stay reserved, and it comes back only
     by enrolling again — which needs an enroll key or a phone approval, so it is
-    still operator-gated. The revive is allowed for a revoked row **and nothing
-    else**, guarded in SQL (`ReactivateMachine` matches `revoked=1`) rather than
-    by a caller's check, because the counterweight is what matters most here: an
-    ACTIVELY enrolled machine is never displaced — not its name, not its key.
-    That is what stops a typo, or a hostile enrollee, taking over a working
-    agent. Reviving clears `revoked` and leaves `blocked` alone (#19).
+    still operator-gated. A **TEMPORARY** enrollment may also be taken over (see
+    #23), and nothing else may: the guard is the WHERE clause in `store.reenroll`
+    (`revoked=1 OR temporary=1`) rather than a caller's check, because the
+    counterweight is what matters most here — an ACTIVELY enrolled, PERMANENT
+    machine is never displaced, not its name and not its key. That is what stops
+    a typo, or a hostile enrollee, taking over a working agent. A takeover clears
+    `revoked`, sets `temporary` from the *new* enrollment (so a permanent
+    enrollment makes the record permanent), and leaves `blocked` alone (#19).
 11. `X-Forwarded-For` is honored ONLY when `MACH_TRUST_PROXY=1`.
 12. **Two command policies, both enforced on every path**: the agent's own
     (`MACH_POLICY`/`policy.txt`, which no upstream can override) and the
@@ -173,9 +175,22 @@ This is `mach`: remote CLI access to registered machines, outbound-only
     identity that would compete for the same console. `registerQRCore` and
     `registerAPIKeyCore` stay free of persistence — that split (load identity
     and keys → core → save) is the only thing keeping the temporary path
-    incapable of writing, so do not "simplify" it back. The session leaves its
-    enrollment on the control plane and says so on exit; a connection needs a
-    record, and the operator revokes or deletes it to reuse the name.
+    incapable of writing, so do not "simplify" it back.
+
+    Two halves, and both are needed. The enrollment is **recorded as temporary**
+    on the control plane (a field on the claim/register request), and the session
+    **retires itself on exit** (a `retire` frame on its authenticated
+    connection). The retirement is the tidy path; the marking is the one that
+    always works — a session killed outright, or cut off before it can say
+    anything, leaves a temporary record whose name the next run takes over with
+    no operator action. A permanent enrollment clears the marking.
+
+    `retire` is accepted from a temporary machine **only**: a permanent agent
+    must not be able to retire a machine the operator expects to stay. The frame
+    carries no name — the handler uses the connection's own — so an agent can
+    retire itself and nothing else. Say what happened on the way out from the
+    goroutine that returns from `RunEphemeral`, never from the signal handler:
+    the handler's print raced the exit, and lost.
 
 ## Environment variables (control plane)
 
@@ -236,8 +251,10 @@ only covered at the SQL-translation level.
   the real browser flow with a cookie jar, and drives block / unblock / the
   orgs / the typed-name delete / sign-out from the UI. It also revives a revoked
   machine by re-enrolling it and checks that an active one cannot be taken over,
-  and observes the temporary session writing nothing to the state directory.
-  Green = 126 checks.
+  and drives the temporary session's whole lifecycle: bare `mach` enrolling over
+  the real pair page, being recorded temporary, retiring itself on SIGTERM, and
+  the next run taking that name back over with no operator action.
+  Green = 131 checks.
 - Timing-sensitive e2e checks (streaming) use a real sleep and a real
   background process; if one flakes, make the sleep longer rather than
   weakening the assertion.
@@ -346,6 +363,17 @@ only covered at the SQL-translation level.
 Not opinions — each of these is something that went wrong in this repo, with the
 rule that would have prevented it.
 
+- **A rule written in two places drifts, and the tests can each be happy.** Two
+  real bugs here were the same shape, and both survived a green suite:
+  (1) the challenge code was hashed in its dashed display form but compared in
+  its normalized form, so **no correct code could ever be approved** — the store
+  tests approved with the raw code and the server tests exercised `normalizeCode`
+  alone, so nothing covered the join; and (2) the pair page had its own copy of
+  the "name is taken" rule with a simpler condition, which disagreed with the
+  store about revoked and temporary rows. Both are fixed by giving the rule one
+  home (`store.NormalizeCode`, `Server.enrollmentRefusal`) and testing the SEAM —
+  drive the whole HTTP flow, not each half. When you add a condition to an
+  enrollment or pairing rule, grep for a second copy of it.
 - **A stale control plane holding a port makes the whole e2e UI section lie.**
   The web-UI checks run a second control plane on `MACH_TEST_UI_PORT` (8098) and
   a fake IdP on `MACH_TEST_IDP_PORT` (8097). A `mach-server` left over from

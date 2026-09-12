@@ -21,7 +21,7 @@ func TestSetMachineBlockedRoundTripAndSurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if ok, err := st.SetMachineBlocked("bcross-a", true); err != nil || !ok {
@@ -72,7 +72,7 @@ func TestSetMachineBlockedUnknownMachine(t *testing.T) {
 // permanent tombstone, block is a reversible freeze.
 func TestSetMachineBlockedDoesNotTouchRevoked(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if err := st.RevokeMachine("bcross-a"); err != nil {
@@ -136,7 +136,7 @@ func TestVerifySchemaRejectsDatabaseWithoutBlocked(t *testing.T) {
 // and the sequential case passes against the old two-statement implementation.
 func TestPopPendingUpdateIsSingleDelivery(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if err := st.QueueUpdate("bcross-a", "1.2.3", "sha", "url", "data", "sig"); err != nil {
@@ -168,7 +168,7 @@ func TestPopPendingUpdateIsSingleDelivery(t *testing.T) {
 // fails there and passes with the single DELETE ... RETURNING.
 func TestPopPendingUpdateIsSingleDeliveryUnderRace(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	const (
@@ -220,7 +220,7 @@ func TestPopPendingUpdateIsSingleDeliveryUnderRace(t *testing.T) {
 
 func TestHasPendingUpdateDoesNotConsume(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if has, err := st.HasPendingUpdate("bcross-a"); err != nil || has {
@@ -245,7 +245,7 @@ func TestHasPendingUpdateDoesNotConsume(t *testing.T) {
 // trail stays, and both the name and the agent key become reusable.
 func TestDeleteMachineFreesNameAndKeyKeepsAudit(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if err := st.QueueUpdate("bcross-a", "1.2.3", "sha", "url", "data", "sig"); err != nil {
@@ -278,7 +278,7 @@ func TestDeleteMachineFreesNameAndKeyKeepsAudit(t *testing.T) {
 	}
 
 	// The whole point: the same name AND the same key material may enroll again.
-	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false); err != nil {
 		t.Fatalf("re-enroll with the freed name and key: %v", err)
 	}
 	m, err := st.MachineByName("bcross-a")

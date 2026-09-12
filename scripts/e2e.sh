@@ -398,32 +398,76 @@ OUT=$(curl -sS "$BASE/v1/machines" -H "Authorization: Bearer $ADMIN_KEY" 2>&1)
 [[ "$OUT" == *"$MACHINE"* ]]; check "the active machine is still enrolled" $?
 
 step "plain mach on a target is the temporary session"
-# Bare `mach` is now a TEMPORARY session: it enrolls in memory and holds the
-# connection, writing nothing. Ctrl-C ends it and running it again re-enrolls.
-# It is launched here only far enough to observe the first two properties: the
-# pairing flow then waits for a phone that this script does not have.
+# Bare `mach` is a TEMPORARY session: it enrolls with an in-memory identity, is
+# recorded on the control plane as temporary, and retires that enrollment when it
+# ends. The temp name is its own so nothing here disturbs the agents above.
+TMP_NAME="$ORG-tmp-01"
+TMP_PART="tmp-01"
 TMP_STATE="$WORKDIR/agent-tmp"
 MACH_SERVER="$BASE" MACH_ORG="$ORG" MACH_STATE_DIR="$TMP_STATE" \
   "$WORKDIR/mach" >"$WORKDIR/agent-tmp.log" 2>&1 &
 TMP_PID=$!
-sleep 3
+
+# Drive the phone side of the pairing from here, exactly as an operator would:
+# the token comes from the printed pair URL, the code from the agent's own
+# console (never from the page). Polling for the token also means the banner
+# below has certainly been written — reading the log straight after starting the
+# process races it.
+TMP_TOKEN=""
+for i in $(seq 1 30); do
+  TMP_TOKEN=$(grep -oE '/pair/[a-f0-9]{64}' "$WORKDIR/agent-tmp.log" | head -1 | cut -d/ -f3)
+  [[ -n "$TMP_TOKEN" ]] && break
+  sleep 0.3
+done
+[[ -n "$TMP_TOKEN" ]]; check "temporary session published a pairing" $?
+TMP_CODE=$(grep -oE '[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}' "$WORKDIR/agent-tmp.log" | head -1)
+[[ -n "$TMP_CODE" ]]; check "temporary session printed its challenge code" $?
 OUT=$(cat "$WORKDIR/agent-tmp.log" 2>&1)
 [[ "$OUT" == *"TEMPORARY session"* ]]; check "plain mach announces that it is temporary" $?
-# The property that makes it temporary: nothing on disk, so the next run cannot
-# silently reuse an identity.
+curl -s -o /dev/null -X POST "$BASE/pair/$TMP_TOKEN" \
+  --data "code=$TMP_CODE&org=$ORG&name=$TMP_PART&approve=1"
+sleep 3
+
+# It is enrolled, and recorded as temporary.
+OUT=$(curl -sS "$BASE/v1/machines" -H "Authorization: Bearer $ADMIN_KEY" 2>&1)
+[[ "$OUT" == *"$TMP_NAME"* ]]; check "the temporary session enrolled" $?
+[[ "$OUT" == *'"temporary":true'* ]]; check "and the control plane recorded it as temporary" $?
+
+# Nothing on disk: that is what makes the next run a re-enrollment rather than a
+# silent reuse of an identity.
 ENTRIES=$(ls -A "$TMP_STATE" 2>/dev/null | wc -l | tr -d ' ')
 [[ "$ENTRIES" == "0" ]]; check "the temporary session wrote nothing to the state dir" $?
-# It did reach the control plane: a pairing exists and is waiting for approval.
-OUT=$(curl -sS "$BASE/v1/machines" -H "Authorization: Bearer $ADMIN_KEY" 2>&1)
-[[ "$OUT" != *"$MACHINE-tmp"* ]]; check "the temporary session is not enrolled before approval" $?
-kill "$TMP_PID" 2>/dev/null
-wait "$TMP_PID" 2>/dev/null
-ENTRIES=$(ls -A "$TMP_STATE" 2>/dev/null | wc -l | tr -d ' ')
-[[ "$ENTRIES" == "0" ]]; check "still nothing on disk after the session ends" $?
 
-# And on a host that is already installed, plain `mach` must NOT start a second
-# identity competing with the service — it says so and exits. (agent1 is the
-# state dir of the installed agent from the enrollment steps above.)
+# Ending it retires the enrollment rather than leaving a machine that looks
+# broken. SIGTERM is what Ctrl-C sends.
+kill -TERM "$TMP_PID" 2>/dev/null
+wait "$TMP_PID" 2>/dev/null
+OUT=$(cat "$WORKDIR/agent-tmp.log" 2>&1)
+[[ "$OUT" == *"Retired this enrollment"* ]]; check "the session retired its enrollment on exit" $?
+
+# And the next run takes that name straight back over — no revoke, no delete,
+# which is the whole point of recording it as temporary.
+MACH_SERVER="$BASE" MACH_ORG="$ORG" MACH_STATE_DIR="$TMP_STATE" \
+  "$WORKDIR/mach" >"$WORKDIR/agent-tmp2.log" 2>&1 &
+TMP2_PID=$!
+TMP_TOKEN=""
+for i in $(seq 1 30); do
+  TMP_TOKEN=$(grep -oE '/pair/[a-f0-9]{64}' "$WORKDIR/agent-tmp2.log" | head -1 | cut -d/ -f3)
+  [[ -n "$TMP_TOKEN" ]] && break
+  sleep 0.3
+done
+TMP_CODE=$(grep -oE '[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}' "$WORKDIR/agent-tmp2.log" | head -1)
+curl -s -o /dev/null -X POST "$BASE/pair/$TMP_TOKEN" \
+  --data "code=$TMP_CODE&org=$ORG&name=$TMP_PART&approve=1"
+sleep 3
+OUT=$(curl -sS "$BASE/v1/machines" -H "Authorization: Bearer $ADMIN_KEY" 2>&1)
+[[ "$OUT" == *"$TMP_NAME"* ]]; check "the next temporary run reused the name with no operator action" $?
+[[ "$OUT" == *'"temporary":true'* ]]; check "and is recorded temporary again" $?
+kill -TERM "$TMP2_PID" 2>/dev/null
+wait "$TMP2_PID" 2>/dev/null
+
+# An installed host must not get a second identity from someone typing `mach` at
+# its console. (agent1 is the state dir of the installed agent above.)
 OUT=$(MACH_STATE_DIR="$WORKDIR/agent1" "$WORKDIR/mach" 2>&1)
 [[ $? -ne 0 ]]; check "plain mach on an installed host refuses" $?
 [[ "$OUT" == *"already enrolled"* ]]; check "and explains why, pointing at mach run/install" $?

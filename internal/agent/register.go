@@ -87,7 +87,7 @@ func RegisterQR(server, org, stateDir string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := registerQRCore(server, org, id, e2eKey)
+	cfg, err := registerQRCore(server, org, id, e2eKey, false)
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +102,7 @@ func RegisterQR(server, org, stateDir string) (*Config, error) {
 // loaded, and does NOT persist the result. That split is what lets the temporary
 // session enroll with an in-memory identity: it calls this and never reaches
 // SaveConfig, so nothing it learns outlives the process.
-func registerQRCore(server, org string, id *Identity, e2eKey *E2EKeyPair) (*Config, error) {
+func registerQRCore(server, org string, id *Identity, e2eKey *E2EKeyPair, temporary bool) (*Config, error) {
 	warnInsecureServer(server)
 	start, err := postJSON2[protocol.PairStartResponse](server, "/v1/pair/start", protocol.PairStartReq{
 		PubKey: id.PubHex, PubE2E: e2eKey.PublicKeyHex(),
@@ -161,7 +161,9 @@ approved:
 		OK        string `json:"ok"`
 		Machine   string `json:"machine"`
 		ServerKey string `json:"server_key"`
-	}](server, "/v1/pair/claim", protocol.PairClaimRequest{PubKey: id.PubHex, PubE2E: e2eKey.PublicKeyHex(), Token: start.Token})
+	}](server, "/v1/pair/claim", protocol.PairClaimRequest{
+		PubKey: id.PubHex, PubE2E: e2eKey.PublicKeyHex(), Token: start.Token, Temporary: temporary,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("pair claim: %w", err)
 	}
@@ -180,7 +182,7 @@ func RegisterAPIKey(server, apiKey, name, org, stateDir string) (*Config, error)
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := registerAPIKeyCore(server, apiKey, name, org, id, e2eKey)
+	cfg, err := registerAPIKeyCore(server, apiKey, name, org, id, e2eKey, false)
 	if err != nil {
 		return nil, err
 	}
@@ -192,7 +194,7 @@ func RegisterAPIKey(server, apiKey, name, org, stateDir string) (*Config, error)
 
 // registerAPIKeyCore is registerAPIKey without the persistence, for the same
 // reason registerQRCore is split out.
-func registerAPIKeyCore(server, apiKey, name, org string, id *Identity, e2eKey *E2EKeyPair) (*Config, error) {
+func registerAPIKeyCore(server, apiKey, name, org string, id *Identity, e2eKey *E2EKeyPair, temporary bool) (*Config, error) {
 	warnInsecureServer(server) // the API key itself crosses the wire here
 	resp, err := postJSON2[struct {
 		OK        string `json:"ok"`
@@ -201,6 +203,7 @@ func registerAPIKeyCore(server, apiKey, name, org string, id *Identity, e2eKey *
 	}](server, "/v1/register/apikey", protocol.RegisterAPIKeyReq{
 		APIKey: apiKey, PubKey: id.PubHex, PubE2E: e2eKey.PublicKeyHex(), Name: name,
 		Hostname: hostname(), OS: runtime.GOOS, Arch: runtime.GOARCH, AgentVer: Version,
+		Temporary: temporary,
 	})
 	if err != nil {
 		return nil, err

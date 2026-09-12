@@ -129,6 +129,7 @@ const fleetSource = `
       <td>
         {{if .Revoked}}<span class="badge revoked">revoked</span>
         {{else if .Blocked}}<span class="badge blocked">blocked</span>{{end}}
+        {{if .Temporary}}<span class="badge pinned">temporary</span>{{end}}
         {{if .Online}}<span class="badge online">online</span>
         {{else}}<span class="badge offline">offline</span>{{end}}
       </td>
@@ -151,7 +152,7 @@ const fleetSource = `
           </form>
           {{end}}
           <form class="inline" method="post" action="/ui/revoke" hx-post="/ui/revoke" hx-target="#fleet" hx-swap="outerHTML"
-                hx-confirm="Revoke {{.Name}}? This is permanent: the machine self-retires, its key can never re-enroll, and its name stays reserved. Use Delete instead if you want the name back.">
+                hx-confirm="Revoke {{.Name}}? Its agent is told to retire and its key stops working. The machine can come back by enrolling again under this same name — or use Delete to remove it and free the name for a different machine.">
             <input type="hidden" name="machine" value="{{.Name}}">
             <input type="hidden" name="csrf" value="{{$.CSRF}}">
             <button type="submit">Revoke</button>

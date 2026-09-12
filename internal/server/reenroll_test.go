@@ -60,7 +60,7 @@ func dialAgentExpectRefusal(t *testing.T, srvURL, mach string) *websocket.Conn {
 func TestReEnrollmentRevivesARevokedMachine(t *testing.T) {
 	s, st := newAuthTestServer(t)
 	oldPub, _ := newKeyHex(t)
-	if err := st.CreateMachine("bcross-web", oldPub, "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-web", oldPub, "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := st.RevokeMachine("bcross-web"); err != nil {
@@ -101,7 +101,7 @@ func TestRevivedMachineCanConnectAgain(t *testing.T) {
 
 	mach := "bcross-web"
 	oldPub, _ := newKeyHex(t)
-	if err := st.CreateMachine(mach, oldPub, "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine(mach, oldPub, "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := st.RevokeMachine(mach); err != nil {
@@ -141,7 +141,7 @@ func TestRevivedMachineCanConnectAgain(t *testing.T) {
 func TestReEnrollmentDoesNotDisplaceAnActiveMachine(t *testing.T) {
 	s, st := newAuthTestServer(t)
 	livePub, _ := newKeyHex(t)
-	if err := st.CreateMachine("bcross-web", livePub, "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-web", livePub, "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	key := adminKey(t, s, "enroll")
@@ -178,7 +178,7 @@ func TestReEnrollmentDoesNotDisplaceAnActiveMachine(t *testing.T) {
 func TestReEnrollmentUnderAnotherNameIsRefused(t *testing.T) {
 	s, st := newAuthTestServer(t)
 	pub, _ := newKeyHex(t)
-	if err := st.CreateMachine("bcross-web", pub, "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-web", pub, "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := st.RevokeMachine("bcross-web"); err != nil {
@@ -205,7 +205,7 @@ func TestReEnrollmentUnderAnotherNameIsRefused(t *testing.T) {
 func TestRevokedKeyCanStartAPairing(t *testing.T) {
 	s, st := newAuthTestServer(t)
 	pub, _ := newKeyHex(t)
-	if err := st.CreateMachine("bcross-web", pub, "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-web", pub, "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := st.RevokeMachine("bcross-web"); err != nil {
@@ -226,12 +226,178 @@ func TestRevokedKeyCanStartAPairing(t *testing.T) {
 	// An ACTIVELY enrolled key is still refused, so the pairing path cannot be
 	// used to displace a working agent either.
 	activePub, _ := newKeyHex(t)
-	if err := st.CreateMachine("bcross-live", activePub, "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-live", activePub, "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	code, _ = bearerJSON(t, s.Routes(), "POST", "/v1/pair/start", "",
 		fmt.Sprintf(`{"pub_key":%q,"hostname":"h"}`, activePub))
 	if code != http.StatusConflict {
 		t.Fatalf("an actively enrolled key started a pairing: %d", code)
+	}
+}
+
+// ---- temporary enrollments ----
+
+func enrollTemporaryBody(key, pubHex, name string, temporary bool) string {
+	return fmt.Sprintf(`{"api_key":%q,"pub_key":%q,"name":%q,"temporary":%t}`, key, pubHex, name, temporary)
+}
+
+// A temporary enrollment is recorded as such, and reported to clients — an
+// operator has to be able to tell a throwaway row from a machine.
+func TestTemporaryEnrollmentIsRecordedAndReported(t *testing.T) {
+	s, st := newAuthTestServer(t)
+	key := adminKey(t, s, "enroll")
+	pub, _ := newKeyHex(t)
+
+	code, body := bearerJSON(t, s.Routes(), "POST", "/v1/register/apikey", "",
+		enrollTemporaryBody(key, pub, "bcross-tmp", true))
+	if code != http.StatusOK {
+		t.Fatalf("temporary enrollment returned %d (%s)", code, body)
+	}
+	m, err := st.MachineByName("bcross-tmp")
+	if err != nil || m == nil {
+		t.Fatalf("machine missing: %v", err)
+	}
+	if !m.Temporary || m.Revoked {
+		t.Fatalf("expected an active temporary enrollment: %+v", m)
+	}
+
+	// And the fleet listing says so, so the web UI can badge it.
+	read := adminKey(t, s, "readonly")
+	code, listing := bearerJSON(t, s.Routes(), "GET", "/v1/machines", read, "")
+	if code != http.StatusOK {
+		t.Fatalf("machines: %d %s", code, listing)
+	}
+	if !strings.Contains(listing, `"temporary":true`) {
+		t.Fatalf("the temporary flag is not reported: %s", listing)
+	}
+}
+
+// The "recorded as permanent" half: enrolling the same machine permanently
+// clears the flag, and the machine is then protected like any other live one.
+func TestPermanentReEnrollmentClearsTemporaryOverHTTP(t *testing.T) {
+	s, st := newAuthTestServer(t)
+	key := adminKey(t, s, "enroll")
+	pub1, _ := newKeyHex(t)
+
+	if code, body := bearerJSON(t, s.Routes(), "POST", "/v1/register/apikey", "",
+		enrollTemporaryBody(key, pub1, "bcross-here", true)); code != http.StatusOK {
+		t.Fatalf("temporary enrollment: %d (%s)", code, body)
+	}
+	// `mach install` on a host that ran plain `mach`: same name, permanent.
+	pub2, _ := newKeyHex(t)
+	if code, body := bearerJSON(t, s.Routes(), "POST", "/v1/register/apikey", "",
+		enrollTemporaryBody(key, pub2, "bcross-here", false)); code != http.StatusOK {
+		t.Fatalf("permanent re-enrollment: %d (%s)", code, body)
+	}
+	m, _ := st.MachineByName("bcross-here")
+	if m == nil || m.Temporary {
+		t.Fatalf("the temporary flag survived a permanent enrollment: %+v", m)
+	}
+	if m.PubKey != pub2 {
+		t.Fatalf("the permanent enrollment did not re-key the machine: %q", m.PubKey)
+	}
+
+	// Now it behaves like any other live machine: a temporary session cannot take
+	// it over.
+	pub3, _ := newKeyHex(t)
+	code, body := bearerJSON(t, s.Routes(), "POST", "/v1/register/apikey", "",
+		enrollTemporaryBody(key, pub3, "bcross-here", true))
+	if code != http.StatusConflict {
+		t.Fatalf("a machine made permanent was taken over by a temporary session: %d (%s)", code, body)
+	}
+}
+
+// A session that was killed before it could retire itself leaves a temporary
+// record, and the next run takes it over with no operator action. This is the
+// case the temporary marking exists for.
+func TestTemporarySessionThatNeverRetiredCanReEnroll(t *testing.T) {
+	s, st := newAuthTestServer(t)
+	key := adminKey(t, s, "enroll")
+
+	// First run: enrolled temporary, then killed (no retire, no revoke).
+	pub1, _ := newKeyHex(t)
+	if code, body := bearerJSON(t, s.Routes(), "POST", "/v1/register/apikey", "",
+		enrollTemporaryBody(key, pub1, "bcross-tmp", true)); code != http.StatusOK {
+		t.Fatalf("first enrollment: %d (%s)", code, body)
+	}
+	// No revoke, no delete — nothing. Just run it again.
+	pub2, _ := newKeyHex(t)
+	code, body := bearerJSON(t, s.Routes(), "POST", "/v1/register/apikey", "",
+		enrollTemporaryBody(key, pub2, "bcross-tmp", true))
+	if code != http.StatusOK {
+		t.Fatalf("a temporary session could not retake its own name: %d (%s)", code, body)
+	}
+	m, _ := st.MachineByName("bcross-tmp")
+	if m == nil || m.PubKey != pub2 || !m.Temporary {
+		t.Fatalf("the second run did not take over the record: %+v", m)
+	}
+}
+
+// A temporary session retires its own enrollment on the way out, so a clean exit
+// leaves the machine revoked rather than looking like a machine that stopped
+// working.
+func TestTemporaryAgentRetiresItself(t *testing.T) {
+	s, st := newAuthTestServer(t)
+	srv := httptest.NewServer(s.Routes())
+	t.Cleanup(srv.Close)
+
+	mach := "bcross-tmp"
+	pub, priv := newKeyHex(t)
+	if err := st.CreateMachine(mach, pub, "h", "linux", "amd64", "v", "", true); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	ws := dialAgent(t, srv.URL, mach, pub, priv)
+
+	if err := ws.WriteJSON(protocol.Envelope{Type: "retire"}); err != nil {
+		t.Fatalf("write retire: %v", err)
+	}
+	// The control plane revokes the machine and closes the connection, so the
+	// agent's exit is a retirement rather than a disconnect it would retry.
+	ws.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
+		var env protocol.Envelope
+		if err := ws.ReadJSON(&env); err != nil {
+			break // closed, as expected
+		}
+		if env.Type == "revoked" {
+			break
+		}
+	}
+	if m, _ := st.MachineByName(mach); m == nil || !m.Revoked {
+		t.Fatalf("a temporary session did not retire its enrollment: %+v", m)
+	}
+	// Still temporary: the next run can take it straight back over, which is what
+	// the operator does after a Ctrl-C.
+	if m, _ := st.MachineByName(mach); !m.Temporary {
+		t.Fatal("self-retire cleared the temporary flag")
+	}
+}
+
+// The capability is exactly as narrow as the feature: a PERMANENT agent must not
+// be able to retire a machine the operator expects to stay.
+func TestPermanentAgentCannotRetireItself(t *testing.T) {
+	s, st := newAuthTestServer(t)
+	srv := httptest.NewServer(s.Routes())
+	t.Cleanup(srv.Close)
+
+	mach := "bcross-fixed"
+	pub, priv := newKeyHex(t)
+	if err := st.CreateMachine(mach, pub, "h", "linux", "amd64", "v", "", false); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	ws := dialAgent(t, srv.URL, mach, pub, priv)
+
+	if err := ws.WriteJSON(protocol.Envelope{Type: "retire"}); err != nil {
+		t.Fatalf("write retire: %v", err)
+	}
+	// Give the control plane a moment to have (wrongly) acted on it: the
+	// connection must also stay up, since nothing should have happened at all.
+	time.Sleep(300 * time.Millisecond)
+	if m, _ := st.MachineByName(mach); m == nil || m.Revoked {
+		t.Fatalf("a permanent agent retired itself: %+v", m)
+	}
+	if ac := s.br.Get(mach); ac == nil {
+		t.Fatal("the permanent agent's connection was closed by its own retire request")
 	}
 }
