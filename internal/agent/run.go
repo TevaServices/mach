@@ -4,6 +4,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -27,6 +28,40 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// Exec limits: no single command may produce more than this much output.
+const (
+	maxOutputBytes = 8 << 20 // 8 MiB per stream, then truncated with a marker
+)
+
+// cappedBuffer enforces a hard cap; the process keeps running but further
+// output is discarded (and the tail is marked). Prevents OOM from
+// `cat /dev/urandom` style commands.
+type cappedBuffer struct {
+	buf     bytes.Buffer
+	max     int
+	dropped bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if c.buf.Len()+len(p) > c.max {
+		room := c.max - c.buf.Len()
+		if room > 0 {
+			c.buf.Write(p[:room])
+		}
+		c.dropped = true
+		return len(p), nil // pretend success; runner adds the truncation marker
+	}
+	return c.buf.Write(p)
+}
+
+func (c *cappedBuffer) String() string {
+	s := c.buf.String()
+	if c.dropped {
+		s += "\n[mach: output truncated at cap]"
+	}
+	return s
+}
+
 // Run is the daemon main loop: dial the control plane over an outbound
 // connection, sign in (challenge-bound), execute commands, reconnect with
 // exponential backoff on any failure. Nothing listens inbound.
@@ -48,7 +83,7 @@ func Run(stateDir string) error {
 	backoff := 2 * time.Second
 	for {
 		iterStart := time.Now()
-		err := dialAndServe(cfg, id)
+		err := dialAndServe(cfg, id, stateDir)
 		if errors.Is(err, errShutdown) {
 			return nil
 		}
@@ -82,7 +117,7 @@ var (
 	errRevoked  = errors.New("machine revoked")
 )
 
-func dialAndServe(cfg *Config, id *Identity) error {
+func dialAndServe(cfg *Config, id *Identity, stateDir string) error {
 	url := wsURL(cfg.Server) + "/v1/agent/ws?name=" + urlQueryEscape(cfg.Name)
 	ws, resp, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
@@ -193,7 +228,14 @@ func dialAndServe(cfg *Config, id *Identity) error {
 		}
 		switch env.Type {
 		case "exec":
-			go handleExec(conn, env, execSem)
+			go handleExecFrame(conn, env, execSem, stateDir)
+		case "exec_stream":
+			go handleStream(conn, env, execSem, stateDir)
+		case "stream_stdin", "stream_kill":
+			// Routed to a live session via the stream registry (server
+			// relays by session ID). Sessions not found are ignored —
+			// the console WS already closed.
+			handleStreamInput(env)
 		case "update":
 			if err := handleUpdate(cfg, env); err != nil {
 				log.Printf("agent: update failed: %v", err)
@@ -211,22 +253,21 @@ func dialAndServe(cfg *Config, id *Identity) error {
 // maxConcurrentExec bounds simultaneously running remote commands.
 const maxConcurrentExec = 8
 
-func handleExec(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{}) {
+// runCommandResult executes the ExecCommand JSON payload and returns the
+// result without replying (callers reply or seal as appropriate).
+func runCommandResult(cmdPayload []byte, sem chan struct{}) protocol.ExecResult {
 	var cmd protocol.ExecCommand
-	if err := json.Unmarshal(env.Payload, &cmd); err != nil {
-		replyExec(conn, env.ReqID, protocol.ExecResult{Error: "bad exec payload"})
-		return
+	if err := json.Unmarshal(cmdPayload, &cmd); err != nil {
+		return protocol.ExecResult{Error: "bad exec payload"}
 	}
 	select {
 	case sem <- struct{}{}:
 		defer func() { <-sem }()
 	case <-time.After(10 * time.Second):
-		replyExec(conn, env.ReqID, protocol.ExecResult{Error: "too many concurrent commands on this machine", ExitCode: 126})
-		return
+		return protocol.ExecResult{Error: "too many concurrent commands on this machine", ExitCode: 126}
 	}
 	if reason := globalPolicy.Evaluate(cmd.Command, cmd.Argv); reason != "" {
-		replyExec(conn, env.ReqID, protocol.ExecResult{Error: reason, ExitCode: 126})
-		return
+		return protocol.ExecResult{Error: reason, ExitCode: 126}
 	}
 	timeout := time.Duration(cmd.Timeout) * time.Second
 	if timeout <= 0 {
@@ -246,68 +287,44 @@ func handleExec(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{})
 		// Shell mode: one parse by the OS-appropriate default shell.
 		sh, err := resolveShell()
 		if err != nil {
-			replyExec(conn, env.ReqID, protocol.ExecResult{Error: err.Error(), ExitCode: 126})
-			return
+			return protocol.ExecResult{Error: err.Error(), ExitCode: 126}
 		}
 		c = exec.CommandContext(ctx, sh.path, sh.args(cmd.Command)...)
 	}
-	// Output is streamed to the control plane as it is produced; see
-	// stream.go for the chunking and per-stream cap.
-	//
-	// What the command prints is data and stays data: it is copied to the
-	// control plane and nowhere else. Nothing in this function — and nothing
-	// in the agent — reads output back to decide what to run next. The only
-	// things the agent acts on are frames from the control plane, and a frame
-	// is only accepted after the pinned-key check in dialAndServe. A command
-	// whose output mimics a protocol frame, a mach message, or a new command
-	// is a command that printed text.
-	stdout := newChunkWriter(conn, env.ReqID, "stdout")
-	stderr := newChunkWriter(conn, env.ReqID, "stderr")
-	c.Stdout = stdout
-	c.Stderr = stderr
-	// Stdout/stderr are writers (not files), so os/exec copies through a
+	// What the command prints is data and stays data: it is buffered, sent to
+	// the control plane, and nowhere else. Nothing in this function — and
+	// nothing in the agent — reads output back to decide what to run next. The
+	// only things the agent acts on are frames from the control plane, and a
+	// frame is only accepted after the pinned-key check in the read loop
+	// above. A command whose output mimics a protocol frame, a mach message or
+	// a new command is a command that printed text.
+	var stdout, stderr cappedBuffer
+	stdout.max = maxOutputBytes
+	stderr.max = maxOutputBytes
+	c.Stdout = &stdout
+	c.Stderr = &stderr
+	// Stdout/stderr are buffers (not files), so os/exec copies through a
 	// pipe: if a command backgrounds a grandchild that inherits the pipe,
 	// the copy goroutine outlives the direct child. WaitDelay bounds that
 	// wait — without it, `sleep 3600 &` style commands hang Wait() forever
 	// past the timeout, leaking the goroutine and losing the result.
 	c.WaitDelay = 10 * time.Second
+	applyConfinement(c)
 	// Do not leak the agent's own environment (MACH_USER, MACH_POLICY, ...)
 	// into every command the control plane runs.
 	c.Env = filteredEnv()
-
-	// Flush ticks so the last of a trickle of output is not held until the
-	// command exits. Stopped and drained before the writers are closed, so no
-	// chunk can be sent after the terminal exec_result.
-	flushDone := make(chan struct{})
-	flusherStopped := make(chan struct{})
-	go func() {
-		defer close(flusherStopped)
-		t := time.NewTicker(chunkFlushInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-flushDone:
-				return
-			case <-t.C:
-				stdout.Flush()
-				stderr.Flush()
-			}
-		}
-	}()
-
 	runErr := c.Run()
-	close(flushDone)
-	<-flusherStopped
-	stdout.Close()
-	stderr.Close()
 
-	res := protocol.ExecResult{}
+	res := protocol.ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
 	switch {
 	case runErr == nil:
 		res.ExitCode = 0
 	case ctx.Err() != nil:
 		res.Error = fmt.Sprintf("timed out after %s", timeout)
 		res.ExitCode = -1
+		// Confinement: kill the whole process group so detached
+		// grandchildren don't outlive the command (unix).
+		killProcessTree(c)
 	default:
 		var ee *exec.ExitError
 		if errors.As(runErr, &ee) {
@@ -317,6 +334,11 @@ func handleExec(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{})
 			res.ExitCode = 127
 		}
 	}
+	return res
+}
+
+func handleExec(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{}) {
+	res := runCommandResult(env.Payload, sem)
 	replyExec(conn, env.ReqID, res)
 }
 

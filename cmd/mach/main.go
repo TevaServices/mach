@@ -140,20 +140,59 @@ func consoleMain(args []string) {
 			if m.Online {
 				status = "online"
 			}
-			fmt.Printf("%-20s %-8s %-10s %-18s %s\n", m.Name, status, m.OS+"/"+m.Arch, m.Hostname, m.AgentVer)
+			// The E2E column is here, not in a separate command, because it is
+			// a property of what you can do to that machine: whether a command
+			// sent to it is sealed or readable by the control plane.
+			e2e := "e2e=on"
+			if m.E2E == "off" {
+				e2e = "e2e=off"
+			}
+			fmt.Printf("%-20s %-8s %-10s %-18s %-8s %s\n", m.Name, status, m.OS+"/"+m.Arch, m.Hostname, e2e, m.AgentVer)
 		}
 
 	case "exec":
-		// mach exec [--json] <machine> <command...>
-		// mach exec [--json] <machine> -- <argv...>
+		// mach exec [--json] [--e2e|--no-e2e] <machine> <command...>
+		// mach exec [--json] [--e2e|--no-e2e] <machine> -- <argv...>
 		rest := args[1:]
 		asJSON := false
-		if len(rest) > 0 && rest[0] == "--json" {
-			asJSON = true
-			rest = rest[1:]
+		e2e := console.E2EObey
+		// Flags stop at the machine name, so nothing in a command can be
+		// swallowed as a flag. A bare -- also ends them, for scripts that
+		// want to be explicit.
+		i := 0
+		for i < len(rest) && strings.HasPrefix(rest[i], "--") {
+			switch rest[i] {
+			case "--json":
+				asJSON = true
+			case "--e2e":
+				e2e = console.E2ERequire
+			case "--no-e2e":
+				e2e = console.E2EForbid
+			case "--":
+				// explicit end of flags
+			default:
+				fmt.Fprintf(os.Stderr, "mach: unknown flag %q\n", rest[i])
+				os.Exit(2)
+			}
+			i++
 		}
+		rest = rest[i:]
 		if len(rest) < 2 {
-			fmt.Fprintln(os.Stderr, "usage: mach exec [--json] <machine> <command...>\n       mach exec [--json] <machine> -- <argv...>   (no-shell mode: args pass through byte-exact)\n\n  --json   emit the control plane's stream frames as NDJSON on stdout\n           (for programs: output is labeled data, exit status is a field)")
+			fmt.Fprintln(os.Stderr, `usage: mach exec [--json] [--e2e|--no-e2e] <machine> <command...>
+       mach exec [--json] [--e2e|--no-e2e] <machine> -- <argv...>   (no-shell mode: args pass through byte-exact)
+
+  --json     print the result as one JSON object instead of raw output
+             (for programs: output is labeled data and the exit status is
+             a field, so nothing has to parse a mixed stream)
+  --e2e      require end-to-end encryption: fail rather than send the command
+             in plaintext (the control plane decides whether it will accept a
+             sealed command; without this flag mach obeys its answer)
+  --no-e2e   never seal: send plaintext, where the fleet-wide block list can
+             read it and the audit log can record the command itself
+
+By default mach obeys the control plane's E2E setting: it seals when the
+control plane accepts sealed commands and the machine has a key, and says so
+on stderr when it cannot.`)
 			os.Exit(2)
 		}
 		machine, cmdArgs := rest[0], rest[1:]
@@ -162,16 +201,27 @@ func consoleMain(args []string) {
 			// own JSON string and exec'd directly on the machine. Your
 			// local shell does the only quoting pass; the remote side
 			// never splits or re-parses anything.
-			os.Exit(c.ExecArgv(machine, cmdArgs[1:], 0, asJSON))
+			os.Exit(c.ExecArgv(machine, cmdArgs[1:], 0, asJSON, e2e))
 		}
-		os.Exit(c.Exec(machine, strings.Join(cmdArgs, " "), 0, asJSON))
+		os.Exit(c.Exec(machine, strings.Join(cmdArgs, " "), 0, asJSON, e2e))
 
 	case "console":
-		if len(args) < 2 {
+		// mach console [--no-e2e] <machine>
+		rest := args[1:]
+		if len(rest) > 0 && rest[0] == "--e2e" {
+			fmt.Fprintln(os.Stderr, "mach: console cannot be end-to-end encrypted: a live session is a relay of\n"+
+				"      many small frames, and only a single command/result can be sealed.\n"+
+				"      Use `mach exec --e2e <machine> <command>` for a sealed one-shot command.")
+			os.Exit(2)
+		}
+		if len(rest) > 0 && rest[0] == "--no-e2e" {
+			rest = rest[1:]
+		}
+		if len(rest) < 1 {
 			fmt.Fprintln(os.Stderr, "usage: mach console <machine>")
 			os.Exit(2)
 		}
-		os.Exit(c.Console(args[1]))
+		os.Exit(c.Console(rest[0]))
 
 	case "audit":
 		machine := "*"

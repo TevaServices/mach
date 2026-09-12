@@ -37,6 +37,31 @@ func main() {
 		}
 		fmt.Printf("api key created: name=%q scopes=%q\n", args[1], args[2])
 		fmt.Printf("KEY (shown once, store it now): %s\n", key)
+	case "e2e":
+		// mach-server e2e [on|off|inherit] [--org ORG] — whether this control
+		// plane accepts sealed (E2E) exec commands, per org. Reports the
+		// effective setting when given no value. Stored in the database;
+		// MACH_E2E overrides every org when set.
+		set, org := "", ""
+		rest := args[1:]
+		for i := 0; i < len(rest); i++ {
+			switch {
+			case rest[i] == "--org" && i+1 < len(rest):
+				org = strings.ToLower(strings.TrimSpace(rest[i+1]))
+				i++
+			case strings.HasPrefix(rest[i], "--org="):
+				org = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(rest[i], "--org=")))
+			case set == "":
+				set = rest[i]
+			default:
+				fmt.Fprintln(os.Stderr, "usage: mach-server e2e [on|off|inherit] [--org ORG]")
+				os.Exit(2)
+			}
+		}
+		if err := controlplane.E2E(set, org); err != nil {
+			fmt.Fprintln(os.Stderr, "mach-server: "+err.Error())
+			os.Exit(1)
+		}
 	case "revoke-machine":
 		// mach-server revoke-machine <name> [--purge-audit]
 		if len(args) < 2 {
@@ -110,7 +135,14 @@ func usage() {
 
   mach-server serve                              run the control plane
                                                  (MACH_DB, MACH_LISTEN, MACH_PUBLIC_URL,
-                                                  MACH_ORG=<org prefix>, MACH_TRUST_PROXY=1)
+                                                  MACH_ORG=<org prefix>, MACH_TRUST_PROXY=1,
+                                                  MACH_E2E=on|off, MACH_EXEC_POLICY/_FILE)
+  mach-server e2e [on|off|inherit] [--org ORG]   whether this control plane accepts sealed (E2E)
+                                                 exec commands, per org (no --org = the default
+                                                 for orgs without their own setting; inherit =
+                                                 drop an org's override). Stored in the database;
+                                                 MACH_E2E overrides every org when set. Clients
+                                                 are told which it is and obey or refuse to run.
   mach-server add-api-key <name> <scopes>        create a key: enroll | readonly | exec:* | exec:m1|m2
                                                  (secret generated server-side, printed once)
   mach-server revoke-machine <name> [--purge-audit]

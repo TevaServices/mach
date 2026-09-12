@@ -83,9 +83,14 @@ func RegisterQR(server, org, stateDir string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	e2eKey, err := LoadOrCreateE2EKey(stateDir)
+	if err != nil {
+		return nil, err
+	}
 	warnInsecureServer(server)
 	start, err := postJSON2[protocol.PairStartResponse](server, "/v1/pair/start", protocol.PairStartReq{
-		PubKey: id.PubHex, Hostname: hostname(), OS: runtime.GOOS, Arch: runtime.GOARCH, AgentVer: Version,
+		PubKey: id.PubHex, PubE2E: e2eKey.PublicKeyHex(),
+		Hostname: hostname(), OS: runtime.GOOS, Arch: runtime.GOARCH, AgentVer: Version,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("pair start: %w", err)
@@ -140,7 +145,7 @@ approved:
 		OK        string `json:"ok"`
 		Machine   string `json:"machine"`
 		ServerKey string `json:"server_key"`
-	}](server, "/v1/pair/claim", protocol.PairClaimRequest{PubKey: id.PubHex, Token: start.Token})
+	}](server, "/v1/pair/claim", protocol.PairClaimRequest{PubKey: id.PubHex, PubE2E: e2eKey.PublicKeyHex(), Token: start.Token})
 	if err != nil {
 		return nil, fmt.Errorf("pair claim: %w", err)
 	}
@@ -159,13 +164,17 @@ func RegisterAPIKey(server, apiKey, name, org, stateDir string) (*Config, error)
 	if err != nil {
 		return nil, err
 	}
+	e2eKey, err := LoadOrCreateE2EKey(stateDir)
+	if err != nil {
+		return nil, err
+	}
 	warnInsecureServer(server) // the API key itself crosses the wire here
 	resp, err := postJSON2[struct {
 		OK        string `json:"ok"`
 		Machine   string `json:"machine"`
 		ServerKey string `json:"server_key"`
 	}](server, "/v1/register/apikey", protocol.RegisterAPIKeyReq{
-		APIKey: apiKey, PubKey: id.PubHex, Name: name,
+		APIKey: apiKey, PubKey: id.PubHex, PubE2E: e2eKey.PublicKeyHex(), Name: name,
 		Hostname: hostname(), OS: runtime.GOOS, Arch: runtime.GOARCH, AgentVer: Version,
 	})
 	if err != nil {

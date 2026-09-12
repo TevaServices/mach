@@ -32,7 +32,8 @@ func TestReadonlyKeySeesEverythingButRunsNothing(t *testing.T) {
 	s, st := newAuthTestServer(t)
 	h := s.Routes()
 	for _, name := range []string{"bcross-a", "bcross-b"} {
-		if err := st.CreateMachine(name, "pub-"+name, "h", "linux", "amd64", "v"); err != nil {
+		// No E2E key: this machine is exercised over the plaintext path.
+		if err := st.CreateMachine(name, "pub-"+name, "h", "linux", "amd64", "v", ""); err != nil {
 			t.Fatalf("seed %s: %v", name, err)
 		}
 		_ = st.AuditInsert("2026-01-01T00:00:00Z", name, "echo hi", "console:x", sql.NullInt64{Int64: 0, Valid: true}, "hi", "")

@@ -13,20 +13,19 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// wsPair gives a writer connected to a server-side reader, and a channel of
-// the envelopes that reader receives. Chunking is exercised on the wire rather
-// than mocked; the reader runs in the background because a read *timeout*
-// permanently poisons a gorilla connection, so "nothing was sent yet" cannot
-// be tested with a short read deadline.
-func wsPair(t *testing.T) (*protocol.WSConn, <-chan protocol.Envelope) {
+// streamPipe gives the agent side of a websocket pair — the conn handleStream
+// writes its frames to — plus the peer the test reads them from. Frames are
+// exercised on the wire rather than mocked: the contract that matters is what
+// the control plane receives.
+func streamPipe(t *testing.T) (*protocol.WSConn, *websocket.Conn) {
 	t.Helper()
-	serverSide := make(chan *protocol.WSConn, 1)
+	serverSide := make(chan *websocket.Conn, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
 		if err != nil {
 			return
 		}
-		serverSide <- protocol.NewWSConn(c)
+		serverSide <- c
 	}))
 	t.Cleanup(srv.Close)
 
@@ -34,140 +33,149 @@ func wsPair(t *testing.T) (*protocol.WSConn, <-chan protocol.Envelope) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	var server *protocol.WSConn
+	t.Cleanup(func() { client.Close() })
+
+	var server *websocket.Conn
 	select {
 	case server = <-serverSide:
 	case <-time.After(5 * time.Second):
 		t.Fatal("server side never connected")
 	}
+	return protocol.NewWSConn(server), client
+}
 
-	frames := make(chan protocol.Envelope, 16)
-	go func() {
-		defer close(frames)
-		for {
-			_ = server.SetReadDeadline(time.Now().Add(10 * time.Second))
-			env, err := server.ReadEnvelope()
+// readEnvelope reads one frame, failing the test rather than hanging.
+func readEnvelope(t *testing.T, peer *websocket.Conn) protocol.Envelope {
+	t.Helper()
+	_ = peer.SetReadDeadline(time.Now().Add(10 * time.Second))
+	var env protocol.Envelope
+	if err := peer.ReadJSON(&env); err != nil {
+		t.Fatalf("read frame: %v", err)
+	}
+	return env
+}
+
+// collectStream reads frames until stream_end and returns the decoded stdout,
+// stderr and the terminal record.
+func collectStream(t *testing.T, peer *websocket.Conn) (stdout, stderr string, end protocol.StreamEnd) {
+	t.Helper()
+	var out, errOut strings.Builder
+	for {
+		env := readEnvelope(t, peer)
+		switch env.Type {
+		case "stream_out":
+			var chunk protocol.StreamOut
+			if err := json.Unmarshal(env.Payload, &chunk); err != nil {
+				t.Fatalf("stream_out payload: %v", err)
+			}
+			b, err := base64.StdEncoding.DecodeString(chunk.B64)
 			if err != nil {
-				return // deadline or closed: the test is over
+				t.Fatalf("stream_out base64: %v", err)
 			}
-			select {
-			case frames <- env:
-			case <-time.After(5 * time.Second):
-				return // nobody is reading; do not leak the goroutine
+			if chunk.Stream == "stderr" {
+				errOut.Write(b)
+			} else {
+				out.Write(b)
 			}
+		case "stream_end":
+			if err := json.Unmarshal(env.Payload, &end); err != nil {
+				t.Fatalf("stream_end payload: %v", err)
+			}
+			return out.String(), errOut.String(), end
+		default:
+			t.Fatalf("unexpected frame %q while streaming", env.Type)
 		}
-	}()
-	// The writer is what the test drives; closing it here also lets the
-	// reader goroutine finish.
-	t.Cleanup(func() { client.Close() })
-	return protocol.NewWSConn(client), frames
-}
-
-// nextChunk waits for one exec_chunk frame and returns its decoded payload.
-func nextChunk(t *testing.T, frames <-chan protocol.Envelope, reqID string) []byte {
-	t.Helper()
-	select {
-	case env, ok := <-frames:
-		if !ok {
-			t.Fatal("connection closed while waiting for a chunk")
-		}
-		if env.Type != "exec_chunk" {
-			t.Fatalf("frame type = %q, want exec_chunk", env.Type)
-		}
-		if env.ReqID != reqID {
-			t.Fatalf("req_id = %q, want %q", env.ReqID, reqID)
-		}
-		var ch protocol.ExecChunk
-		if err := json.Unmarshal(env.Payload, &ch); err != nil {
-			t.Fatalf("payload: %v", err)
-		}
-		data, err := base64.StdEncoding.DecodeString(ch.DataB64)
-		if err != nil {
-			t.Fatalf("base64: %v", err)
-		}
-		return data
-	case <-time.After(5 * time.Second):
-		t.Fatal("no chunk arrived")
-		return nil
 	}
 }
 
-func expectNoFrame(t *testing.T, frames <-chan protocol.Envelope, d time.Duration) {
-	t.Helper()
-	select {
-	case env, ok := <-frames:
-		if ok {
-			t.Fatalf("unexpected frame: %+v", env)
-		}
-	case <-time.After(d):
+// The agent's guardrail applies to a streaming session exactly as it does to a
+// one-shot exec: the same rules, evaluated before anything is spawned.
+func TestStreamRefusesDeniedCommand(t *testing.T) {
+	globalPolicy.install("deny:stream-refused-marker\n")
+	conn, peer := streamPipe(t)
+
+	payload, _ := json.Marshal(protocol.StreamStart{Command: "echo stream-refused-marker"})
+	handleStream(conn, protocol.Envelope{Type: "exec_stream", ReqID: "sess-deny", Payload: payload},
+		make(chan struct{}, 1), t.TempDir())
+
+	env := readEnvelope(t, peer)
+	if env.Type != "stream_end" {
+		t.Fatalf("first frame = %q, want stream_end (nothing may run)", env.Type)
+	}
+	if env.ReqID != "sess-deny" {
+		t.Errorf("req_id = %q, want the session id echoed back", env.ReqID)
+	}
+	var end protocol.StreamEnd
+	if err := json.Unmarshal(env.Payload, &end); err != nil {
+		t.Fatalf("stream_end payload: %v", err)
+	}
+	if end.ExitCode != 126 {
+		t.Errorf("exit code = %d, want 126", end.ExitCode)
+	}
+	if !strings.Contains(end.Error, "deny:stream-refused-marker") {
+		t.Errorf("refusal %q does not name the rule that refused it", end.Error)
 	}
 }
 
-func TestChunkWriterHoldsSmallWritesUntilFlush(t *testing.T) {
-	w, frames := wsPair(t)
-	cw := newChunkWriter(w, "req1", "stdout")
-	if _, err := cw.Write([]byte("hello")); err != nil {
-		t.Fatalf("write: %v", err)
+func TestStreamRunsAllowedCommandAndReportsExit(t *testing.T) {
+	globalPolicy.install("")
+	conn, peer := streamPipe(t)
+
+	payload, _ := json.Marshal(protocol.StreamStart{Command: "echo streamed-hello; echo oops >&2; exit 7"})
+	handleStream(conn, protocol.Envelope{Type: "exec_stream", ReqID: "sess-run", Payload: payload},
+		make(chan struct{}, 1), t.TempDir())
+
+	stdout, stderr, end := collectStream(t, peer)
+	if !strings.Contains(stdout, "streamed-hello") {
+		t.Errorf("stdout = %q, want the command's output", stdout)
 	}
-	// Under the threshold nothing is on the wire: chunking must not turn one
-	// small write into one frame.
-	expectNoFrame(t, frames, 150*time.Millisecond)
-	cw.Flush()
-	if got := string(nextChunk(t, frames, "req1")); got != "hello" {
-		t.Errorf("flushed %q, want %q", got, "hello")
+	if !strings.Contains(stderr, "oops") {
+		t.Errorf("stderr = %q, want the command's stderr", stderr)
+	}
+	// The exit status is a field of the terminal record, never text in the
+	// output stream: nothing the command prints can become a control fact.
+	if end.ExitCode != 7 {
+		t.Errorf("exit code = %d, want 7 (got error %q)", end.ExitCode, end.Error)
 	}
 }
 
-func TestChunkWriterFlushesAtThreshold(t *testing.T) {
-	w, frames := wsPair(t)
-	cw := newChunkWriter(w, "req2", "stderr")
-	payload := strings.Repeat("x", chunkFlushBytes)
-	if _, err := cw.Write([]byte(payload)); err != nil {
-		t.Fatalf("write: %v", err)
+// argv mode goes straight to execve: no shell runs, so a byte-exact argument
+// survives even when it looks like something a shell would expand.
+func TestStreamArgvModeRunsNoShell(t *testing.T) {
+	if runtimeGOOS() == "windows" {
+		t.Skip("no portable echo binary on windows")
 	}
-	// A full threshold's worth goes out without waiting for Flush or a tick.
-	if got := nextChunk(t, frames, "req2"); len(got) != chunkFlushBytes {
-		t.Fatalf("chunk len = %d, want %d", len(got), chunkFlushBytes)
+	globalPolicy.install("")
+	conn, peer := streamPipe(t)
+
+	payload, _ := json.Marshal(protocol.StreamStart{Argv: []string{"echo", "$HOME"}})
+	handleStream(conn, protocol.Envelope{Type: "exec_stream", ReqID: "sess-argv", Payload: payload},
+		make(chan struct{}, 1), t.TempDir())
+
+	stdout, _, end := collectStream(t, peer)
+	if strings.TrimSpace(stdout) != "$HOME" {
+		t.Errorf("stdout = %q, want the literal $HOME — a shell expanded it", stdout)
 	}
-	expectNoFrame(t, frames, 100*time.Millisecond)
+	if end.ExitCode != 0 {
+		t.Errorf("exit code = %d, want 0", end.ExitCode)
+	}
 }
 
-func TestChunkWriterCapsAndMarksTruncation(t *testing.T) {
-	w, frames := wsPair(t)
-	cw := newChunkWriter(w, "req3", "stdout")
-	cw.limit = 10
-	// Overflow writes are swallowed, not turned into errors: the process must
-	// keep running so its exit status can still be reported.
-	for i := 0; i < 3; i++ {
-		n, err := cw.Write([]byte("0123456789"))
-		if err != nil || n != 10 {
-			t.Fatalf("write %d: n=%d err=%v", i, n, err)
-		}
-	}
-	cw.Close()
-	// One chunk: the capped head, then the marker. Everything past the cap is
-	// gone, and the marker is what tells the console output was lost.
-	want := "0123456789" + truncationMarker
-	if got := string(nextChunk(t, frames, "req3")); got != want {
-		t.Fatalf("chunk = %q, want %q", got, want)
-	}
-	// Exactly one chunk: the terminal exec_result is sent by the caller
-	// (handleExec), after Close.
-	expectNoFrame(t, frames, 150*time.Millisecond)
-}
+// A malformed start must end the session with a refusal rather than leaving the
+// console waiting for output that will never come.
+func TestStreamRejectsMalformedStart(t *testing.T) {
+	conn, peer := streamPipe(t)
 
-func TestChunkWriterNeverErrorsAfterBreak(t *testing.T) {
-	w, _ := wsPair(t)
-	cw := newChunkWriter(w, "req4", "stdout")
-	// flushLocked sets broken when the control plane refuses a chunk (the peer
-	// is gone); the state is set directly here so the contract is tested
-	// without depending on when a TCP reset is observed.
-	cw.broken = true
-	for i := 0; i < 2; i++ {
-		if n, err := cw.Write([]byte("more output")); n != len("more output") || err != nil {
-			t.Fatalf("write %d after break: n=%d err=%v", i, n, err)
-		}
+	handleStream(conn, protocol.Envelope{Type: "exec_stream", ReqID: "sess-bad", Payload: json.RawMessage(`"not an object"`)},
+		make(chan struct{}, 1), t.TempDir())
+
+	env := readEnvelope(t, peer)
+	if env.Type != "stream_end" {
+		t.Fatalf("frame = %q, want stream_end", env.Type)
 	}
-	cw.Flush()
-	cw.Close() // must not panic nor try to send
+	var end protocol.StreamEnd
+	_ = json.Unmarshal(env.Payload, &end)
+	if end.ExitCode != 126 || end.Error == "" {
+		t.Errorf("refusal = %+v, want exit 126 and a reason", end)
+	}
 }

@@ -2,7 +2,6 @@ package server
 
 import (
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -69,9 +68,14 @@ func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request, keyName,
 		if !all && !containsFold(allowed, m.Name) {
 			continue
 		}
+		// The E2E signal rides each machine, not the listing: the setting is
+		// per org, and a client holding a machine name can decide without
+		// having to work out which org it belongs to.
+		e2eState := s.e2eStateFor(m.Name)
 		resp.Machines = append(resp.Machines, protocol.MachineInfo{
 			Name: m.Name, Hostname: m.Hostname, OS: m.OS, Arch: m.Arch,
 			Online: online[m.Name], AgentVer: m.AgentVer, CreatedAt: m.CreatedAt,
+			E2E: e2eState.Mode, E2EReason: e2eState.Reason,
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -115,16 +119,47 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json"})
 		return
 	}
-	if req.Machine == "" || (req.Command == "" && len(req.Argv) == 0) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "machine and (command or argv) are required"})
+	if req.Machine == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "machine is required"})
+		return
+	}
+	// Two modes: plaintext (command/argv) or E2E (sealed + e2e_pub). In E2E
+	// mode the server relays an opaque blob and audits a placeholder.
+	if req.Sealed == "" && req.Command == "" && len(req.Argv) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "machine and (command or argv or sealed) are required"})
 		return
 	}
 	if req.Command != "" && len(req.Argv) > 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provide command or argv, not both"})
 		return
 	}
+	if (req.Sealed != "") != (req.E2EPub != "") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "sealed and e2e_pub must be provided together"})
+		return
+	}
 	if !keyCanExecOn(scopes, req.Machine) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key is not scoped for machine " + req.Machine})
+		return
+	}
+	display := commandForDisplay(req.Command, req.Argv)
+	// Sealed (E2E) exec is the control plane's call, not the client's: it is the
+	// party that cannot read ciphertext, and the one an operator points at when
+	// they want a fleet that can (or cannot) be inspected. With E2E off the
+	// command is refused here — before dispatch, so nothing reaches the machine
+	// — and the client is told in the response why, rather than being left to
+	// discover it from a console that silently ran in plaintext.
+	//
+	// Note what the flag does NOT do: the fleet-wide block list keeps checking
+	// every plaintext command, on both paths, whether E2E is on or off. Turning
+	// it off is how an operator restores that check over the one-shot path too
+	// (a sealed command has no text to match); it is not a way to switch the
+	// block list off.
+	if req.Sealed != "" && !s.e2eStateFor(req.Machine).Enabled {
+		state := s.e2eStateFor(req.Machine)
+		s.st.AuditInsert(nowRFC3339(), req.Machine, auditSealedLabel, "console:"+keyName,
+			sqlNullInt(execRefused), "", "sealed exec refused: E2E is off for this machine's org")
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error": "sealed exec is disabled on this control plane: " + state.Reason})
 		return
 	}
 	// The fleet-wide block list, checked here — after the caller is
@@ -132,7 +167,6 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 	// and every machine is subject to it. The refusal is a plain HTTP error
 	// (no stream has started) and is audited like any other attempt, so a
 	// blocked command shows up in the record rather than vanishing.
-	display := commandForDisplay(req.Command, req.Argv)
 	if reason := s.execPolicyCheck(req.Command, req.Argv); reason != "" {
 		s.auditExec(&pendingExec{machine: req.Machine, command: display, source: "console:" + keyName},
 			execRefused, "", reason)
@@ -154,8 +188,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 
 	reqID := store.RandToken(8)
 	pe := &pendingExec{
-		ch:      make(chan execOutcome, 1),
-		out:     make(chan protocol.ExecChunk, execOutChanBuf),
+		ch:      make(chan execReply, 1),
 		machine: req.Machine,
 		command: display,
 		source:  "console:" + keyName,
@@ -169,118 +202,100 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 		s.pendMu.Unlock()
 	}()
 
-	cmdPayload, _ := json.Marshal(protocol.ExecCommand{Command: req.Command, Argv: req.Argv, Timeout: req.Timeout})
+	var cmdPayload []byte
+	if req.Sealed != "" {
+		// E2E: relay the sealed blob to the agent verbatim, carrying the
+		// console's reply key. The server never sees the command.
+		cmdPayload, _ = json.Marshal(protocol.SealedExecCommand{
+			SealedB64: req.Sealed,
+			ReplyPub:  strings.TrimSpace(req.E2EPub),
+			Timeout:   req.Timeout,
+		})
+	} else {
+		cmdPayload, _ = json.Marshal(protocol.ExecCommand{Command: req.Command, Argv: req.Argv, Timeout: req.Timeout})
+	}
 	if err := ac.Conn.WriteEnvelope(protocol.Envelope{Type: "exec", ReqID: reqID, Payload: cmdPayload}); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent connection lost"})
 		return
 	}
 
-	s.relayExec(w, pe, req)
+	grace := time.Duration(req.Timeout)*time.Second + 10*time.Second
+	select {
+	case reply := <-pe.ch:
+		if reply.Sealed != "" {
+			// E2E: audit metadata only (never plaintext).
+			s.st.AuditInsert(nowRFC3339(), pe.machine, auditSealedLabel, pe.source,
+				sql.NullInt64{Int64: int64(reply.Result.ExitCode), Valid: true}, "", "")
+			writeJSON(w, http.StatusOK, execReplyWire{ExitCode: reply.Result.ExitCode, SealedB64: reply.Sealed})
+			return
+		}
+		s.auditExec(pe, reply.Result.ExitCode, reply.Result.Stdout, reply.Result.Stderr)
+		writeJSON(w, http.StatusOK, reply.Result)
+	case <-time.After(grace):
+		res := protocol.ExecResult{Error: "timed out waiting for agent result"}
+		s.auditExec(pe, -1, "", res.Error)
+		writeJSON(w, http.StatusGatewayTimeout, res)
+	}
 }
 
-// relayExec streams one command's output to the console as NDJSON: one JSON
-// object per line, flushed as it arrives, ending with an "exit" record.
+const auditSealedLabel = "[E2E sealed command]"
+
+// e2ePubResponse is the control signal a console reads before it decides how to
+// send a command: whether this control plane accepts sealed exec at all, and
+// the key to seal to when it does.
 //
-// Everything that can fail before this point has already been answered with an
-// HTTP status. From the moment the response is committed the status is 200, so
-// failures that happen after dispatch — including the agent's own error and
-// this server's timeout — are reported inside the stream instead. A client
-// must therefore read the exit record, not the status line, to learn how the
-// command ended.
-func (s *Server) relayExec(w http.ResponseWriter, pe *pendingExec, req protocol.ExecRequest) {
-	w.Header().Set("Content-Type", "application/x-ndjson")
-	w.Header().Set("Cache-Control", "no-store")
-	// Ask reverse proxies not to buffer. A buffering proxy would hold the
-	// command's whole output and hand it over at the end, which is exactly
-	// the behavior streaming exists to remove.
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-
-	rc := http.NewResponseController(w)
-	enc := json.NewEncoder(w)
-	send := func(f protocol.ExecStreamFrame) bool {
-		// Per-write deadline: a console that stops reading must not pin this
-		// goroutine, the pending exec, or the connection's resources. Reset on
-		// every frame, so a slow-but-alive client can stream indefinitely.
-		_ = rc.SetWriteDeadline(time.Now().Add(execWriteTimeout))
-		if err := enc.Encode(f); err != nil {
-			return false
-		}
-		return rc.Flush() == nil
-	}
-	sendExit := func(code int, errMsg string) bool {
-		return send(protocol.ExecStreamFrame{Type: protocol.ExecStreamExit, ExitCode: &code, Error: errMsg})
-	}
-
-	timer := time.NewTimer(time.Duration(req.Timeout)*time.Second + 10*time.Second)
-	defer timer.Stop()
-
-	for {
-		select {
-		case chunk := <-pe.out:
-			if !send(chunkFrame(chunk)) {
-				return
-			}
-		case out := <-pe.ch:
-			// The agent sends every chunk of a command's output before its
-			// terminal result, but pe.out is buffered, so frames still queued
-			// must be drained before the exit record — otherwise output would
-			// appear after the command was reported finished.
-			for drained := false; !drained; {
-				select {
-				case chunk := <-pe.out:
-					if !send(chunkFrame(chunk)) {
-						return
-					}
-				default:
-					drained = true
-				}
-			}
-			if out.truncated {
-				if !send(protocol.ExecStreamFrame{
-					Type:    protocol.ExecStreamChunk,
-					Stream:  "stderr",
-					DataB64: base64.StdEncoding.EncodeToString([]byte("[mach: output dropped — the console was not reading fast enough]\n")),
-				}) {
-					return
-				}
-			}
-			if !sendExit(out.res.ExitCode, out.res.Error) {
-				return
-			}
-			s.auditExec(pe, out.res.ExitCode, out.stdout, auditStderr(out))
-			return
-		case <-timer.C:
-			// The agent is responsible for enforcing the timeout it was
-			// given; reaching this means it never answered (died mid-command,
-			// or the connection stalled). Either way the command's fate on the
-			// machine is unknown — it is not cancelled, only this caller's
-			// wait ends.
-			msg := "timed out waiting for agent result"
-			_ = sendExit(-1, msg)
-			s.auditExec(pe, -1, "", msg)
-			return
-		}
-	}
+// The two facts are separate fields on purpose. "The server will not accept
+// ciphertext" and "this machine never registered a key" are different problems
+// with different fixes, and a client that had to tell them apart from an error
+// string would get it wrong eventually. With E2E off no key is advertised at
+// all, so an obeying client never seals to a key the server would refuse.
+type e2ePubResponse struct {
+	E2EState
+	Machine string `json:"machine"`
+	PubE2E  string `json:"pub_e2e,omitempty"`
+	// Note explains an absent key when E2E is on.
+	Note string `json:"note,omitempty"`
 }
 
-// chunkFrame wraps an agent chunk for the console. The base64 payload is
-// passed through untouched — re-encoding it would only risk corrupting bytes.
-func chunkFrame(chunk protocol.ExecChunk) protocol.ExecStreamFrame {
-	return protocol.ExecStreamFrame{Type: protocol.ExecStreamChunk, Stream: chunk.Stream, DataB64: chunk.DataB64}
-}
-
-// auditStderr is what the audit row records for stderr: what the command wrote
-// plus, when it failed to run or was killed, why.
-func auditStderr(out execOutcome) string {
+// handleE2EPub serves the target machine's X25519 public key so a console
+// can seal exec commands to it, plus what this control plane accepts. Scoped
+// like exec: a key that may run commands on the machine may fetch its E2E key.
+func (s *Server) handleE2EPub(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
+	name := r.PathValue("name")
+	if !keyCanExecOn(scopes, name) && scopes != "readonly" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key is not scoped for machine " + name})
+		return
+	}
+	m, err := s.st.MachineByName(name)
+	if err != nil || m == nil || m.Revoked {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown machine"})
+		return
+	}
+	resp := e2ePubResponse{E2EState: s.e2eStateFor(m.Name), Machine: m.Name}
 	switch {
-	case out.res.Error == "":
-		return out.stderr
-	case out.stderr == "":
-		return out.res.Error
+	case !resp.Enabled:
+		// Nothing else to say: the reason is in E2EState.
+	case m.PubE2E == "":
+		// Older agents enrolled before E2E: no key registered. Not an error —
+		// the client is told the server accepts sealing but this machine has no
+		// key, which is a different sentence from "E2E is off".
+		resp.Note = "machine has no E2E key — re-enroll to enable E2E"
 	default:
-		return out.stderr + "\n[mach: " + out.res.Error + "]"
+		resp.PubE2E = m.PubE2E
 	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// execReply is what the agent pump hands back: either plaintext or sealed.
+type execReply struct {
+	Result protocol.ExecResult
+	Sealed string // base64 sealed ExecResult (E2E mode); empty for plaintext
+}
+
+// execReplyWire is the HTTP response in E2E mode.
+type execReplyWire struct {
+	ExitCode  int    `json:"exit_code"`
+	SealedB64 string `json:"sealed_b64"`
 }
 
 func (s *Server) auditExec(pe *pendingExec, exitCode int, stdout, stderr string) {
@@ -378,6 +393,11 @@ func (s *Server) handleRevokeMachine(w http.ResponseWriter, r *http.Request, key
 	// or key name containing newlines could forge log lines.
 	s.logf("machine revoked: %q (by %q)", req.Machine, keyName)
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "revoked", "machine": req.Machine})
+}
+
+// sqlNullInt is an audit exit status (or a NULL when there is none to report).
+func sqlNullInt(code int) sql.NullInt64 {
+	return sql.NullInt64{Int64: int64(code), Valid: true}
 }
 
 func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }

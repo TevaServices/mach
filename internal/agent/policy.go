@@ -41,6 +41,14 @@ func (l *lazyPolicy) Evaluate(command string, argv []string) string {
 	return l.p.Evaluate(command, argv)
 }
 
+// install replaces the process-wide guardrail at runtime. The lazy load is
+// marked done so a later Evaluate never re-reads the environment out from under
+// whoever installed the rules.
+func (l *lazyPolicy) install(spec string) {
+	l.once.Do(func() {})
+	l.p.Replace(spec)
+}
+
 func policyPath() string {
 	return StateDir() + "/policy.txt"
 }
