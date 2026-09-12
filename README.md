@@ -56,6 +56,7 @@ Explicit subcommands:
 | `mach exec --no-e2e <m> <cmd...>` | never encrypt: keep the command readable to the fleet-wide block list and the audit log |
 | `mach console <m>` | interactive remote shell: output streams live, stdin and Ctrl-C reach the machine (`:!` runs locally) |
 | `mach audit [m] [n]` | recent command audit log |
+| `mach trust [m]` | pinned E2E keys per machine; `mach trust <m>` accepts a changed key, `--forget` drops the pin |
 
 A machine's output goes to stdout verbatim; mach's own messages go to stderr
 with a `mach: ` prefix, so a script never has to guess which is which.

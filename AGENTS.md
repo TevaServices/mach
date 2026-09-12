@@ -102,12 +102,20 @@ This is `mach`: remote CLI access to registered machines, outbound-only
     restores sealing with no re-enrollment. Do not reintroduce a "refuse sealed
     while a policy is configured" rule: the flag is the single decision point,
     and a sealed command is exactly what an operator chose when they left it on.
-15. **Every dispatched command is audited, streamed ones included.** The relay
+15. **The console pins each machine's E2E key on first use** (`console/pins.go`,
+    `<state dir>/e2e_pins.json`, 0600), because the key comes from the control
+    plane and the control plane is what the seal defends against. A changed key
+    refuses to seal in every mode, naming both fingerprints and `mach trust`;
+    `mach trust <machine>` is the only thing that accepts one, and
+    `--forget` is the only way to turn the protection off. Do not add a silent
+    fallback from a pin mismatch to plaintext, and do not make a corrupt pin file
+    read as "no pins" — both turn the control off exactly when it matters.
+16. **Every dispatched command is audited, streamed ones included.** The relay
     writes a row when the agent reports the exit status — command, source, exit
     code, head of the output — and a `-1` row if the stream ends without one
     (the command's fate on the machine is unknown, so the row says so). A
     refusal is audited as `126` with the rule that refused it, on both paths.
-16. **`readonly` cannot stream.** `/v1/console/stream` is command execution; a
+17. **`readonly` cannot stream.** `/v1/console/stream` is command execution; a
     key that can only watch must not reach it, or the scope is decorative.
 
 ## Environment variables (control plane)
@@ -140,6 +148,7 @@ only covered at the SQL-translation level.
   policy, the streaming relay, the per-org E2E flag and its control signal, the
   fleet-rules mirror and its propagation), agent (policy — including fleet rules
   binding a sealed command — shells, streaming writers, confinement), console
+  (the E2E signal, key pinning, trust)
   (output-is-data, lost-stream, obeying/refusing the E2E signal), policy,
   protocol, release and in-toto all have coverage; keep it that way for touched
   code.
@@ -153,7 +162,9 @@ only covered at the SQL-translation level.
   which is the live proof of the per-org control signal. It also proves the
   fleet block list applies to SEALED commands (the rules reach the machine and
   refuse them there) and that a rule added to the policy file on disk reaches a
-  machine that is already connected. Green = 70 checks.
+  machine that is already connected. Pinning is covered too: the first sealed
+  command reports the pin, a pin that no longer matches what the control plane
+  advertises refuses to seal, and `mach trust` is the only thing that accepts it. Green = 78 checks.
 - Timing-sensitive e2e checks (streaming) use a real sleep and a real
   background process; if one flakes, make the sleep longer rather than
   weakening the assertion.

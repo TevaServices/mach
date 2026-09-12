@@ -220,7 +220,11 @@ grep -qE '"pub_e2e":"[a-f0-9]{64}"' "$WORKDIR/e2epub.json"; check "machine E2E k
 # control plane could not read what it relayed.
 sleep 1
 BEFORE=$(machc audit "$MACHINE" 1 2>/dev/null | head -1)
-machc exec "$MACHINE" 'echo sealed-marker-e2e' >/dev/null 2>&1
+# This is the first sealed command to this machine, so it is also where the key
+# gets pinned — and the operator is told, because a first use is the one moment
+# there is no protection at all.
+PINOUT=$(machc exec "$MACHINE" 'echo sealed-marker-e2e' 2>&1)
+[[ "$PINOUT" == *"pinned the E2E key for $MACHINE"* ]]; check "first sealed command reported the pin" $?
 sleep 1
 AUDIT=$(machc audit "$MACHINE" 1 2>/dev/null | head -1)
 [[ "$AUDIT" == *"[E2E sealed command]"* ]]; check "command was sealed (audit is a placeholder)" $?
@@ -263,6 +267,25 @@ sleep 1
 AUDIT=$(machc audit "$MACHINE" 1 2>/dev/null | head -1)
 [[ "$AUDIT" == *"[E2E sealed command]"* ]]; check "the refused command stayed sealed in the record" $?
 [[ "$AUDIT" != *"fleet-blocked-marker"* ]]; check "the control plane still cannot read it" $?
+# First use pins the key the control plane advertised — the seal is only worth
+# what that key is, and the control plane is the party it defends against.
+PINS="$CONSOLE_DIR/e2e_pins.json"
+[[ -f "$PINS" ]]; check "the machine's E2E key was pinned on first use" $?
+grep -q "$MACHINE" "$PINS"; check "the pin names the machine" $?
+# A pin that no longer matches what the control plane hands out stops sealing.
+# Written by hand here because, from the console's side, this is indistinguishable
+# from a control plane that swapped the key — which is the point.
+jq '.machines["'"$MACHINE"'"].pub_e2e = "0000000000000000000000000000000000000000000000000000000000000000"' \
+  "$PINS" > "$PINS.tmp" && mv "$PINS.tmp" "$PINS"
+OUT=$(machc exec "$MACHINE" 'echo must-not-be-sealed' 2>&1) && CODE=0 || CODE=$?
+[[ "$CODE" -ne 0 ]]; check "a changed E2E key refuses to seal" $?
+[[ "$OUT" == *"E2E key for $MACHINE changed"* ]]; check "the refusal says the key changed" $?
+[[ "$OUT" == *"mach trust $MACHINE"* ]]; check "the refusal names the remedy" $?
+# The explicit re-trust is the only thing that accepts it, and sealing works again.
+machc trust "$MACHINE" | grep -q "$MACHINE"; check "mach trust re-pins the key" $?
+OUT=$(machc exec "$MACHINE" 'echo after-trust') || true
+[[ "$OUT" == *"after-trust"* ]]; check "sealing works again after trust" $?
+
 # A rule added to the fleet list after this machine connected must reach it
 # without a restart or a reconnect: the rules are enforced on the machines, so a
 # change that only updated the control plane would leave every running agent

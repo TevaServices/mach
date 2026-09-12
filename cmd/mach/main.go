@@ -41,7 +41,7 @@ func main() {
 	// Explicit subcommands keep working everywhere.
 	if len(args) > 0 {
 		switch args[0] {
-		case "list", "exec", "console", "audit":
+		case "list", "exec", "console", "audit", "trust":
 			consoleMain(args)
 			return
 		case "register", "run", "install", "service", "version", "help":
@@ -65,6 +65,8 @@ Make it permanent:         mach install    (register the OS service)
 On an admin machine:       mach            (first run: setup wizard; then: live fleet status)
 Run commands:              mach exec <m> <cmd...>   |   mach exec <m> -- <argv>  (byte-exact)
                            mach console <m>         |   mach list, mach audit [m] [n]
+Sealed exec (E2E):         mach exec --e2e <m> <cmd...>  (fail rather than send plaintext)
+                           mach trust               pinned E2E keys for each machine
 Agent/service:             mach register [--server URL | --api-key K --name N], mach run, mach version
 
 The control plane is a separate binary: mach-server (runs in a container).
@@ -222,6 +224,75 @@ on stderr when it cannot.`)
 			os.Exit(2)
 		}
 		os.Exit(c.Console(rest[0]))
+
+	case "trust":
+		// mach trust                       list pinned E2E keys
+		// mach trust <machine>             accept the key the control plane now advertises
+		// mach trust --forget <machine>    drop the pin (the next sealed command re-pins)
+		rest := args[1:]
+		forget := false
+		if len(rest) > 0 && rest[0] == "--forget" {
+			forget = true
+			rest = rest[1:]
+		}
+		switch {
+		case forget && len(rest) == 1:
+			existed, err := c.ForgetMachine(rest[0])
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "mach: "+err.Error())
+				os.Exit(3)
+			}
+			if !existed {
+				fmt.Printf("no pin for %s (nothing to forget)\n", rest[0])
+				return
+			}
+			fmt.Printf("forgot the pinned E2E key for %s — the next sealed command will pin again\n", rest[0])
+		case forget:
+			fmt.Fprintln(os.Stderr, "usage: mach trust --forget <machine>")
+			os.Exit(2)
+		case len(rest) == 1:
+			fingerprint, previous, err := c.TrustMachine(rest[0])
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "mach: "+err.Error())
+				os.Exit(3)
+			}
+			if previous == "" {
+				fmt.Printf("pinned %s -> %s\n", rest[0], fingerprint)
+				return
+			}
+			if previous == fingerprint {
+				fmt.Printf("%s is already pinned to %s\n", rest[0], fingerprint)
+				return
+			}
+			// Show both, so the change is visible at the moment it is accepted
+			// rather than only in the refusal that prompted it.
+			fmt.Printf("re-pinned %s\n  was %s\n  now %s\n", rest[0], previous, fingerprint)
+		case len(rest) == 0:
+			machines, err := c.PinnedMachines()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "mach: "+err.Error())
+				os.Exit(3)
+			}
+			if len(machines) == 0 {
+				fmt.Printf("no pinned E2E keys yet (%s)\n", console.PinPath())
+				return
+			}
+			for _, m := range machines {
+				fingerprint, pinnedAt, org, _, err := c.PinnedKey(m)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "mach: "+err.Error())
+					os.Exit(3)
+				}
+				label := org
+				if label == "" {
+					label = "-"
+				}
+				fmt.Printf("%-24s %-20s %-8s %s\n", m, fingerprint, label, pinnedAt)
+			}
+		default:
+			fmt.Fprintln(os.Stderr, "usage: mach trust [<machine>]\n       mach trust --forget <machine>")
+			os.Exit(2)
+		}
 
 	case "audit":
 		machine := "*"

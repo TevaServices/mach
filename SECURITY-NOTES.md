@@ -50,10 +50,34 @@ message saying they cannot do what they were asked to.
   itself can read and refuse it before dispatching anything.
 
 What the seal is worth, stated plainly: it keeps the command and its output from
-the control plane, and it is authenticated (a tampered envelope fails to open) —
-but it is not protection from the control plane substituting the key it hands
-out (`/e2epub` is that same party's word), and it is not protection from the
-machine's own operator. There is no key-transparency mechanism behind it.
+the control plane and it is authenticated (a tampered envelope fails to open) —
+but the key it seals to is handed out by the control plane itself, so a control
+plane that wanted to read the command could advertise its own key and open what
+it received. The console closes that as far as it can with **trust on first use**:
+it remembers the first key it is given for each machine and refuses to seal to any
+other, which turns a silent permanent capability into a one-shot, visible one.
+
+Precisely what that does and does not buy:
+
+- **Detected**: a key substituted after this console has sealed to that machine.
+  Sealing stops with an error naming both fingerprints, and stays stopped until a
+  human runs `mach trust <machine>`. Nothing downgrades to plaintext on the way.
+- **Not detected**: a key substituted *before* the first sealed command, which
+  silently pins whatever it was given. There is no way around that without an
+  out-of-band fingerprint or a key-transparency log, and this does not have one.
+- **Also caught, and indistinguishable**: a machine that legitimately re-enrolled
+  with a fresh key (wiped state dir, rebuilt host). The remedy is the same
+  explicit command, which is the point: a key change is a decision, not something
+  a client resolves on its own.
+- **The pin file is a control in its own right** (`<state dir>/e2e_pins.json`,
+  0600): whoever can rewrite it chooses which key this console seals to. A file
+  that cannot be parsed is an error rather than an empty pin set, because
+  "unreadable" silently re-pinning would disable the protection exactly when
+  something is wrong. `mach trust --forget <machine>` is the deliberate way to
+  turn it off for one machine.
+- It is not protection from the machine's own operator, and it says nothing about
+  whether the machine is the one you think it is — only that it is the same one
+  you spoke to last time.
 
 **Nothing on any agent changes in either direction.** An agent keeps its
 `e2e.key`, keeps registering the public half at enrollment, and keeps opening
@@ -97,6 +121,7 @@ from the broker; nothing protects content from the machine's own operator.
 | Sealed exec refused while the setting is off, before dispatch, and no key advertised — so a client cannot believe it sealed | consoleapi.go handleExec, handleE2EPub |
 | Per-machine command policy on the agent itself (`MACH_POLICY` / `policy.txt`), evaluated where no upstream can override it, on both paths | agent/policy.go, internal/policy |
 | E2E sealing of one-shot exec: X25519 + ChaCha20-Poly1305, ephemeral sender key per command, AEAD key derived with HKDF (recipient and format version bound into the info string), AAD = the sender's ephemeral pubkey, format version checked on the way in | internal/e2e, agent/e2eexec.go |
+| **Trust-on-first-use pinning of each machine's E2E key** on the console: a changed key refuses to seal (naming both fingerprints and the remedy) instead of sealing to whatever the control plane now advertises | console/pins.go, client.go runExec |
 | `readonly` keys refused on the streaming endpoint (it is command execution, not observation) | stream.go handleConsoleStreamWS |
 | Confinement of remote commands: own process group (unix), SIGKILL as a tree on timeout (Windows: timeout + caps only) | agent/confine*.go |
 | Output caps per path, with visible truncation markers; streamed frames dropped rather than stalling an agent whose console stopped reading | agent/run.go, agent/streamexec.go |
@@ -282,11 +307,16 @@ signature protects delivery, the attestation records provenance.
 4. **Output caps are per-path and lossy at the edges**: a buffered command
    producing more than 8 MiB loses the tail; a slow console loses streamed
    frames. Both are marked visibly, but they are not recoverable.
-5. **Rate limiting is per-IP and in-memory**: a restart clears the counters,
+5. **The control plane hands out the key the seal uses**, so it can substitute one
+   before a console has ever sealed to a machine. Trust-on-first-use pinning makes
+   a later substitution loud and one-shot, not impossible (see "Trust model"), and
+   nothing here is a key-transparency mechanism. A console that has never sealed
+   to a machine has no protection at all.
+6. **Rate limiting is per-IP and in-memory**: a restart clears the counters,
    and a distributed source is not one IP. The pairing and enrollment paths
    are single indexed lookups, so the amplification that would have justified
    tighter limits is gone; the limits that remain are there to slow scanning.
-6. **The fleet-wide block list applies to sealed commands by running on the
+7. **The fleet-wide block list applies to sealed commands by running on the
    machine, and that has a residue worth naming.** The rules have to travel to
    the agent and be evaluated there, which means: an agent that has not yet
    received them (it is connecting, or the control plane is mid-change) enforces
@@ -299,7 +329,7 @@ signature protects delivery, the attestation records provenance.
    log (which cannot read what it cannot decrypt). The agent acknowledges the
    ruleset version it holds, so "which machines have the current rules" is
    answerable rather than assumed.
-7. **The copies of the agent binaries baked into the container image are not
+8. **The copies of the agent binaries baked into the container image are not
    attested** by `push-update --attestation`, which covers runtime pushes only
    (issue #4).
 
@@ -311,9 +341,13 @@ signature protects delivery, the attestation records provenance.
       each agent's own `MACH_POLICY` set for what that machine must never run.
 - [ ] Decide the E2E setting per org (`mach-server e2e`), with the trade in
       mind: sealing off means the block list can read commands; sealing on means
-      the one-shot path is opaque to the control plane, and the block list
-      governs only plaintext. `MACH_E2E` pins it deployment-wide if a container
-      spec should win over a runtime change.
+      the one-shot path is opaque to the control plane and the fleet rules are
+      enforced on the machine instead. `MACH_E2E` pins it deployment-wide if a
+      container spec should win over a runtime change.
+- [ ] On each console, the first sealed command to a machine pins its key
+      (`mach trust` lists what is pinned). Treat a "key changed" refusal as an
+      incident question, not a nuisance: `mach trust <machine>` accepts the new
+      key, and it is the only thing that does.
 - API keys minted per consumer with least scope (enroll keys only where
   enrollment happens; per-machine allowlists for consoles; `readonly` for
   dashboards and monitoring).
