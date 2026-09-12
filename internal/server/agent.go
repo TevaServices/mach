@@ -172,20 +172,22 @@ func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, map[string]string{"error": msg})
 		return
 	}
-	// Create, or revive a revoked machine that is enrolling again.
-	revived, err := s.st.ReactivateMachine(name, req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer, pubE2E)
+	// Create, or take over a revoked or temporary row that is enrolling again.
+	// The flag travels with the enrollment, so a permanent enrollment clears a
+	// temporary row's flag: that is what "recorded as permanent" means here.
+	took, err := s.st.ReenrollMachine(name, req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer, pubE2E, req.Temporary)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
 	}
-	if !revived {
-		if err := s.st.CreateMachine(name, req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer, pubE2E); err != nil {
+	if !took {
+		if err := s.st.CreateMachine(name, req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer, pubE2E, req.Temporary); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 			return
 		}
-		s.logf("api-key enrollment: machine=%s host=%q", name, req.Hostname)
+		s.logf("api-key enrollment: machine=%s host=%q temporary=%v", name, req.Hostname, req.Temporary)
 	} else {
-		s.logf("api-key re-enrollment: revived revoked machine=%s host=%q", name, req.Hostname)
+		s.logf("api-key re-enrollment: took over machine=%s host=%q temporary=%v", name, req.Hostname, req.Temporary)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": name, "server_key": s.serverKeyHex})
 }
@@ -194,18 +196,22 @@ func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
 //
 // Two rules, and together they are the whole policy:
 //
-//   - An ACTIVELY enrolled machine is never displaced. Not its name, not its
-//     key. This keeps the name-conflict rejection that stops an operator's typo
-//     (or a hostile enrollee) from taking over a working agent's identity.
+//   - An ACTIVELY enrolled, PERMANENT machine is never displaced. Not its name,
+//     not its key. This keeps the name-conflict rejection that stops an
+//     operator's typo (or a hostile enrollee) from taking over a working agent.
 //   - A REVOKED machine may be revived by enrolling again. That is what makes
 //     revocation a forced re-enrollment rather than a permanent ban: the agent
 //     self-retires, the name and key stay reserved, and the machine comes back
 //     only through a fresh enrollment — which needs an enroll key or a phone
 //     approval, so it is still operator-gated.
+//   - A TEMPORARY machine may be taken over too. Its record belongs to a session
+//     rather than to a machine, so the next run of that session reuses the name
+//     without the operator revoking or deleting anything first — which matters
+//     because a session revokes itself on the way out but may not get the chance.
 //
-// The actual revive is guarded in SQL too (ReactivateMachine matches only
-// revoked rows), so this check is about the message a caller gets, not about the
-// property holding.
+// The takeover is guarded in SQL too (store.reenroll matches only revoked or
+// temporary rows), so this check is about the message a caller gets, not about
+// the property holding.
 func (s *Server) enrollmentRefusal(name, pubkey string) (int, string) {
 	byKey, err := s.st.MachineByPubKey(pubkey)
 	if err != nil {
@@ -230,7 +236,9 @@ func (s *Server) enrollmentRefusal(name, pubkey string) (int, string) {
 	if byName == nil {
 		return 0, ""
 	}
-	if !byName.Revoked {
+	// Revoked or temporary rows may be taken over (see store.reenroll); anything
+	// else is a live machine whose name is its own.
+	if !byName.Revoked && !byName.Temporary {
 		return http.StatusConflict, "machine name already taken — pick a new name (e.g. " + name + "-2)"
 	}
 	return 0, ""
@@ -354,12 +362,45 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 			} else {
 				s.logf("agent %q sent a stream frame for an unbound session", machine.Name)
 			}
+		case "retire":
+			s.handleSelfRetire(machine.Name)
 		case "ping":
 			_ = conn.WriteEnvelope(protocol.Envelope{Type: "pong"})
 		default:
 			s.logf("agent %s sent unknown frame %q", machine.Name, env.Type)
 		}
 	}
+}
+
+// handleSelfRetire retires a machine at its own request, for a temporary session
+// cleaning up on the way out.
+//
+// Only a TEMPORARY enrollment may do this. Its record belongs to a session
+// rather than to a machine, so retiring is the session removing itself; a
+// permanent agent must not be able to retire a machine the operator expects to
+// stay, and that case is refused and logged rather than obeyed. The capability is
+// also scoped by construction — the name is the connection's own, taken from the
+// authenticated handshake, so an agent can retire itself and nothing else.
+//
+// It re-reads the row rather than trusting the flag seen at connect: the question
+// is what this enrollment is *now*, and a session that was re-enrolled
+// permanently mid-connection must not still be able to retire itself.
+func (s *Server) handleSelfRetire(name string) {
+	m, err := s.st.MachineByName(name)
+	if err != nil || m == nil {
+		return
+	}
+	if !m.Temporary {
+		s.logf("agent %q asked to retire itself but is a permanent enrollment — refusing", name)
+		return
+	}
+	// revokeMachine writes the flag, sends the terminal frame and closes the
+	// socket, which is exactly what a retirement is; the agent is exiting anyway.
+	if err := s.revokeMachine(name, false); err != nil {
+		s.logf("agent %q self-retire failed: %v", name, err)
+		return
+	}
+	s.logf("machine %q retired itself (temporary session ended)", name)
 }
 
 // pushQueuedUpdate delivers a machine's queued, signed update over a live
@@ -454,7 +495,7 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, map[string]string{"error": msg})
 		return
 	}
-	ok, err := s.st.ConsumePairing(p, pubE2E)
+	ok, err := s.st.ConsumePairing(p, pubE2E, req.Temporary)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return

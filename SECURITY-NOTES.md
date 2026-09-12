@@ -135,8 +135,10 @@ from the broker; nothing protects content from the machine's own operator.
 | Machine output is data, never input: nothing in the agent reads it back, and the console labels it rather than parsing a control fact out of text | agent/run.go, console/client.go, console/stream.go |
 | Audit log with secret-value redaction; every dispatched command recorded on both paths; refusals audited too; a stream that dies without an exit status recorded as `-1`; optional purge on revoke | store.RedactScrubs/AuditInsert/RemoveMachineAudit, server/stream.go |
 | Signed in-toto attestations for released agent binaries, verified before an update can be queued | internal/release, controlplane/attest.go |
-| Revocation: self-retiring agents, names and keys stay reserved. **A revoked machine can be revived by re-enrolling it — and only a revoked one**: the guard is the `WHERE revoked=1` in `ReactivateMachine`, so an actively enrolled machine's name and key can never be taken by an enrollment | store.RevokeMachine/ReactivateMachine, server enrollmentRefusal, agent errRevoked |
+| Revocation: self-retiring agents, names and keys stay reserved. **A revoked OR temporary machine can be taken over by re-enrolling it — and only one of those two**: the guard is the `WHERE revoked=1 OR temporary=1` in `store.reenroll`, so an actively enrolled **permanent** machine's name and key can never be taken by an enrollment | store.RevokeMachine/reenroll, server enrollmentRefusal, agent errRevoked |
 | **Temporary session** (plain `mach` on a target): enrolls and serves with the identity key, E2E key and config held **in memory only**, so Ctrl-C is a real shutdown and running it again re-enrolls. It cannot read, write or delete the persistent state, so an installed host's enrollment is untouchable from it — and bare `mach` there refuses rather than starting a second identity | agent/ephemeral.go, registerQRCore/registerAPIKeyCore, cmd/mach bootStrap |
+| **The temporary enrollment is recorded as such**, and the session **retires it on exit** via a `retire` frame on its own authenticated connection. Accepted **only** from a temporary machine, so a permanent agent cannot retire a machine the operator expects to stay; the frame carries no name, so an agent can retire itself and nothing else | protocol retire, server handleSelfRetire, store.machines.temporary |
+| Challenge codes are compared in **one canonical form** (`store.NormalizeCode`), used by both the hashing and the page. It used to be hashed dashed and compared undashed, which meant no correct code could ever be approved — see the working note in AGENTS.md | store.NormalizeCode, server/pairpages.go, paircode_test.go, pairhttp_test.go |
 | Agent privilege drop on linux root (MACH_USER, default nobody) | agent/droppriv_linux.go |
 | X-Forwarded-For honored only with MACH_TRUST_PROXY=1 | server.New + SetTrustProxy |
 | Pair-page security headers (CSP default-src 'none', XFO DENY, nosniff, no-referrer); cross-site POST refused | pairpages.go |
@@ -405,12 +407,19 @@ signature protects delivery, the attestation records provenance.
     can enroll. A true ban means removing the enrollment paths themselves (revoke
     the enroll keys, or drop the org). Say this plainly rather than implying
     `revoke` is permanent.
-16. **A temporary session leaves its enrollment behind.** The row is the record —
-    a connection needs one — so a host that ran plain `mach` stays enrolled and
-    offline, holding its name. Running again under that name needs the row
-    revoked (or deleted) first, and the session says so on exit rather than
-    leaving the operator to meet it as a name conflict. Nothing else about the
-    host persists: no key, no config, no E2E key on disk.
+16. **A temporary session leaves its enrollment behind, on purpose.** The row is
+    the record — a connection needs one — so a host that ran plain `mach` stays
+    enrolled, holding its name. It is recorded as *temporary*, which is what lets
+    the next run take that name straight back over with no operator action, and
+    that matters most in the case that has no tidy path: a session killed
+    outright, or cut off before it can retire itself. Nothing else about the host
+    persists: no key, no config, no E2E key on disk.
+17. **A temporary machine can retire itself; a permanent one cannot.** The
+    `retire` frame is scoped to the connection's own machine, so it grants an
+    agent power over itself and nothing else — and it is refused outright for a
+    permanent enrollment, so a compromised permanent agent cannot retire the
+    machine it runs on. The one thing it can do is remove itself from the fleet,
+    which is visible (the row shows revoked) and recoverable (re-enroll).
 
 ## Deployment checklist
 

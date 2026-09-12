@@ -247,6 +247,11 @@ type fleetRow struct {
 	Online   bool
 	Blocked  bool
 	Revoked  bool
+	// Temporary marks an enrollment that belongs to a session rather than to a
+	// machine (plain `mach` on a target). Shown so an operator can tell a
+	// throwaway row from a real one, and so a session that never got to retire
+	// itself is not mistaken for a machine that stopped working.
+	Temporary bool
 }
 
 // fleetRows assembles the fleet listing for the UI, including revoked machines.
@@ -261,7 +266,7 @@ func (s *Server) fleetRows() ([]fleetRow, error) {
 		rows = append(rows, fleetRow{
 			Name: m.Name, Hostname: m.Hostname, OS: m.OS, Arch: m.Arch,
 			AgentVer: m.AgentVer, Online: online[m.Name],
-			Blocked: m.Blocked, Revoked: m.Revoked,
+			Blocked: m.Blocked, Revoked: m.Revoked, Temporary: m.Temporary,
 		})
 	}
 	return rows, nil

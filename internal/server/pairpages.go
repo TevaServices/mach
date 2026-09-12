@@ -155,8 +155,14 @@ func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store
 		renderPair(w, pairPageData{Error: "Machine part must be 1-48 chars (letters/digits/hyphen). Final name: " + org + "-<machine>.", State: "pending-retry", Token: token, Orgs: s.ListOrgs()})
 		return
 	}
-	if existing, _ := s.st.MachineByName(name); existing != nil {
-		renderPair(w, pairPageData{Error: "Machine name already taken — pick a new name (e.g. " + name + "-2).", State: "pending-retry", Token: token, Orgs: s.ListOrgs()})
+	// Whether this name may be taken is the enrollment policy's call, not this
+	// page's. A revoked or temporary row may be taken over (see store.reenroll),
+	// and a second copy of that rule living here is exactly how the QR path came
+	// to disagree with the API-key path — this check refused a name the store
+	// would have accepted, so a temporary session could retire itself and then
+	// never come back under its own name.
+	if status, msg := s.enrollmentRefusal(name, p.PubKey); status != 0 {
+		renderPair(w, pairPageData{Error: msg + " Final name: " + name + ".", State: "pending-retry", Token: token, Orgs: s.ListOrgs()})
 		return
 	}
 
@@ -196,13 +202,8 @@ func renderPair(w http.ResponseWriter, data pairPageData) {
 
 // normalizeCode uppercases and strips separators so XXXX-XXXX-XXXX can be
 // typed with or without dashes/spaces.
-func normalizeCode(s string) string {
-	var b strings.Builder
-	for _, r := range strings.ToUpper(strings.TrimSpace(s)) {
-		if r == '-' || r == ' ' {
-			continue
-		}
-		b.WriteRune(r)
-	}
-	return b.String()
-}
+// normalizeCode is the display-form normalization, kept as a local name so the
+// page reads the same as before. It delegates to the store, which is where the
+// hashing happens: these two agreeing is the whole point, and they have not
+// always — see store.NormalizeCode.
+func normalizeCode(s string) string { return store.NormalizeCode(s) }

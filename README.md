@@ -30,10 +30,14 @@ connection right there in that console.
 
 Bare `mach` is a **temporary session**: it keeps the identity key, the E2E key
 and the config in memory and writes nothing, so Ctrl-C ends it and running
-`mach` again enrolls this host from scratch. That also means it cannot disturb a
-machine you have already installed — on one of those it says so and exits rather
-than starting a second identity. To make a connection permanent
-(auto-start at boot, reconnect after network loss), run once:
+`mach` again enrolls this host from scratch. Its enrollment is marked temporary
+on the control plane and it retires that enrollment when it ends — and because it
+is marked temporary, running `mach` again reuses the same name without you having
+to revoke or delete anything first (which matters when a session is killed rather
+than stopped). It cannot disturb a machine you have already installed — on one of
+those it says so and exits rather than starting a second identity. To make a
+connection permanent (auto-start at boot, reconnect after network loss), run
+once:
 
 ```
 mach install
@@ -252,8 +256,9 @@ Put Caddy/nginx in front for TLS (agents speak wss://).
   removing the enrollment paths themselves.
 - **A temporary session leaves its enrollment on the control plane.** Plain
   `mach` keeps nothing on disk, so Ctrl-C ends it — but the machine row is the
-  record a connection needs, so it stays (offline). Reusing that name next time
-  means revoking or deleting the row first; the session prints the command.
+  record a connection needs, so it stays, marked *temporary* and revoked. Next
+  time you run `mach` there it takes that name straight back over; the row is
+  visible in the fleet (and badged "temporary") until you delete it.
 
 Follow-up work tracks in GitHub issues (#2 sandboxing, #3 PTY, #4 signed
 manifests, #5 multi-server) — not in this file.

@@ -58,7 +58,7 @@ func newStreamHarness(t *testing.T) *streamHarness {
 		t.Fatalf("keygen: %v", err)
 	}
 	pubHex := hex.EncodeToString(pub)
-	if err := st.CreateMachine(mach, pubHex, "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine(mach, pubHex, "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed machine: %v", err)
 	}
 
@@ -367,7 +367,7 @@ func TestE2EPubCarriesTheControlSignal(t *testing.T) {
 	// With a key registered, the key is what comes back.
 	const key64 = "9f2b1c4d5e6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e"
 	withKey := "bcross-stream-keyed"
-	if err := h.st.CreateMachine(withKey, "pub-keyed", "h", "linux", "amd64", "v", key64); err != nil {
+	if err := h.st.CreateMachine(withKey, "pub-keyed", "h", "linux", "amd64", "v", key64, false); err != nil {
 		t.Fatalf("seed keyed machine: %v", err)
 	}
 	code2, body2 := bearerJSON(t, h.s.Routes(), "GET", "/v1/machines/"+withKey+"/e2epub", key, "")
@@ -431,7 +431,7 @@ func TestE2EIsPerOrg(t *testing.T) {
 	key := adminKey(t, h.s, "exec:*")
 
 	const acme = "acme-web-01"
-	if err := h.st.CreateMachine(acme, "pub-acme", "h", "linux", "amd64", "v", ""); err != nil {
+	if err := h.st.CreateMachine(acme, "pub-acme", "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed acme machine: %v", err)
 	}
 	enabled := func(machine string) bool { return h.s.e2eStateFor(machine).Enabled }
@@ -497,7 +497,7 @@ func TestE2EUnknownOrgFallsBackToTheDefault(t *testing.T) {
 
 	// An org that is not configured on this server.
 	const orphan = "unconfigured-01"
-	if err := h.st.CreateMachine(orphan, "pub-orphan", "h", "linux", "amd64", "v", ""); err != nil {
+	if err := h.st.CreateMachine(orphan, "pub-orphan", "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed orphan machine: %v", err)
 	}
 	// bcross (the configured org) is turned off; the orphan must not inherit it.

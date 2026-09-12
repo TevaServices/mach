@@ -280,7 +280,7 @@ func TestUICallbackDoesNotEchoProviderText(t *testing.T) {
 // refusal must leave the machine alone.
 func TestUIPostRequiresCSRF(t *testing.T) {
 	s, st, p := newUITestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	h := s.Routes()
@@ -309,7 +309,7 @@ func TestUIPostRequiresCSRF(t *testing.T) {
 // A cross-site form post is refused before anything else runs.
 func TestUIPostRefusesCrossSite(t *testing.T) {
 	s, st, p := newUITestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	h := s.Routes()
@@ -358,7 +358,7 @@ func TestUIPageCarriesTheSessionCSRF(t *testing.T) {
 // back for an htmx request.
 func TestUIBlockUnblockRoundTrip(t *testing.T) {
 	s, st, p := newUITestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	h := s.Routes()
@@ -395,7 +395,7 @@ func TestUIBlockUnblockRoundTrip(t *testing.T) {
 // A non-htmx post gets a redirect rather than a bare fragment.
 func TestUIPostWithoutHtmxRedirects(t *testing.T) {
 	s, st, p := newUITestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	h := s.Routes()
@@ -412,7 +412,7 @@ func TestUIPostWithoutHtmxRedirects(t *testing.T) {
 // Delete is the sharpest action available and needs the name typed.
 func TestUIDeleteRequiresTypedName(t *testing.T) {
 	s, st, p := newUITestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	h := s.Routes()
@@ -462,7 +462,7 @@ func TestUIDeleteRequiresTypedName(t *testing.T) {
 // unreachable from the UI.
 func TestUIFleetIncludesRevokedMachines(t *testing.T) {
 	s, st, _ := newUITestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := st.RevokeMachine("bcross-a"); err != nil {
@@ -512,7 +512,7 @@ func TestUIOrgLifecycle(t *testing.T) {
 	}
 
 	// Removal is refused while machines exist under the prefix.
-	if err := st.CreateMachine("acme-1", "pub-1", "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("acme-1", "pub-1", "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if code, _, _ := uiPOST(t, h, session, csrf, "/ui/orgs/remove", "org=acme", true); code != http.StatusConflict {
@@ -594,10 +594,10 @@ func TestOrgResolutionPrefersTheLongestPrefix(t *testing.T) {
 // an org — it either names that org's machines or it reaches every org.
 func TestUIOrgMembershipSplitsKeys(t *testing.T) {
 	s, st, _ := newUITestServer(t)
-	if err := st.CreateMachine("acme-a", "pub-a", "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("acme-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := st.CreateMachine("other-b", "pub-b", "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("other-b", "pub-b", "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := st.CreateAPIKey("scoped", "mach_"+store.RandToken(24), "exec:acme-a"); err != nil {

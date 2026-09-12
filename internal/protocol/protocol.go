@@ -76,6 +76,12 @@ type MachineInfo struct {
 	// acted on by clients — a blocked machine also stays in the listing, because
 	// the operator has to be able to see it in order to unblock it.
 	Blocked bool `json:"blocked,omitempty"`
+
+	// Temporary marks an enrollment that belongs to a session rather than to a
+	// machine: plain `mach` on a target. Reported so an operator can tell a
+	// throwaway row from a real one at a glance, and so a session that never got
+	// to retire itself is not mistaken for a machine that stopped working.
+	Temporary bool `json:"temporary,omitempty"`
 }
 
 // ---- fleet policy (control plane -> agent, agent -> control plane) ----
@@ -123,6 +129,17 @@ type PolicyAck struct {
 // upgrading and closing with no frame at all, deliberately, so the
 // unauthenticated endpoint cannot be used to enumerate which names exist. A
 // deleted machine is exactly an unknown name there, and must stay that way.
+
+// The "retire" frame is the other direction: an agent telling the control plane
+// to retire it. It is sent by a TEMPORARY session on its way out (plain `mach`
+// on a target, which keeps nothing on disk and so revokes itself on exit), and
+// the control plane accepts it only from a machine enrolled as temporary — a
+// permanent agent must not be able to retire a machine the operator expects to
+// stay.
+//
+// It is scoped by construction: the handler uses the name of the connection the
+// frame arrived on, so an agent can retire itself and nothing else. Like the
+// other terminal frames it carries no payload.
 
 type ExecCommand struct {
 	Command string   `json:"command,omitempty"` // shell mode
@@ -211,6 +228,13 @@ type PairClaimRequest struct {
 	PubE2E string `json:"pub_e2e,omitempty"` // X25519 public key for E2E exec (hex)
 	Token  string `json:"token"`
 	Name   string `json:"name"`
+	// Temporary marks an enrollment that belongs to a session rather than to a
+	// machine: plain `mach` on a target, which keeps nothing on disk and revokes
+	// itself on the way out. It is recorded so the enrollment can be taken over
+	// by the next run of that session — even after a Ctrl-C that never got the
+	// chance to self-revoke — without the operator revoking or deleting anything.
+	// A later permanent enrollment clears it.
+	Temporary bool `json:"temporary,omitempty"`
 }
 
 // PairStartReq is the agent's request to begin a pairing session.
@@ -238,4 +262,7 @@ type RegisterAPIKeyReq struct {
 	OS       string `json:"os,omitempty"`
 	Arch     string `json:"arch,omitempty"`
 	AgentVer string `json:"agent_version,omitempty"`
+	// Temporary is the same flag as on PairClaimRequest: this enrollment belongs
+	// to a session, not to a machine.
+	Temporary bool `json:"temporary,omitempty"`
 }

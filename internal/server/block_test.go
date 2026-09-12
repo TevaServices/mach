@@ -115,7 +115,7 @@ func seedMachine(t *testing.T, st *store.Store, mach string) (pubHex string, pri
 		t.Fatalf("keygen: %v", err)
 	}
 	pubHex = hex.EncodeToString(pub)
-	if err := st.CreateMachine(mach, pubHex, "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine(mach, pubHex, "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed machine: %v", err)
 	}
 	return pubHex, priv
@@ -126,7 +126,7 @@ func seedMachine(t *testing.T, st *store.Store, mach string) (pubHex string, pri
 // answering "machine offline or unknown" — true-sounding, and wrong.
 func TestExecRefusedWhenMachineBlocked(t *testing.T) {
 	s, st := newAuthTestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if _, err := st.SetMachineBlocked("bcross-a", true); err != nil {
@@ -182,10 +182,10 @@ func TestExecAllowedWhenNotBlocked(t *testing.T) {
 // the operator's own action invisible — they could not see it to unblock it.
 func TestMachinesReportsBlocked(t *testing.T) {
 	s, st := newAuthTestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := st.CreateMachine("bcross-b", "pub-b", "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-b", "pub-b", "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if _, err := st.SetMachineBlocked("bcross-a", true); err != nil {
@@ -438,7 +438,7 @@ func TestStreamStdinRefusedWhenBlocked(t *testing.T) {
 // pipeline must never reach one.
 func TestAdminBlockRequiresExecStar(t *testing.T) {
 	s, st := newAuthTestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	body := `{"machine":"bcross-a","blocked":true}`
@@ -466,7 +466,7 @@ func TestAdminBlockRequiresExecStar(t *testing.T) {
 // request must never change a machine's state.
 func TestAdminBlockRejectsMissingField(t *testing.T) {
 	s, st := newAuthTestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if _, err := st.SetMachineBlocked("bcross-a", true); err != nil {
@@ -534,7 +534,7 @@ func TestDeleteNotifiesAgentAndFreesName(t *testing.T) {
 	}
 	// The name and the key material are free to enroll again — the recovery path
 	// revocation deliberately cannot express.
-	if err := st.CreateMachine(mach, pubHex, "h", "linux", "amd64", "v", ""); err != nil {
+	if err := st.CreateMachine(mach, pubHex, "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("re-enroll with the freed name and key: %v", err)
 	}
 }

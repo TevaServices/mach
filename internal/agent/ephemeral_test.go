@@ -75,7 +75,7 @@ func TestTemporaryEnrollmentKeepsEverythingInMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("e2e key: %v", err)
 	}
-	cfg, err := registerQRCore(srv.URL, "bcross", id, e2eKey)
+	cfg, err := registerQRCore(srv.URL, "bcross", id, e2eKey, true)
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestTemporarySessionLeavesAnInstalledEnrollmentAlone(t *testing.T) {
 	// in-memory keys and never consults the directory.
 	id, _ := NewIdentity()
 	e2eKey, _ := NewE2EKeyPair()
-	if _, err := registerQRCore(srv.URL, "bcross", id, e2eKey); err != nil {
+	if _, err := registerQRCore(srv.URL, "bcross", id, e2eKey, true); err != nil {
 		t.Fatalf("temporary register: %v", err)
 	}
 

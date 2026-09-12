@@ -76,7 +76,7 @@ func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request, keyName,
 			Name: m.Name, Hostname: m.Hostname, OS: m.OS, Arch: m.Arch,
 			Online: online[m.Name], AgentVer: m.AgentVer, CreatedAt: m.CreatedAt,
 			E2E: e2eState.Mode, E2EReason: e2eState.Reason,
-			Blocked: m.Blocked,
+			Blocked: m.Blocked, Temporary: m.Temporary,
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)
