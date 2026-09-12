@@ -76,6 +76,7 @@ func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request, keyName,
 			Name: m.Name, Hostname: m.Hostname, OS: m.OS, Arch: m.Arch,
 			Online: online[m.Name], AgentVer: m.AgentVer, CreatedAt: m.CreatedAt,
 			E2E: e2eState.Mode, E2EReason: e2eState.Reason,
+			Blocked: m.Blocked,
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -171,6 +172,21 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 		s.auditExec(&pendingExec{machine: req.Machine, command: display, source: "console:" + keyName},
 			execRefused, "", reason)
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "blocked by the server's global exec policy: " + reason})
+		return
+	}
+	// The operator's soft block, checked after authorization and before anything
+	// is dispatched, for the same reason the policy check sits here: it has to
+	// hold for every key, every scope and every machine.
+	//
+	// Audited like a policy refusal — a block that silently swallowed commands
+	// would be indistinguishable, in the record, from a machine that was simply
+	// idle. This also replaces what used to be a 15s wait for the agent followed
+	// by "machine offline": a blocked machine is online, and saying so
+	// immediately is the truthful answer.
+	if ref := s.dispatchRefusal(req.Machine); ref != nil {
+		s.auditExec(&pendingExec{machine: req.Machine, command: display, source: "console:" + keyName},
+			execRefused, "", ref.msg)
+		writeJSON(w, ref.status, map[string]string{"error": ref.msg})
 		return
 	}
 	if req.Timeout <= 0 {
@@ -369,7 +385,7 @@ func (s *Server) handleRevokeMachine(w http.ResponseWriter, r *http.Request, key
 	// fleet-wide admin action: require the unrestricted exec:* key.
 	// Enroll-scoped keys live in provisioning pipelines and must never
 	// revoke — or worse, erase another machine's audit trail.
-	if !hasScope(scopes, "exec") || !keyCanExecOn(scopes, "*") {
+	if !adminScopeOK(scopes) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key lacks revoke scope"})
 		return
 	}
@@ -378,16 +394,9 @@ func (s *Server) handleRevokeMachine(w http.ResponseWriter, r *http.Request, key
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown machine"})
 		return
 	}
-	if err := s.st.RevokeMachine(req.Machine); err != nil {
+	if err := s.revokeMachine(req.Machine, req.PurgeAudit); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
-	}
-	if ac := s.br.Get(req.Machine); ac != nil {
-		_ = ac.Conn.WriteEnvelope(protocol.Envelope{Type: "revoked"})
-		ac.Conn.Close()
-	}
-	if req.PurgeAudit {
-		_ = s.st.RemoveMachineAudit(req.Machine)
 	}
 	// %q, not %s: both values reach the log from outside, and a machine name
 	// or key name containing newlines could forge log lines.

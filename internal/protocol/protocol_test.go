@@ -253,3 +253,57 @@ func TestPolicyWireFormats(t *testing.T) {
 		t.Errorf("a successful ack carried an error: %s", raw)
 	}
 }
+
+// The delete notice is an envelope shape, not a payload, and it must stay one.
+// The agent switches on the frame type alone, so a field added here would be
+// silently ignored by every agent already deployed — and the failure would look
+// like a machine that keeps reconnecting after it was deleted.
+func TestDeletedFrameWireFormat(t *testing.T) {
+	raw, err := json.Marshal(Envelope{Type: "deleted"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(raw) != `{"type":"deleted"}` {
+		t.Fatalf("deleted frame = %s, want exactly {\"type\":\"deleted\"} (no req_id, no payload)", raw)
+	}
+	// It must still read back as an envelope with the same tag.
+	var env Envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if env.Type != "deleted" || env.ReqID != "" || len(env.Payload) != 0 {
+		t.Fatalf("round trip changed the frame: %+v", env)
+	}
+}
+
+// MachineInfo rides the fleet listing, which the console CLI and the web UI both
+// read. "blocked" is additive, so an older client simply does not see it — but a
+// blocked machine must still be *listed*, which is why this is a field on the
+// machine rather than a reason to omit it from the response.
+func TestMachineInfoBlockedField(t *testing.T) {
+	raw, err := json.Marshal(MachineInfo{Name: "bcross-a", Online: true, Blocked: true})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := fields["blocked"]; !ok {
+		t.Fatalf("blocked machine did not report the flag: %s", raw)
+	}
+
+	// An unblocked machine omits it, so the common case does not grow the
+	// payload every client parses.
+	raw, err = json.Marshal(MachineInfo{Name: "bcross-a", Online: true})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	fields = nil
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := fields["blocked"]; ok {
+		t.Fatalf("unblocked machine reported a blocked field: %s", raw)
+	}
+}

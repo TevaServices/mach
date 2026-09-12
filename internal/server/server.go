@@ -186,8 +186,15 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/exec", s.authConsole(s.handleExec))
 	mux.HandleFunc("GET /v1/audit", s.authConsole(s.handleAudit))
 
-	// Server management API: machine revocation (exec:* keys only)
+	// Server management API: machine lifecycle (exec:* keys only). Three
+	// distinct axes — block is soft and reversible, revoke is the sticky
+	// tombstone, delete removes the machine and frees its name. They are on the
+	// console API as well as the web UI so the fleet is operable without a
+	// browser, and so scripts/e2e.sh can exercise them without an identity
+	// provider.
 	mux.HandleFunc("POST /v1/admin/revoke", s.authConsole(s.handleRevokeMachine))
+	mux.HandleFunc("POST /v1/admin/block", s.authConsole(s.handleBlockMachine))
+	mux.HandleFunc("POST /v1/admin/delete", s.authConsole(s.handleDeleteMachine))
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok\n"))

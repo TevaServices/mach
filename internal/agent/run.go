@@ -93,6 +93,15 @@ func Run(stateDir string) error {
 			log.Printf("agent: machine %q was revoked by the operator — retiring (state files kept for forensics)", cfg.Name)
 			return nil
 		}
+		if errors.Is(err, errDeleted) {
+			// The control plane removed this machine — and its key — from the
+			// database. There is nothing here to reconnect to: the name is no
+			// longer enrolled, so dialing it again is indistinguishable from a
+			// typo and would retry forever. Retire, and keep the state files so
+			// an operator can re-enroll this host with them.
+			log.Printf("agent: machine %q was deleted by the operator — retiring (state files kept; re-enroll to use this host again)", cfg.Name)
+			return nil
+		}
 		// %q: the error can embed text the control plane supplied, and a newline in
 		// it must not be able to forge an agent log line.
 		log.Printf("agent: disconnected: %q — reconnecting in %s", err.Error(), backoff)
@@ -115,7 +124,26 @@ func Run(stateDir string) error {
 var (
 	errShutdown = errors.New("shutdown")
 	errRevoked  = errors.New("machine revoked")
+	errDeleted  = errors.New("machine deleted")
 )
+
+// terminalFrame maps a control-plane frame to the sentinel that stops the
+// reconnect loop, or nil for frames that are not terminal.
+//
+// Both terminal frames mean "this connection must not be re-established", for
+// different reasons: revoked leaves a tombstone that refuses the agent, deleted
+// removes the row the name was enrolled under. Keeping the mapping in one place
+// is what stops a frame from being handled in the loop but missed in the
+// pre-hello path, or vice versa.
+func terminalFrame(frameType string) error {
+	switch frameType {
+	case "revoked":
+		return errRevoked
+	case "deleted":
+		return errDeleted
+	}
+	return nil
+}
 
 func dialAndServe(cfg *Config, id *Identity, stateDir string) error {
 	url := wsURL(cfg.Server) + "/v1/agent/ws?name=" + urlQueryEscape(cfg.Name)
@@ -143,8 +171,10 @@ func dialAndServe(cfg *Config, id *Identity, stateDir string) error {
 	// Server initiates hello with a per-connection challenge (ReqID).
 	env, err := conn.ReadEnvelope()
 	if err != nil || env.Type != "hello" {
-		if err == nil && env.Type == "revoked" {
-			return errRevoked
+		if err == nil {
+			if term := terminalFrame(env.Type); term != nil {
+				return term
+			}
 		}
 		return fmt.Errorf("expected hello, got %v/%v", env.Type, err)
 	}
@@ -226,6 +256,11 @@ func dialAndServe(cfg *Config, id *Identity, stateDir string) error {
 		if err != nil {
 			return err // deadline, clean disconnect, or protocol error
 		}
+		// A terminal frame ends the reconnect loop rather than this connection
+		// alone: "revoked" and "deleted" both mean this name must not dial again.
+		if term := terminalFrame(env.Type); term != nil {
+			return term
+		}
 		switch env.Type {
 		case "exec":
 			go handleExecFrame(conn, env, execSem, stateDir)
@@ -249,8 +284,6 @@ func dialAndServe(cfg *Config, id *Identity, stateDir string) error {
 			if err := handleUpdate(cfg, env); err != nil {
 				log.Printf("agent: update failed: %v", err)
 			}
-		case "revoked":
-			return errRevoked
 		case "pong":
 			// keepalive ack; the pong handler already refreshed deadlines
 		default:

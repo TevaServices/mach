@@ -70,6 +70,12 @@ type MachineInfo struct {
 	E2E string `json:"e2e,omitempty"`
 	// E2EReason explains an "off" in one line.
 	E2EReason string `json:"e2e_reason,omitempty"`
+
+	// Blocked is the operator's soft block: the agent is still connected, but
+	// the control plane will not dispatch to it. It is reported rather than
+	// acted on by clients — a blocked machine also stays in the listing, because
+	// the operator has to be able to see it in order to unblock it.
+	Blocked bool `json:"blocked,omitempty"`
 }
 
 // ---- fleet policy (control plane -> agent, agent -> control plane) ----
@@ -100,6 +106,23 @@ type PolicyAck struct {
 }
 
 // ---- control plane -> agent ----
+
+// The "deleted" frame is the control plane's delete notice: the machine row and
+// the agent's key are gone from the database, so this connection is about to be
+// closed and the agent must retire rather than reconnect — dialing this name
+// again finds nothing.
+//
+// It carries no payload, like "revoked": the agent needs no data to act, and a
+// control-plane-supplied string would only be a log-injection surface. Frame
+// tags are raw literals throughout this package (there is no enum), so this one
+// is spelled "deleted" at every site — see the agent's terminalFrame mapping and
+// consoleapi's delete path.
+//
+// It is only ever sent on a connection that has already completed the hello
+// handshake. That matters: handleAgentWS answers an *unknown* machine name by
+// upgrading and closing with no frame at all, deliberately, so the
+// unauthenticated endpoint cannot be used to enumerate which names exist. A
+// deleted machine is exactly an unknown name there, and must stay that way.
 
 type ExecCommand struct {
 	Command string   `json:"command,omitempty"` // shell mode

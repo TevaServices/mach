@@ -54,19 +54,30 @@ const consoleStreamIdle = 120 * time.Second
 const streamPingInterval = 30 * time.Second
 
 // streamSessions tracks active console↔agent relay pairs by session ID, so a
-// teardown can find the relay to unbind.
+// teardown can find the relay to unbind. streamsByMachine is the same set
+// indexed the other way, so an operator action can find every session for one
+// machine — streamSessions carries the machine only as a field.
 var (
-	streamMu       sync.Mutex
-	streamSessions = map[string]*streamRelay{}
+	streamMu         sync.Mutex
+	streamSessions   = map[string]*streamRelay{}
+	streamsByMachine = map[string]map[string]bool{}
 )
 
 type streamRelay struct {
 	machine string
+	// console is the console end of this relay, retained so the session can be
+	// ended from outside it. Without it a session could only be ended by the
+	// console itself or by the idle deadline — and the keepalive pings below
+	// keep that deadline from ever firing.
+	console *protocol.WSConn
 	// toConsole carries agent-originated frames to the console socket. The
 	// agent pump pushes into it through the broker, which drops a frame rather
 	// than stalling an agent whose console has stopped reading.
 	toConsole chan protocol.Envelope
 	Done      chan struct{}
+	// stopOnce guards Done, which two goroutines may now want to close: the
+	// handler's own teardown and an operator's block.
+	stopOnce sync.Once
 
 	// Audit bookkeeping for the command running in this session. Guarded
 	// because the console pump (which captures output) and the console read
@@ -78,12 +89,87 @@ type streamRelay struct {
 	errOut  []byte
 }
 
-func newStreamRelay(machine string) *streamRelay {
+func newStreamRelay(machine string, console *protocol.WSConn) *streamRelay {
 	return &streamRelay{
 		machine:   machine,
+		console:   console,
 		toConsole: make(chan protocol.Envelope, 64),
 		Done:      make(chan struct{}),
 	}
+}
+
+// stop ends this session's delivery loop. Idempotent, because the handler's own
+// teardown and an operator's kill can both reach it.
+func (r *streamRelay) stop() { r.stopOnce.Do(func() { close(r.Done) }) }
+
+// kill ends the session from outside its handler: the console is told why, and
+// then the socket is closed.
+//
+// Closing is what actually ends it. The handler is parked in a read on that
+// socket, so closing makes the read fail and the normal teardown runs — which
+// then unregisters the session and writes the audit row for a command that
+// never reported an exit status.
+func (r *streamRelay) kill(reason string) {
+	if r.console != nil {
+		_ = r.console.WriteEnvelope(protocol.Envelope{
+			Type:    "stream_end",
+			Payload: mustJSON(protocol.StreamEnd{ExitCode: -1, Error: reason}),
+		})
+		r.console.Close()
+	}
+	r.stop()
+}
+
+// registerStream records a session in both indexes.
+func registerStream(sessionID string, relay *streamRelay) {
+	streamMu.Lock()
+	streamSessions[sessionID] = relay
+	if streamsByMachine[relay.machine] == nil {
+		streamsByMachine[relay.machine] = map[string]bool{}
+	}
+	streamsByMachine[relay.machine][sessionID] = true
+	streamMu.Unlock()
+}
+
+// unregisterStream drops a session from both indexes.
+func unregisterStream(sessionID, machine string) {
+	streamMu.Lock()
+	delete(streamSessions, sessionID)
+	if set := streamsByMachine[machine]; set != nil {
+		delete(set, sessionID)
+		if len(set) == 0 {
+			delete(streamsByMachine, machine)
+		}
+	}
+	streamMu.Unlock()
+}
+
+// killStreamsForMachine ends every live console session for a machine and
+// reports how many it ended.
+//
+// Used when an operator blocks a machine. A soft block stops *new* commands, but
+// a session opened before it would otherwise keep feeding stdin — or killing the
+// running command — for as long as its console stayed connected, which is the
+// opposite of what blocking a machine means.
+//
+// What this deliberately does NOT do is cancel the command on the machine. The
+// documented behaviour is that a command keeps running when its console goes
+// away, and synthesising a stream_kill here would be a new remote-kill
+// capability rather than a freeze on terminal communication. The audit row
+// records the session as ending without an exit status, which is what happened.
+func (s *Server) killStreamsForMachine(machine, reason string) int {
+	streamMu.Lock()
+	relays := make([]*streamRelay, 0, len(streamsByMachine[machine]))
+	for id := range streamsByMachine[machine] {
+		if r := streamSessions[id]; r != nil {
+			relays = append(relays, r)
+		}
+	}
+	streamMu.Unlock()
+	for _, r := range relays {
+		r.kill(reason)
+	}
+	return len(relays)
 }
 
 // beginCommand records the command a stream is about to run, for the audit row
@@ -142,6 +228,14 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key is not scoped for machine " + machine})
 		return
 	}
+	// The operator's soft block, refused here rather than after the upgrade:
+	// streaming is command execution, so a blocked machine must not open a
+	// session at all, and an HTTP status is a clearer answer than a session that
+	// immediately dies.
+	if ref := s.dispatchRefusal(machine); ref != nil {
+		writeJSON(w, ref.status, map[string]string{"error": ref.msg})
+		return
+	}
 
 	// Resolve the agent before upgrading: an HTTP status is the only way to
 	// tell the console "no such machine / offline", and the console's client
@@ -161,16 +255,12 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 	defer consoleConn.Close()
 
 	sessionID := store.RandToken(8)
-	relay := newStreamRelay(machine)
-	streamMu.Lock()
-	streamSessions[sessionID] = relay
-	streamMu.Unlock()
+	relay := newStreamRelay(machine, consoleConn)
+	registerStream(sessionID, relay)
 	defer func() {
-		streamMu.Lock()
-		delete(streamSessions, sessionID)
-		streamMu.Unlock()
+		unregisterStream(sessionID, machine)
 		s.br.UnbindStream(sessionID)
-		close(relay.Done)
+		relay.stop()
 		// A command that never reported an exit status — the console
 		// disconnected mid-stream, or the agent died — still leaves a record.
 		// The command's fate on the machine is unknown; it is not cancelled by
@@ -278,10 +368,26 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 				s.streamRefuse(consoleConn, machine, "blocked by the server's global exec policy: "+reason)
 				continue
 			}
+			// The operator's soft block, re-checked per command: the check at
+			// connect only covers the moment the session opened, and a block set
+			// while it is idle must stop the next command too.
+			if ref := s.dispatchRefusal(machine); ref != nil {
+				s.st.AuditInsert(nowRFC3339(), machine, display, "console:"+keyName,
+					sqlNullInt(execRefused), "", ref.msg)
+				s.streamRefuse(consoleConn, machine, ref.msg)
+				continue
+			}
 			relay.beginCommand(display, "console:"+keyName)
 			env.ReqID = sessionID // tag for the agent pump's routing
 			s.streamToAgent(sessionID, consoleConn, env)
 		case "stream_stdin", "stream_kill":
+			// Also gated. Refusing only exec_stream would leave a session that
+			// can still feed — or kill — a command already running, which is
+			// terminal communication by any reading.
+			if ref := s.dispatchRefusal(machine); ref != nil {
+				s.streamRefuse(consoleConn, machine, ref.msg)
+				continue
+			}
 			env.ReqID = sessionID
 			s.streamToAgent(sessionID, consoleConn, env)
 		default:
