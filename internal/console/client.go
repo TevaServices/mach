@@ -85,10 +85,13 @@ func DefaultClient() (*client, error) {
 type client struct {
 	cfg  *Config
 	http *http.Client
+	// pins remembers each machine's E2E key on first use. See pins.go for what
+	// that does and does not protect against.
+	pins *pinStore
 }
 
 func New(cfg *Config) *client {
-	return &client{cfg: cfg, http: &http.Client{Timeout: 12 * time.Minute}}
+	return &client{cfg: cfg, http: &http.Client{Timeout: 12 * time.Minute}, pins: newPinStore()}
 }
 
 func (c *client) do(method, path string, body any, out any) error {
@@ -224,6 +227,20 @@ func (c *client) runExec(machine, command string, argv []string, timeout int, as
 			}
 			fmt.Fprintf(os.Stderr, "mach: %s has no E2E key — running in plaintext (re-enroll to enable E2E)\n", machine)
 		default:
+			// The key came from the control plane, which is the party the seal
+			// protects against; the pin is what makes a substituted key visible
+			// instead of silent. Checked before anything is sent, in every mode:
+			// a changed key is not something to work around automatically.
+			first, pinErr := c.pins.check(machine, info.PubE2E, info.Org)
+			if pinErr != nil {
+				fmt.Fprintln(os.Stderr, "mach: "+pinErr.Error())
+				return 3
+			}
+			if first {
+				fmt.Fprintf(os.Stderr, "mach: pinned the E2E key for %s (%s); "+
+					"a later change is refused until you run `mach trust %s`\n",
+					machine, KeyFingerprint(info.PubE2E), machine)
+			}
 			if code, done := c.sealedExec(machine, command, argv, timeout, asJSON, info.PubE2E, mode); done {
 				return code
 			}
@@ -363,6 +380,9 @@ type e2eTarget struct {
 	Enabled bool   `json:"e2e_enabled"`
 	Mode    string `json:"e2e"`
 	Reason  string `json:"e2e_reason"`
+	// Org is the machine's org, the one the setting was resolved for. It rides
+	// along so the pin file a human reads can tell machines apart.
+	Org     string `json:"e2e_org"`
 	Machine string `json:"machine"`
 	PubE2E  string `json:"pub_e2e"`
 	Note    string `json:"note"`
