@@ -327,6 +327,34 @@ func (s *Store) RevokeMachine(name string) error {
 	return err
 }
 
+// DeleteMachine removes a machine outright, freeing its name and its agent
+// public key for re-enrollment.
+//
+// Revocation is the normal way to retire a machine: it keeps the row (and
+// therefore any queued update, plus the fact that the key existed) while
+// refusing the agent. Deleting is the recovery path for the case revocation
+// cannot express — a machine that must enroll again from scratch, using the
+// same name or even the same key material (a re-imaged box, a restored
+// backup), where "already enrolled" would otherwise be a dead end.
+//
+// Audit rows are kept: who ran what on a machine is a record about the
+// operator's fleet, not a property of the machine row. Purging it is a
+// separate, explicit act (RemoveMachineAudit).
+func (s *Store) DeleteMachine(name string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM pending_updates WHERE machine=?`, name); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM machines WHERE name=?`, name); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ---- API keys ----
 
 // Scopes: "exec:*" = all machines; "exec:<name>,<name>" = allowlist;
