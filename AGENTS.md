@@ -232,6 +232,8 @@ only covered at the SQL-translation level.
   signal, key pinning and trust), policy, protocol, oidcauth (a fake issuer, one
   broken check per test), release and in-toto all have coverage; keep it that
   way for touched code.
+- `mise run lint` — the gofmt check plus `go vet`. Read-only; `mise run fmt`
+  writes the formatting.
 - `mise run e2e` — full end-to-end (builds binaries, spins up the control
   plane on 127.0.0.1:8099 with a fleet-wide policy installed, enrolls via API
   key + QR, exercises exec in both modes, the console relay, output-is-data,
@@ -430,9 +432,11 @@ rule that would have prevented it.
   which mode is in force — and only a *sealed* command proves anything about what
   reached the machine, because a plaintext one is judged by the control plane.
   That distinction is the whole reason the mirroring tests look the way they do.
-- **`gofmt -l .` should be empty before you commit.** Files merged in from another
-  branch have arrived without trailing newlines, and the diff noise from fixing
-  that later is avoidable.
+- **Formatting is a task, not a habit.** `mise run lint` runs the gofmt check
+  (`mise run fmt-check`, read-only) before `go vet`, so a commit that skips it
+  fails there; `mise run fmt` writes the fixes. `mise run all` includes it. Files
+  merged in from another branch have arrived unformatted before now, and the diff
+  noise from cleaning that up later is avoidable.
 - **Read the merge commit's message before "fixing" something that looks
   redundant.** Two independent implementations of the same four limitations were
   reconciled in `c620a16`; the decisions that look odd in isolation (one-shot exec
