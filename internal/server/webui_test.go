@@ -68,7 +68,7 @@ func newUITestServer(t *testing.T) (*Server, *store.Store, *fakeProvider) {
 	clearOIDCEnv(t)
 	s, st := newAuthTestServer(t)
 	p := &fakeProvider{ident: oidcauth.Identity{Subject: "op-1", Email: "op@example.com", EmailVerified: true}}
-	s.EnableUI(p, "http://127.0.0.1:8099/ui/callback", false)
+	s.enableUI(p, "http://127.0.0.1:8099/ui/callback", false)
 	return s, st, p
 }
 
