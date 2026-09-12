@@ -34,6 +34,24 @@ func StateDir() string {
 	return filepath.Join(home, ".mach")
 }
 
+// NewIdentity generates an agent keypair that exists only in memory.
+//
+// Used by the temporary session (bare `mach`), whose whole point is that nothing
+// outlives the process: the key is never written, so running again enrolls
+// again. The persistent path keeps using LoadOrCreate, which does write one.
+func NewIdentity() (*Identity, error) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	return &Identity{Priv: priv, PubHex: hex.EncodeToString(pub)}, nil
+}
+
+// NewE2EKeyPair generates an X25519 keypair that exists only in memory, for the
+// same reason. Kept here beside NewIdentity so the two in-memory constructors
+// are read together.
+func NewE2EKeyPair() (*E2EKeyPair, error) { return generateE2EKeyPair() }
+
 // LoadOrCreate reads (or first-run creates) the agent keypair in stateDir.
 func LoadOrCreate(stateDir string) (*Identity, error) {
 	keyPath := filepath.Join(stateDir, "agent.key")

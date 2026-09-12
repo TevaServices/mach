@@ -5,8 +5,12 @@ This is `mach`: remote CLI access to registered machines, outbound-only
 
 - `mach` (cmd/mach) — agent + console. On a fresh target, bare `mach`
   prompts for the control-plane URL, enrolls via QR, then holds the live
-  connection. `mach install` registers the OS service (systemd/launchd/
-  Task Scheduler). On an admin box, bare `mach` prints the fleet table.
+  connection — as a **temporary session**, keeping every secret in memory, so
+  Ctrl-C ends it and running it again enrolls from scratch (#23).
+  `mach install` registers the OS service (systemd/launchd/Task Scheduler) and
+  is what makes a connection survive reboots. On an admin box, bare `mach`
+  prints the fleet table. On a target that is already installed, bare `mach`
+  refuses rather than starting a second identity.
 - `mach-server` (cmd/mach-server) — the control plane; the ONLY publicly
   reachable component. Ships as a Docker container. Also serves admin
   commands: `add-api-key`, `revoke-machine`, `delete-machine`, `e2e`,
@@ -15,8 +19,8 @@ This is `mach`: remote CLI access to registered machines, outbound-only
 ## Ground rules
 
 - **Do not modify** `internal/server/*`, `internal/agent/run.go`,
-  `internal/store/*`, `internal/console/*`, `internal/policy/*`,
-  `internal/oidcauth/*`, or `internal/release/*` without running
+  `internal/agent/ephemeral.go`, `internal/store/*`, `internal/console/*`,
+  `internal/policy/*`, `internal/oidcauth/*`, or `internal/release/*` without running
   `go test ./...` AND `scripts/e2e.sh`.
   These files implement the security properties listed below; a change that
   breaks a test is a regression.
@@ -68,8 +72,15 @@ This is `mach`: remote CLI access to registered machines, outbound-only
    (`internal/agent/run.go`), marked visibly when hit; a streamed session is
    uncapped and the relay drops frames rather than stalling an agent whose
    console stopped reading. Audit snippets are redacted (`RedactScrubs`).
-10. **Revocation** is sticky: revoked machines self-retire, their keys
-    cannot re-enroll, and their names stay reserved.
+10. **Revocation is a forced re-enrollment, and its door is narrow.** A revoked
+    machine self-retires, its name and key stay reserved, and it comes back only
+    by enrolling again — which needs an enroll key or a phone approval, so it is
+    still operator-gated. The revive is allowed for a revoked row **and nothing
+    else**, guarded in SQL (`ReactivateMachine` matches `revoked=1`) rather than
+    by a caller's check, because the counterweight is what matters most here: an
+    ACTIVELY enrolled machine is never displaced — not its name, not its key.
+    That is what stops a typo, or a hostile enrollee, taking over a working
+    agent. Reviving clears `revoked` and leaves `blocked` alone (#19).
 11. `X-Forwarded-For` is honored ONLY when `MACH_TRUST_PROXY=1`.
 12. **Two command policies, both enforced on every path**: the agent's own
     (`MACH_POLICY`/`policy.txt`, which no upstream can override) and the
@@ -153,6 +164,18 @@ This is `mach`: remote CLI access to registered machines, outbound-only
     change those to restart unconditionally: it turns a deliberate retirement into
     a restart loop, and it races the update path, which starts its own detached
     replacement and then exits 0.
+23. **Plain `mach` on a target is a TEMPORARY session** (`agent/ephemeral.go`).
+    It enrolls and holds the live connection with every secret in memory — no
+    identity key, no E2E key, no config on disk — so Ctrl-C is a real shutdown
+    and running it again enrolls from scratch. It must never read, write or
+    delete the persistent state: an installed host's enrollment is what its
+    service runs on, so bare `mach` there refuses rather than starting a second
+    identity that would compete for the same console. `registerQRCore` and
+    `registerAPIKeyCore` stay free of persistence — that split (load identity
+    and keys → core → save) is the only thing keeping the temporary path
+    incapable of writing, so do not "simplify" it back. The session leaves its
+    enrollment on the control plane and says so on exit; a connection needs a
+    record, and the operator revokes or deletes it to reuse the name.
 
 ## Environment variables (control plane)
 
@@ -211,7 +234,10 @@ only covered at the SQL-translation level.
   It also stands up a **second** control plane with OIDC enabled plus
   `scripts/fakeidp` (a stdlib-only loopback identity provider), signs in through
   the real browser flow with a cookie jar, and drives block / unblock / the
-  orgs / the typed-name delete / sign-out from the UI. Green = 116 checks.
+  orgs / the typed-name delete / sign-out from the UI. It also revives a revoked
+  machine by re-enrolling it and checks that an active one cannot be taken over,
+  and observes the temporary session writing nothing to the state directory.
+  Green = 126 checks.
 - Timing-sensitive e2e checks (streaming) use a real sleep and a real
   background process; if one flakes, make the sleep longer rather than
   weakening the assertion.

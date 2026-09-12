@@ -26,8 +26,14 @@ mach
 
 with no arguments. If it isn't enrolled yet, it prints the QR → you scan,
 compare the challenge code, approve, name it — and then holds the live
-connection right there in that console (Ctrl-C to stop). To make it
-permanent (auto-start at boot, reconnect after network loss), run once:
+connection right there in that console.
+
+Bare `mach` is a **temporary session**: it keeps the identity key, the E2E key
+and the config in memory and writes nothing, so Ctrl-C ends it and running
+`mach` again enrolls this host from scratch. That also means it cannot disturb a
+machine you have already installed — on one of those it says so and exits rather
+than starting a second identity. To make a connection permanent
+(auto-start at boot, reconnect after network loss), run once:
 
 ```
 mach install
@@ -181,7 +187,9 @@ Put Caddy/nginx in front for TLS (agents speak wss://).
   larger fleets. SQLite stays the default (WAL + capped connections).
 - **Web UI with OIDC sign-in** (optional, off by default): a browser view of the
   fleet with per-machine **block** (freeze dispatch — the agent stays connected),
-  **revoke** (the sticky tombstone) and **delete** (remove the machine and its
+  **revoke** (self-retires the agent; the machine can come back by re-enrolling,
+  and only a revoked one can — an active machine is never displaced) and
+  **delete** (remove the machine and its
   key, freeing the name so a re-imaged box can enroll again), plus org
   management: add or remove org prefixes, set sealed-exec per org, and see which
   machines and keys belong to each. Deleting needs the machine name typed.
@@ -237,6 +245,15 @@ Put Caddy/nginx in front for TLS (agents speak wss://).
   retries on backoff until it is stopped on the host.
 - **UI sessions are in memory**, so restarting the control plane signs operators
   out. Nothing about UI authorization is on disk, which is the point.
+- **Revocation is recoverable, not a permanent ban.** A revoked machine comes
+  back by enrolling again — operator-gated (an enroll key, or phone approval),
+  but it does mean whoever can enroll can also un-revoke. What revocation still
+  guarantees is that an *active* machine cannot be taken over. A true ban means
+  removing the enrollment paths themselves.
+- **A temporary session leaves its enrollment on the control plane.** Plain
+  `mach` keeps nothing on disk, so Ctrl-C ends it — but the machine row is the
+  record a connection needs, so it stays (offline). Reusing that name next time
+  means revoking or deleting the row first; the session prints the command.
 
 Follow-up work tracks in GitHub issues (#2 sandboxing, #3 PTY, #4 signed
 manifests, #5 multi-server) — not in this file.

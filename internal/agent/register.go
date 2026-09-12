@@ -87,6 +87,22 @@ func RegisterQR(server, org, stateDir string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	cfg, err := registerQRCore(server, org, id, e2eKey)
+	if err != nil {
+		return nil, err
+	}
+	if err := SaveConfig(stateDir, cfg); err != nil {
+		return nil, err
+	}
+	fmt.Println("Run the agent with:  mach run   (or make it permanent with: mach install)")
+	return cfg, nil
+}
+
+// registerQRCore runs the pairing flow for an identity that has already been
+// loaded, and does NOT persist the result. That split is what lets the temporary
+// session enroll with an in-memory identity: it calls this and never reaches
+// SaveConfig, so nothing it learns outlives the process.
+func registerQRCore(server, org string, id *Identity, e2eKey *E2EKeyPair) (*Config, error) {
 	warnInsecureServer(server)
 	start, err := postJSON2[protocol.PairStartResponse](server, "/v1/pair/start", protocol.PairStartReq{
 		PubKey: id.PubHex, PubE2E: e2eKey.PublicKeyHex(),
@@ -150,11 +166,7 @@ approved:
 		return nil, fmt.Errorf("pair claim: %w", err)
 	}
 	cfg := &Config{Server: server, Name: claim.Machine, ServerKey: claim.ServerKey}
-	if err := SaveConfig(stateDir, cfg); err != nil {
-		return nil, err
-	}
 	fmt.Printf("Enrolled as machine %q (server key pinned).\n", cfg.Name)
-	fmt.Println("Run the agent with:  mach run   (or make it permanent with: mach install)")
 	return cfg, nil
 }
 
@@ -168,6 +180,19 @@ func RegisterAPIKey(server, apiKey, name, org, stateDir string) (*Config, error)
 	if err != nil {
 		return nil, err
 	}
+	cfg, err := registerAPIKeyCore(server, apiKey, name, org, id, e2eKey)
+	if err != nil {
+		return nil, err
+	}
+	if err := SaveConfig(stateDir, cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// registerAPIKeyCore is registerAPIKey without the persistence, for the same
+// reason registerQRCore is split out.
+func registerAPIKeyCore(server, apiKey, name, org string, id *Identity, e2eKey *E2EKeyPair) (*Config, error) {
 	warnInsecureServer(server) // the API key itself crosses the wire here
 	resp, err := postJSON2[struct {
 		OK        string `json:"ok"`
@@ -181,9 +206,6 @@ func RegisterAPIKey(server, apiKey, name, org, stateDir string) (*Config, error)
 		return nil, err
 	}
 	cfg := &Config{Server: server, Name: resp.Machine, ServerKey: resp.ServerKey}
-	if err := SaveConfig(stateDir, cfg); err != nil {
-		return nil, err
-	}
 	fmt.Printf("Enrolled as machine %q via API key.\n", cfg.Name)
 	return cfg, nil
 }

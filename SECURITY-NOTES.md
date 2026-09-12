@@ -135,7 +135,8 @@ from the broker; nothing protects content from the machine's own operator.
 | Machine output is data, never input: nothing in the agent reads it back, and the console labels it rather than parsing a control fact out of text | agent/run.go, console/client.go, console/stream.go |
 | Audit log with secret-value redaction; every dispatched command recorded on both paths; refusals audited too; a stream that dies without an exit status recorded as `-1`; optional purge on revoke | store.RedactScrubs/AuditInsert/RemoveMachineAudit, server/stream.go |
 | Signed in-toto attestations for released agent binaries, verified before an update can be queued | internal/release, controlplane/attest.go |
-| Revocation: self-retiring agents, revoked keys can't re-enroll, names stay reserved | store.RevokeMachine, agent errRevoked |
+| Revocation: self-retiring agents, names and keys stay reserved. **A revoked machine can be revived by re-enrolling it — and only a revoked one**: the guard is the `WHERE revoked=1` in `ReactivateMachine`, so an actively enrolled machine's name and key can never be taken by an enrollment | store.RevokeMachine/ReactivateMachine, server enrollmentRefusal, agent errRevoked |
+| **Temporary session** (plain `mach` on a target): enrolls and serves with the identity key, E2E key and config held **in memory only**, so Ctrl-C is a real shutdown and running it again re-enrolls. It cannot read, write or delete the persistent state, so an installed host's enrollment is untouchable from it — and bare `mach` there refuses rather than starting a second identity | agent/ephemeral.go, registerQRCore/registerAPIKeyCore, cmd/mach bootStrap |
 | Agent privilege drop on linux root (MACH_USER, default nobody) | agent/droppriv_linux.go |
 | X-Forwarded-For honored only with MACH_TRUST_PROXY=1 | server.New + SetTrustProxy |
 | Pair-page security headers (CSP default-src 'none', XFO DENY, nosniff, no-referrer); cross-site POST refused | pairpages.go |
@@ -394,6 +395,22 @@ signature protects delivery, the attestation records provenance.
     So a machine revoked from the CLI keeps accepting commands until it next
     reconnects. There is no `block-machine` subcommand: blocking is reachable
     over HTTP and from the UI, and a CLI version would have the same gap.
+15. **Revocation is recoverable, so there is no permanent ban.** A revoked
+    machine comes back through a fresh enrollment, which is operator-gated (an
+    `enroll`-scoped key, or a phone approval with the challenge code) but does
+    mean anyone who can enroll can also un-revoke. The property revocation still
+    holds is the one that matters for day-to-day safety: **it cannot be used to
+    take over an active machine**, since only a revoked row may be revived.
+    Deleting is not a ban either — it frees the name precisely so a re-imaged box
+    can enroll. A true ban means removing the enrollment paths themselves (revoke
+    the enroll keys, or drop the org). Say this plainly rather than implying
+    `revoke` is permanent.
+16. **A temporary session leaves its enrollment behind.** The row is the record —
+    a connection needs one — so a host that ran plain `mach` stays enrolled and
+    offline, holding its name. Running again under that name needs the row
+    revoked (or deleted) first, and the session says so on exit rather than
+    leaving the operator to meet it as a name conflict. Nothing else about the
+    host persists: no key, no config, no E2E key on disk.
 
 ## Deployment checklist
 

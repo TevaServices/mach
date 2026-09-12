@@ -25,6 +25,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"strconv"
@@ -35,11 +36,14 @@ import (
 )
 
 func main() {
-	console.InterruptGuard()
 	args := os.Args[1:]
 
-	// Explicit subcommands keep working everywhere.
+	// Explicit subcommands keep working everywhere. The interrupt guard is
+	// installed only for these: the bare path below runs the temporary session,
+	// which handles the signal itself so it can say what happened on the way out
+	// (and so an abrupt exit does not race that message).
 	if len(args) > 0 {
+		console.InterruptGuard()
 		switch args[0] {
 		case "list", "exec", "console", "audit", "trust":
 			consoleMain(args)
@@ -83,23 +87,69 @@ func bootStrap() {
 		return
 	}
 
-	// Configured target (enrolled)? Plain `mach` re-establishes the
-	// machine's live connection in this console.
+	// Already installed on this host? Say so rather than starting a second,
+	// throwaway identity: an installed machine's enrollment is what its service
+	// runs on, and a temporary session here would be a different machine with a
+	// different name, competing for the same console.
 	if agent.IsEnrolled(stateDir) {
-		agentMain([]string{"run"})
-		return
+		fmt.Fprintf(os.Stderr, "This host is already enrolled as a permanent agent (%s).\n", stateDir)
+		fmt.Fprintln(os.Stderr, "  mach run                 reconnect that agent")
+		fmt.Fprintln(os.Stderr, "  mach install             keep it running across reboots")
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "Plain `mach` is the TEMPORARY session and would enroll this host as a")
+		fmt.Fprintln(os.Stderr, "second, separate machine. Delete the enrollment above if that is what you want.")
+		os.Exit(2)
 	}
 
-	// Nothing configured: this is a fresh machine to wire in. Enroll via
-	// QR (one URL prompt), then hold the live connection here. Making it
-	// survive reboots is the separate, explicit `mach install`.
-	agentMain([]string{"register"})
-	if !agent.IsEnrolled(stateDir) {
+	// Nothing installed: plain `mach` is a temporary session. It enrolls over
+	// QR (one URL prompt), holds the live connection, and keeps everything in
+	// memory — so Ctrl-C ends it and running `mach` again enrolls from scratch.
+	// Surviving reboots is the separate, explicit `mach install`.
+	if err := agent.RunEphemeral(promptServer(), promptOrg()); err != nil {
+		fmt.Fprintln(os.Stderr, "mach: "+err.Error())
 		os.Exit(1)
 	}
-	fmt.Println("\nEnrolled. Holding the live connection in this console (Ctrl-C to stop).")
-	fmt.Println("Make it permanent (auto-start + reconnect after reboots):  mach install")
-	agentMain([]string{"run"})
+}
+
+// promptServer asks for the control-plane URL when it is not in the environment.
+// Same one-prompt UX as `mach register`, which the temporary session replaces.
+func promptServer() string {
+	if v := os.Getenv("MACH_SERVER"); v != "" {
+		fmt.Printf("Control plane URL [%s]: ", v)
+		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		if s := strings.TrimSpace(line); s != "" {
+			return s
+		}
+		return v
+	}
+	fmt.Print("Control plane URL (e.g. https://mach.example.com): ")
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	s := strings.TrimSpace(line)
+	if s == "" {
+		fmt.Fprintln(os.Stderr, "mach: a control plane URL is required (set MACH_SERVER to skip the prompt)")
+		os.Exit(2)
+	}
+	return s
+}
+
+// promptOrg asks for the org prefix, defaulting to MACH_ORG.
+func promptOrg() string {
+	if v := os.Getenv("MACH_ORG"); v != "" {
+		fmt.Printf("Org prefix for machine names [%s]: ", v)
+		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		if s := strings.TrimSpace(line); s != "" {
+			return s
+		}
+		return v
+	}
+	fmt.Print("Org prefix for machine names (e.g. bcross): ")
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	s := strings.TrimSpace(line)
+	if s == "" {
+		fmt.Fprintln(os.Stderr, "mach: an org prefix is required (set MACH_ORG to skip the prompt)")
+		os.Exit(2)
+	}
+	return s
 }
 
 func consoleMain(args []string) {

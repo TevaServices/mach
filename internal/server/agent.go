@@ -44,11 +44,11 @@ func (s *Server) handlePairStart(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	if existing, _ := s.st.MachineByPubKey(req.PubKey); existing != nil {
-		if existing.Revoked {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "this agent key is revoked; ask the operator to delete it first"})
-			return
-		}
+	if existing, _ := s.st.MachineByPubKey(req.PubKey); existing != nil && !existing.Revoked {
+		// A revoked machine is NOT refused here: re-enrolling is how it comes
+		// back, and the pairing is the operator-gated path for that. An actively
+		// enrolled key is still refused.
+		//
 		// The machine name is deliberately not echoed back: this endpoint is
 		// unauthenticated, so anyone holding a public key (an agent's key is
 		// not a secret once it has been used anywhere) could otherwise confirm
@@ -159,14 +159,6 @@ func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	name := strings.TrimSpace(req.Name)
-	if existing, _ := s.st.MachineByPubKey(req.PubKey); existing != nil {
-		if existing.Revoked {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "this agent key is revoked"})
-			return
-		}
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "already enrolled as " + existing.Name})
-		return
-	}
 	// Any *configured* org, not just the primary one. The pair page has always
 	// accepted every configured org; this path used to check MACH_ORG alone, so
 	// adding an org from the UI would have worked for QR enrollment and silently
@@ -176,16 +168,72 @@ func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name must be org-prefixed (<org>-<machine>, letters/digits/hyphen, machine part 1-48 chars) for a configured org"})
 		return
 	}
-	if existing, _ := s.st.MachineByName(name); existing != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "machine name already taken — pick a new name (e.g. " + name + "-2)"})
+	if status, msg := s.enrollmentRefusal(name, req.PubKey); status != 0 {
+		writeJSON(w, status, map[string]string{"error": msg})
 		return
 	}
-	if err := s.st.CreateMachine(name, req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer, pubE2E); err != nil {
+	// Create, or revive a revoked machine that is enrolling again.
+	revived, err := s.st.ReactivateMachine(name, req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer, pubE2E)
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
 	}
-	s.logf("api-key enrollment: machine=%s host=%q", name, req.Hostname)
+	if !revived {
+		if err := s.st.CreateMachine(name, req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer, pubE2E); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
+			return
+		}
+		s.logf("api-key enrollment: machine=%s host=%q", name, req.Hostname)
+	} else {
+		s.logf("api-key re-enrollment: revived revoked machine=%s host=%q", name, req.Hostname)
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": name, "server_key": s.serverKeyHex})
+}
+
+// enrollmentRefusal is why an enrollment must be refused, or (0, "") to proceed.
+//
+// Two rules, and together they are the whole policy:
+//
+//   - An ACTIVELY enrolled machine is never displaced. Not its name, not its
+//     key. This keeps the name-conflict rejection that stops an operator's typo
+//     (or a hostile enrollee) from taking over a working agent's identity.
+//   - A REVOKED machine may be revived by enrolling again. That is what makes
+//     revocation a forced re-enrollment rather than a permanent ban: the agent
+//     self-retires, the name and key stay reserved, and the machine comes back
+//     only through a fresh enrollment — which needs an enroll key or a phone
+//     approval, so it is still operator-gated.
+//
+// The actual revive is guarded in SQL too (ReactivateMachine matches only
+// revoked rows), so this check is about the message a caller gets, not about the
+// property holding.
+func (s *Server) enrollmentRefusal(name, pubkey string) (int, string) {
+	byKey, err := s.st.MachineByPubKey(pubkey)
+	if err != nil {
+		return http.StatusInternalServerError, "store error"
+	}
+	if byKey != nil && !byKey.Revoked {
+		return http.StatusConflict, "already enrolled as " + byKey.Name
+	}
+	// The presented key belongs to a revoked machine, and it may only come back
+	// under that machine's own name: reviving a *different* row with it would
+	// violate the unique key constraint, and there is no honest resolution to
+	// offer — so name the machine the key belongs to instead of surfacing a
+	// driver error.
+	if byKey != nil && byKey.Name != name {
+		return http.StatusConflict, "this key belongs to revoked machine " + byKey.Name +
+			" — enroll under that name, or delete that machine first"
+	}
+	byName, err := s.st.MachineByName(name)
+	if err != nil {
+		return http.StatusInternalServerError, "store error"
+	}
+	if byName == nil {
+		return 0, ""
+	}
+	if !byName.Revoked {
+		return http.StatusConflict, "machine name already taken — pick a new name (e.g. " + name + "-2)"
+	}
+	return 0, ""
 }
 
 // ---- GET /v1/agent/ws  (agent main connection; identity via ed25519) ----
@@ -392,8 +440,18 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "pairing not approved (state: " + state + ")"})
 		return
 	}
-	if existing, _ := s.st.MachineByPubKey(p.PubKey); existing != nil {
+	if existing, _ := s.st.MachineByPubKey(p.PubKey); existing != nil && !existing.Revoked {
+		// Idempotent re-claim: this key is already enrolled. Reporting success
+		// rather than a conflict keeps a lost response from looking like a
+		// failure to an agent that is retrying.
 		writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": existing.Name, "server_key": s.serverKeyHex})
+		return
+	}
+	// A revoked machine may come back through a fresh enrollment — but only under
+	// its own name, so the pairing's name is checked here rather than left to the
+	// unique constraint inside ConsumePairing.
+	if status, msg := s.enrollmentRefusal(p.Name, p.PubKey); status != 0 {
+		writeJSON(w, status, map[string]string{"error": msg})
 		return
 	}
 	ok, err := s.st.ConsumePairing(p, pubE2E)
