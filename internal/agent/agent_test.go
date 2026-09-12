@@ -91,20 +91,14 @@ func TestShellArgs(t *testing.T) {
 	}
 }
 
-func TestCappedBufferTruncates(t *testing.T) {
-	cb := &cappedBuffer{max: 10}
-	n, _ := cb.Write([]byte("0123456789"))
-	_ = n
-	// Overflow write must be discarded, not grown.
-	_, _ = cb.Write([]byte("ABCDEFGHIJ"))
-	s := cb.String()
-	if len(s) != 10+len("\n[mach: output truncated at cap]") {
-		t.Errorf("capped buffer len = %d", len(s))
+func TestTruncationMarkerShape(t *testing.T) {
+	// The marker is user-visible text in every console: it must say what
+	// happened and be separated from real output on its own line.
+	marker := truncationMarker
+	if !strings.HasPrefix(marker, "\n") || !strings.HasSuffix(marker, "\n") {
+		t.Errorf("marker not on its own line: %q", marker)
 	}
-	if !strings.HasSuffix(s, "[mach: output truncated at cap]") {
-		t.Errorf("missing truncation marker: %q", s)
-	}
-	if !strings.HasPrefix(s, "0123456789") {
-		t.Errorf("head content lost: %q", s)
+	if !strings.Contains(marker, "truncated") {
+		t.Errorf("marker does not say the output was truncated: %q", marker)
 	}
 }

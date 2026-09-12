@@ -78,12 +78,21 @@ func Serve() {
 	log.Printf("mach control plane listening on %s (public URL %s, org %q, trust-proxy %v)",
 		listen, pubURL, Org(), os.Getenv("MACH_TRUST_PROXY") == "1")
 	// Explicit timeouts: without a ReadHeaderTimeout the public listener is
-	// trivially slowloris'd. (ReadTimeout/WriteTimeout stay unset — console
-	// exec requests legitimately block for up to ~10 minutes.)
+	// trivially slowloris'd.
+	//
+	// ReadTimeout bounds reading a request (headers plus body — every endpoint
+	// takes a small JSON or form body, so 30s is generous even on a phone).
+	// WriteTimeout stays UNSET on purpose: a streamed exec response can
+	// legitimately last as long as the command's timeout. What bounds a slow
+	// or stalled reader instead is a per-write deadline on the streaming
+	// handler (relayExec, execWriteTimeout), which is strictly better than a
+	// whole-response timeout — it lets a slow-but-alive console finish, and
+	// drops one that has stopped reading.
 	srvHTTP := &http.Server{
 		Addr:              listen,
 		Handler:           srv.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 	if err := srvHTTP.ListenAndServe(); err != nil {

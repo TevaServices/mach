@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bcross/mach/internal/broker"
@@ -214,9 +215,14 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	resp := protocol.HelloResponse{OK: true, ServerAuth: "v1 " + base64.StdEncoding.EncodeToString(ed25519.Sign(s.serverPriv, []byte("server|"+nonce)))}
 	_ = conn.WriteEnvelope(protocol.Envelope{Type: "hello_result", Payload: mustJSON(resp)})
 
-	// Authenticated: exec_result frames carry up to 2×8 MiB of output plus
-	// JSON overhead; raise the frame cap accordingly.
-	ws.SetReadLimit(40 << 20)
+	// Authenticated: an agent only ever sends hello, ping, exec_chunk and
+	// exec_result. The largest of those is a chunk — one flush's worth of
+	// output (8 KiB) plus at most one os/exec copy (32 KiB), base64'd to
+	// ~55 KiB — so the cap sits four times above the real maximum. It used to
+	// be 40 MiB, from when exec_result carried a whole command's output;
+	// streaming means that no longer exists, and the cap is what bounds how
+	// much a single agent connection can make this server allocate at once.
+	ws.SetReadLimit(256 << 10)
 
 	ac := &broker.AgentConn{Name: machine.Name, Conn: conn, LastSeen: time.Now(), Hostname: hr.Hostname, OS: hr.OS, Arch: hr.Arch, AgentVer: hr.AgentVer}
 	s.br.Add(ac)
@@ -245,6 +251,8 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		switch env.Type {
+		case "exec_chunk":
+			s.streamChunk(env, machine.Name)
 		case "exec_result":
 			s.completeExec(env, machine.Name)
 		case "ping":
@@ -318,34 +326,131 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": p.Name, "server_key": s.serverKeyHex})
 }
 
-// ---- exec completion (called from the agent pump above) ----
+// ---- exec streaming and completion (called from the agent pump above) ----
 
+const (
+	// execOutChanBuf bounds the chunks buffered for one exec while it waits
+	// for the console to read them. Beyond it chunks are dropped and the
+	// console is told, rather than blocking the agent's frame pump — which
+	// serves every other exec on that machine connection too.
+	execOutChanBuf = 512
+
+	// auditHeadBytes is how much of each output stream is kept for the audit
+	// row (the store trims further, to 4096 bytes, on insert).
+	auditHeadBytes = 8 << 10
+
+	// execWriteTimeout bounds one write of a stream frame to a console.
+	execWriteTimeout = 60 * time.Second
+)
+
+// pendingExec is one in-flight command: the live output channel the console
+// reads, and the head of that output kept for the audit row it will leave.
 type pendingExec struct {
-	ch      chan protocol.ExecResult
+	ch      chan execOutcome        // terminal result (buffered: never blocks the pump)
+	out     chan protocol.ExecChunk // live output, consumed by the HTTP handler
 	machine string
 	command string
 	source  string
+
+	// Owned by the agent pump, read by the HTTP handler once the terminal
+	// result has been delivered (the channel send orders the two).
+	mu        sync.Mutex
+	stdout    []byte
+	stderr    []byte
+	truncated bool // output dropped here: the console was too slow
+}
+
+// execOutcome is the terminal state delivered on pendingExec.ch.
+type execOutcome struct {
+	res       protocol.ExecResult
+	stdout    string
+	stderr    string
+	truncated bool
+}
+
+func (pe *pendingExec) appendOut(stream string, data []byte) {
+	pe.mu.Lock()
+	defer pe.mu.Unlock()
+	dst := &pe.stdout
+	if stream == "stderr" {
+		dst = &pe.stderr
+	}
+	if room := auditHeadBytes - len(*dst); room > 0 {
+		if len(data) > room {
+			data = data[:room] // the store trims to a rune boundary on insert
+		}
+		*dst = append(*dst, data...)
+	}
+}
+
+func (pe *pendingExec) markTruncated() {
+	pe.mu.Lock()
+	pe.truncated = true
+	pe.mu.Unlock()
+}
+
+func (pe *pendingExec) outcome(res protocol.ExecResult) execOutcome {
+	pe.mu.Lock()
+	defer pe.mu.Unlock()
+	return execOutcome{res: res, stdout: string(pe.stdout), stderr: string(pe.stderr), truncated: pe.truncated}
+}
+
+// pendingFor resolves a frame from a machine to its pending exec. An exec may
+// only be streamed or completed by the machine it was dispatched to: without
+// that check, any other enrolled machine could inject output into (or end) a
+// command it was never sent.
+func (s *Server) pendingFor(reqID, fromMachine string) *pendingExec {
+	s.pendMu.Lock()
+	defer s.pendMu.Unlock()
+	pe, ok := s.pending[reqID]
+	if !ok || pe.machine != fromMachine {
+		return nil
+	}
+	return pe
+}
+
+// streamChunk relays one piece of a running command's output to the console.
+// Called from the agent pump, so it must never block.
+func (s *Server) streamChunk(env protocol.Envelope, fromMachine string) {
+	var ch protocol.ExecChunk
+	if err := json.Unmarshal(env.Payload, &ch); err != nil {
+		return
+	}
+	if ch.Stream != "stdout" && ch.Stream != "stderr" {
+		// Relay only the two streams the console knows. An agent must not be
+		// able to invent a third label and have it echoed to a client.
+		return
+	}
+	data, err := base64.StdEncoding.DecodeString(ch.DataB64)
+	if err != nil {
+		return
+	}
+	pe := s.pendingFor(env.ReqID, fromMachine)
+	if pe == nil {
+		return // unknown exec, or one dispatched to a different machine
+	}
+	pe.appendOut(ch.Stream, data)
+	select {
+	case pe.out <- ch:
+	default:
+		pe.markTruncated()
+	}
 }
 
 func (s *Server) completeExec(env protocol.Envelope, fromMachine string) {
 	var res protocol.ExecResult
 	if err := json.Unmarshal(env.Payload, &res); err != nil {
-		res = protocol.ExecResult{Error: "bad exec_result payload"}
+		res = protocol.ExecResult{Error: "bad exec_result payload", ExitCode: -1}
+	}
+	pe := s.pendingFor(env.ReqID, fromMachine)
+	if pe == nil {
+		return
 	}
 	s.pendMu.Lock()
-	pe, ok := s.pending[env.ReqID]
-	if ok && pe.machine != fromMachine {
-		// Only the machine the exec was dispatched to may complete it.
-		ok = false
-	}
-	if ok {
-		delete(s.pending, env.ReqID)
-	}
+	delete(s.pending, env.ReqID)
 	s.pendMu.Unlock()
-	if ok {
-		select {
-		case pe.ch <- res:
-		default:
-		}
+	select {
+	case pe.ch <- pe.outcome(res):
+	default:
 	}
 }
