@@ -1,35 +1,44 @@
 package agent
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
 
-func TestPolicyDeny(t *testing.T) {
-	p := &policy{}
-	p.parse("deny:rm -rf\ndeny:mkfs\n")
-	if r := p.Evaluate("rm -rf /", nil); r == "" {
+// The agent's guardrail is a thin lazy wrapper over internal/policy (which
+// owns the grammar and matching semantics and has its own tests); what is
+// worth testing here is that the wrapper loads once and evaluates.
+func TestAgentPolicyLoadsFromEnv(t *testing.T) {
+	t.Setenv("MACH_POLICY", "deny:rm -rf\ndeny:mkfs\n")
+	var lp lazyPolicy
+	if r := lp.Evaluate("rm -rf /", nil); r == "" {
 		t.Error("rm -rf not denied")
 	}
-	if r := p.Evaluate("ls -la", nil); r != "" {
+	if r := lp.Evaluate("ls -la", nil); r != "" {
 		t.Errorf("ls refused: %s", r)
 	}
 	// argv mode: joined args checked too, whitespace-normalized.
-	if r := p.Evaluate("", []string{"bash", "-c", "rm  -rf /"}); r == "" {
+	if r := lp.Evaluate("", []string{"bash", "-c", "rm  -rf /"}); r == "" {
 		t.Error("argv rm -rf not denied")
 	}
 }
 
-func TestPolicyAllowlist(t *testing.T) {
-	p := &policy{}
-	p.parse("allowonly\nallow:systemctl\nallow:journalctl\n")
-	if r := p.Evaluate("systemctl status nginx", nil); r != "" {
+func TestAgentPolicyLoadsFromFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MACH_STATE_DIR", dir)
+	t.Setenv("MACH_POLICY", "")
+	if err := os.WriteFile(policyPath(), []byte("allowonly\nallow:systemctl\n"), 0o600); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+	var lp lazyPolicy
+	if r := lp.Evaluate("systemctl status nginx", nil); r != "" {
 		t.Errorf("allowed command refused: %s", r)
 	}
-	if r := p.Evaluate("", []string{"systemctl", "status", "nginx"}); r != "" {
+	if r := lp.Evaluate("", []string{"systemctl", "status", "nginx"}); r != "" {
 		t.Errorf("allowed argv command refused: %s", r)
 	}
-	if r := p.Evaluate("cat /etc/shadow", nil); r == "" {
+	if r := lp.Evaluate("cat /etc/shadow", nil); r == "" {
 		t.Error("non-allowlisted command allowed in allowonly mode")
 	}
 }
