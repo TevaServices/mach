@@ -461,6 +461,7 @@ UI_MACHINE="$ORG-ui-01"
 MACH_STATE_DIR="$WORKDIR/agent-ui" "$WORKDIR/mach" register --server "$UI_BASE" \
   --api-key "$UI_ENROLL" --name "$UI_MACHINE" >/dev/null 2>&1
 MACH_STATE_DIR="$WORKDIR/agent-ui" "$WORKDIR/mach" run >"$WORKDIR/agent-ui.log" 2>&1 &
+UI_AGENT_PID=$!
 sleep 2
 UI_CONSOLE_DIR="$WORKDIR/ui-console"
 mkdir -p "$UI_CONSOLE_DIR"
@@ -554,10 +555,15 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$UI_BASE/ui/delete" -b "$
 [[ "$CODE" == "200" ]]; check "delete confirmed" $?
 OUT=$(curl -sS "$UI_BASE/v1/machines" -H "Authorization: Bearer $UI_ADMIN" 2>&1)
 [[ "$OUT" != *"$UI_MACHINE"* ]]; check "the machine is gone from the fleet" $?
-# The agent is told to retire rather than left dialing a name nobody knows.
-sleep 1
+# The agent is told to retire rather than left dialing a name nobody knows, and
+# it must actually STOP: Run() returns nil, so the process exits 0. That is the
+# half a supervisor depends on — the installed unit restarts on failure, not on
+# any exit, which is what makes a clean exit mean "stop" instead of a loop.
+sleep 2
 OUT=$(grep -c 'deleted by the operator' "$WORKDIR/agent-ui.log"); [[ "$OUT" -ge 1 ]]
 check "the agent was notified so it could exit" $?
+kill -0 "$UI_AGENT_PID" 2>/dev/null; [[ $? -ne 0 ]]
+check "the notified agent exited rather than reconnecting" $?
 # And the name is free again: this is the recovery path revocation cannot express.
 PUB_UI2=$(python3 -c "print('12'*32)")
 NAME_OK=$(python3 -c "print('$UI_MACHINE')")
