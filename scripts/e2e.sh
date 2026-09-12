@@ -19,6 +19,11 @@ FAIL=0
 
 cleanup() {
   [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null
+  # The web-UI section runs its own control plane and a fake identity provider on
+  # their own ports and database, so tearing down must not depend on the primary
+  # server's lifecycle.
+  [[ -n "${UI_SERVER_PID:-}" ]] && kill "$UI_SERVER_PID" 2>/dev/null
+  [[ -n "${IDP_PID:-}" ]] && kill "$IDP_PID" 2>/dev/null
   # Kill only processes started from THIS workdir's binary — never a bare
   # `pkill -f "mach run"`, which would match unrelated processes (editors,
   # other projects' dev servers) that merely contain those words.
@@ -407,6 +412,165 @@ sleep 5
 # Behavioral assertion: the agent survives the swap and keeps serving.
 machc exec "$MACHINE3" "echo updated-ok" >/dev/null; check "post-update exec works" $?
 machc list | grep -q "$MACHINE3"; check "updated machine still enrolled+known" $?
+
+step "web UI: absent when OIDC is not configured"
+# The primary control plane has no MACH_OIDC_* set, so its UI must not exist at
+# all — not a UI that refuses, but no route to probe. This is the fail-closed
+# property, and it is the reason the routes are registered conditionally.
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/ui"); [[ "$CODE" == "404" ]]
+check "no OIDC configured: /ui is 404" $?
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/ui/login"); [[ "$CODE" == "404" ]]
+check "no OIDC configured: /ui/login is 404" $?
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/static/htmx.min.js"); [[ "$CODE" == "200" ]]
+check "vendored asset serves" $?
+# The static route is an allowlist, never a directory server.
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/static/../go.mod"); [[ "$CODE" != "200" ]]
+check "static route refuses traversal" $?
+
+step "web UI: OIDC sign-in, block/revoke/delete, org management (loopback)"
+UI_PORT="${MACH_TEST_UI_PORT:-8098}"
+IDP_PORT="${MACH_TEST_IDP_PORT:-8097}"
+UI_BASE="http://127.0.0.1:$UI_PORT"
+IDP_BASE="http://127.0.0.1:$IDP_PORT"
+go build -o "$WORKDIR/fakeidp" ./scripts/fakeidp || { echo "build fakeidp failed"; exit 1; }
+"$WORKDIR/fakeidp" -addr "127.0.0.1:$IDP_PORT" -client-id mach-ui \
+  -subject e2e-operator -email e2e@example.com >"$WORKDIR/idp.log" 2>&1 &
+IDP_PID=$!
+# A second control plane with its own database, so this section cannot disturb
+# the fleet the checks above built. Its MACH_PUBLIC_URL is http, which is what
+# grants the http-issuer carve-out — the dev/loopback case, and the only one.
+MACH_DB="$WORKDIR/ui.db" MACH_LISTEN="127.0.0.1:$UI_PORT" \
+  MACH_PUBLIC_URL="$UI_BASE" MACH_ORG="$ORG" \
+  MACH_OIDC_ISSUER="$IDP_BASE" MACH_OIDC_CLIENT_ID=mach-ui MACH_OIDC_CLIENT_SECRET=s3cret \
+  "$WORKDIR/mach-server" serve >"$WORKDIR/ui-server.log" 2>&1 &
+UI_SERVER_PID=$!
+for i in $(seq 1 30); do
+  curl -fsS "$UI_BASE/healthz" >/dev/null 2>&1 && break
+  sleep 0.3
+done
+curl -fsS "$UI_BASE/healthz" >/dev/null; check "second control plane up (UI+OIDC configured)" $?
+
+UI_ENROLL=$(MACH_DB="$WORKDIR/ui.db" "$WORKDIR/mach-server" add-api-key ui-enroll enroll | grep -oE 'mach_[a-f0-9]+')
+UI_ADMIN=$(MACH_DB="$WORKDIR/ui.db" "$WORKDIR/mach-server" add-api-key ui-admin admin | grep -oE 'mach_[a-f0-9]+')
+[[ -n "$UI_ENROLL" && -n "$UI_ADMIN" ]]; check "UI control plane keys generated" $?
+
+# A real agent, so "block keeps the client connected" is observed rather than
+# assumed: the assertion below is that its log shows ONE connect for the whole
+# block, which a reconnect would break.
+UI_MACHINE="$ORG-ui-01"
+MACH_STATE_DIR="$WORKDIR/agent-ui" "$WORKDIR/mach" register --server "$UI_BASE" \
+  --api-key "$UI_ENROLL" --name "$UI_MACHINE" >/dev/null 2>&1
+MACH_STATE_DIR="$WORKDIR/agent-ui" "$WORKDIR/mach" run >"$WORKDIR/agent-ui.log" 2>&1 &
+sleep 2
+UI_CONSOLE_DIR="$WORKDIR/ui-console"
+mkdir -p "$UI_CONSOLE_DIR"
+printf '{"server": "%s", "api_key": "%s"}\n' "$UI_BASE" "$UI_ADMIN" > "$UI_CONSOLE_DIR/console.json"
+uic() { MACH_STATE_DIR="$UI_CONSOLE_DIR" "$WORKDIR/mach" "$@"; }
+OUT=$(uic list 2>&1); [[ "$OUT" == *"$UI_MACHINE"* ]]; check "agent enrolled and online on the UI control plane" $?
+
+# Sign in through the real OIDC flow against the fake issuer: /ui/login → the
+# IdP → /ui/callback → the fleet page. -L because every hop is a redirect.
+JAR="$WORKDIR/ui-cookies.txt"
+curl -sL -c "$JAR" -b "$JAR" -o "$WORKDIR/ui-fleet.html" -w '%{http_code}' "$UI_BASE/ui/login" >"$WORKDIR/ui-code.txt"
+CODE=$(cat "$WORKDIR/ui-code.txt"); [[ "$CODE" == "200" ]]; check "OIDC sign-in completes and renders the fleet" $?
+OUT=$(grep -o "$UI_MACHINE" "$WORKDIR/ui-fleet.html" | head -1); [[ "$OUT" == "$UI_MACHINE" ]]
+check "signed-in page lists the machine" $?
+# The CSRF token rides in the shell's hx-headers, which is how every action
+# request carries it.
+CSRF=$(python3 -c "import re,sys; h=open('$WORKDIR/ui-fleet.html').read(); m=re.search(r'X-CSRF-Token\":\"([a-f0-9]+)\"',h); print(m.group(1) if m else '')")
+[[ -n "$CSRF" ]]; check "page carries a per-session CSRF token" $?
+
+# A cross-site post and a token-less post must both be refused, and must leave
+# the machine alone.
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$UI_BASE/ui/block" -b "$JAR" \
+  --data-urlencode "machine=$UI_MACHINE"); [[ "$CODE" == "403" ]]
+check "block without a CSRF token is refused" $?
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$UI_BASE/ui/block" -b "$JAR" \
+  -H "X-CSRF-Token: $CSRF" -H 'Sec-Fetch-Site: cross-site' --data-urlencode "machine=$UI_MACHINE")
+[[ "$CODE" == "403" ]]; check "cross-site block is refused" $?
+OUT=$(curl -sS "$UI_BASE/v1/machines" -H "Authorization: Bearer $UI_ADMIN" 2>&1)
+[[ "$OUT" != *'"blocked":true'* ]]; check "refused requests left the machine unblocked" $?
+
+# Block: soft. Commands are refused, the connection is not.
+CODE=$(curl -s -o "$WORKDIR/ui-block.html" -w '%{http_code}' -X POST "$UI_BASE/ui/block" -b "$JAR" \
+  -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' --data-urlencode "machine=$UI_MACHINE")
+[[ "$CODE" == "200" ]]; check "block accepted" $?
+OUT=$(curl -sS "$UI_BASE/v1/machines" -H "Authorization: Bearer $UI_ADMIN" 2>&1)
+[[ "$OUT" == *'"blocked":true'* ]]; check "the fleet listing reports the block" $?
+OUT=$(uic exec "$UI_MACHINE" "echo blocked-should-not-run" 2>&1); [[ "$OUT" == *"blocked by the operator"* ]]
+check "exec against a blocked machine is refused with the reason" $?
+# THE soft-block proof: the agent is still connected. A reconnect would add a
+# second "connected to" line to its log.
+sleep 1
+CONNECTS=$(grep -c 'connected to' "$WORKDIR/agent-ui.log")
+[[ "$CONNECTS" -eq 1 ]]; check "blocked machine stayed connected (one connect, no reconnect)" $?
+
+# Unblock: commands work again. 503-or-success rather than 403 is the point —
+# "offline" and "blocked" are different answers.
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$UI_BASE/ui/unblock" -b "$JAR" \
+  -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' --data-urlencode "machine=$UI_MACHINE")
+[[ "$CODE" == "200" ]]; check "unblock accepted" $?
+uic exec "$UI_MACHINE" "echo unblocked-ok" >/dev/null 2>&1; check "exec works again after unblock" $?
+OUT=$(curl -sS "$UI_BASE/v1/machines" -H "Authorization: Bearer $UI_ADMIN" 2>&1)
+[[ "$OUT" != *'"blocked":true'* ]]; check "the fleet listing clears the block" $?
+
+step "web UI: org management"
+CODE=$(curl -s -o "$WORKDIR/ui-orgs.html" -w '%{http_code}' -X POST "$UI_BASE/ui/orgs/add" -b "$JAR" \
+  -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' --data-urlencode 'org=acme')
+[[ "$CODE" == "200" ]]; check "org added through the UI" $?
+OUT=$(grep -o '<code>acme</code>' "$WORKDIR/ui-orgs.html" | head -1); [[ "$OUT" == "<code>acme</code>" ]]
+check "the new org is listed" $?
+OUT=$(grep -o 'badge pinned' "$WORKDIR/ui-orgs.html" | head -1); [[ "$OUT" == "badge pinned" ]]
+check "the environment's org is shown as pinned" $?
+# The behaviour change this feature forced: enrollment now resolves any
+# configured org, not just the primary one.
+PUB_UI=$(python3 -c "print('ef'*32)")
+OUT=$(curl -sS -X POST "$UI_BASE/v1/register/apikey" -H 'Content-Type: application/json' \
+  -d "{\"api_key\":\"$UI_ENROLL\",\"pub_key\":\"$PUB_UI\",\"name\":\"acme-ui-01\"}" 2>&1)
+[[ "$OUT" == *'"ok":"enrolled"'* ]]; check "a machine enrolls under an org added through the UI" $?
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$UI_BASE/ui/orgs/remove" -b "$JAR" \
+  -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' --data-urlencode 'org=acme')
+[[ "$CODE" == "409" ]]; check "removing an org that still has machines is refused" $?
+OUT=$(curl -sS -X POST "$UI_BASE/ui/orgs/remove" -b "$JAR" -H "X-CSRF-Token: $CSRF" \
+  -H 'HX-Request: true' --data-urlencode "org=$ORG" 2>&1)
+[[ "$OUT" == *"cannot be removed"* ]]; check "removing a pinned org is refused" $?
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$UI_BASE/ui/orgs/e2e" -b "$JAR" \
+  -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' --data-urlencode 'org=acme' --data-urlencode 'mode=off')
+[[ "$CODE" == "200" ]]; check "sealed exec can be set per org from the UI" $?
+OUT=$(curl -sS "$UI_BASE/v1/machines" -H "Authorization: Bearer $UI_ADMIN" 2>&1)
+[[ "$OUT" == *'"e2e":"off"'* ]]; check "the per-org sealed-exec setting reaches the fleet listing" $?
+
+step "web UI: delete is confirmed by name and frees the name"
+CODE=$(curl -s -o "$WORKDIR/ui-del1.html" -w '%{http_code}' -X POST "$UI_BASE/ui/delete" -b "$JAR" \
+  -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' --data-urlencode "machine=$UI_MACHINE")
+[[ "$CODE" == "200" ]]; check "delete asks for confirmation" $?
+OUT=$(grep -o 'confirm_name' "$WORKDIR/ui-del1.html" | head -1); [[ "$OUT" == "confirm_name" ]]
+check "confirmation requires the machine name to be typed" $?
+OUT=$(curl -sS "$UI_BASE/v1/machines" -H "Authorization: Bearer $UI_ADMIN" 2>&1)
+[[ "$OUT" == *"$UI_MACHINE"* ]]; check "the machine survives an unconfirmed delete" $?
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$UI_BASE/ui/delete" -b "$JAR" \
+  -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' --data-urlencode "machine=$UI_MACHINE" \
+  --data-urlencode 'confirm=1' --data-urlencode "confirm_name=$UI_MACHINE")
+[[ "$CODE" == "200" ]]; check "delete confirmed" $?
+OUT=$(curl -sS "$UI_BASE/v1/machines" -H "Authorization: Bearer $UI_ADMIN" 2>&1)
+[[ "$OUT" != *"$UI_MACHINE"* ]]; check "the machine is gone from the fleet" $?
+# The agent is told to retire rather than left dialing a name nobody knows.
+sleep 1
+OUT=$(grep -c 'deleted by the operator' "$WORKDIR/agent-ui.log"); [[ "$OUT" -ge 1 ]]
+check "the agent was notified so it could exit" $?
+# And the name is free again: this is the recovery path revocation cannot express.
+PUB_UI2=$(python3 -c "print('12'*32)")
+NAME_OK=$(python3 -c "print('$UI_MACHINE')")
+OUT=$(curl -sS -X POST "$UI_BASE/v1/register/apikey" -H 'Content-Type: application/json' \
+  -d "{\"api_key\":\"$UI_ENROLL\",\"pub_key\":\"$PUB_UI2\",\"name\":\"$NAME_OK\"}" 2>&1)
+[[ "$OUT" == *'"ok":"enrolled"'* ]]; check "the freed name and a new key re-enroll" $?
+
+step "web UI: sign out"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$UI_BASE/ui/logout" -b "$JAR" \
+  -H "X-CSRF-Token: $CSRF")
+[[ "$CODE" == "200" ]]; check "sign out accepted" $?
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" "$UI_BASE/ui"); [[ "$CODE" == "303" ]]
+check "the signed-out session no longer reaches the fleet" $?
 
 step "cleanup job smoke: pairings purge"
 MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" version >/dev/null
