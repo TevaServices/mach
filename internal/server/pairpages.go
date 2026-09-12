@@ -78,8 +78,9 @@ func (s *Server) pairPageHandler(w http.ResponseWriter, r *http.Request) {
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
 
-	// Token lookups hash candidates per request; keep the per-IP rate
-	// bounded (generous: a human with a slow connection is nowhere close).
+	// Bounded per IP (generous: a human with a slow connection is nowhere
+	// close). This page is reachable by anyone, so the bound is also what
+	// keeps a scanner from probing pairing tokens at speed.
 	if s.pairLookups.record(s.clientIP(r)) {
 		http.Error(w, "too many requests — try again in a few minutes", http.StatusTooManyRequests)
 		return
@@ -94,6 +95,16 @@ func (s *Server) pairPageHandler(w http.ResponseWriter, r *http.Request) {
 	state := s.st.PairingState(p)
 
 	if r.Method == http.MethodPost {
+		// Defense in depth, not the authentication: the token in the path is
+		// the secret, and whoever holds it can post directly. This stops a
+		// page on another site from driving an approve in a browser that
+		// happens to have this pairing open. Sec-Fetch-Site is used rather
+		// than comparing Origin to Host because it is sent by every browser
+		// and cannot be confused by a TLS-terminating proxy rewriting Host.
+		if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+			http.Error(w, "cross-site approval is not allowed — open the pairing link directly", http.StatusForbidden)
+			return
+		}
 		s.handlePairPost(w, r, p, state, token)
 		return
 	}
@@ -173,7 +184,7 @@ func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store
 		renderPair(w, pairPageData{State: why, Orgs: s.ListOrgs()})
 		return
 	}
-	s.logf("pair approved: id=%s name=%s", p.ID, name)
+	s.logf("pair approved: id=%q name=%q", p.ID, name)
 	renderPair(w, pairPageData{Done: true, Name: name})
 }
 

@@ -49,11 +49,11 @@ func (s *Server) authFail(w http.ResponseWriter, msg string) {
 // ---- GET /v1/machines (readonly, or exec keys — allowlist-filtered) ----
 
 func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
-	if scopes != "readonly" && !hasScope(scopes, "exec") {
+	if !canRead(scopes) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key lacks machine-list scope"})
 		return
 	}
-	allowed, all := execAllowlist(scopes)
+	allowed, all := readScope(scopes)
 	machines, err := s.st.ListMachines()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
@@ -83,6 +83,27 @@ func containsFold(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// canRead reports whether a key may read the fleet (machine list, audit).
+// Enroll keys cannot: they are handed to provisioning pipelines, which have no
+// business reading another machine's command history.
+func canRead(scopes string) bool {
+	return hasScope(scopes, "readonly") || hasScope(scopes, "exec")
+}
+
+// readScope resolves the machine allowlist for a read-only surface.
+//
+// A readonly key is fleet-wide by definition ("read machines + audit, execute
+// nothing"). An exec key is restricted to its allowlist. Calling
+// execAllowlist for both was a bug: a readonly key has no exec: entry, so it
+// came back with an empty allowlist and every machine was filtered out —
+// readonly keys saw an empty fleet and an empty audit log.
+func readScope(scopes string) (allowed []string, all bool) {
+	if hasScope(scopes, "readonly") {
+		return nil, true
+	}
+	return execAllowlist(scopes)
 }
 
 // ---- POST /v1/exec (exec scope; allowlist-checked per machine) ----
@@ -163,11 +184,11 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, keyName, sc
 	// Audit entries carry command output: restrict to readonly (full) or
 	// exec keys (allowlist keys see only their machines). Enroll keys get
 	// nothing — they are distributed into provisioning pipelines.
-	if scopes != "readonly" && !hasScope(scopes, "exec") {
+	if !canRead(scopes) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key lacks audit scope"})
 		return
 	}
-	allowed, all := execAllowlist(scopes)
+	allowed, all := readScope(scopes)
 	machine := r.URL.Query().Get("machine")
 	if !all && machine != "" && machine != "*" && !containsFold(allowed, machine) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key is not scoped for machine " + machine})
