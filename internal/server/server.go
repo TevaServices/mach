@@ -9,11 +9,13 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/bcross/mach/internal/broker"
+	"github.com/bcross/mach/internal/oidcauth"
 	"github.com/bcross/mach/internal/store"
 	"github.com/gorilla/websocket"
 )
@@ -57,8 +59,45 @@ type Server struct {
 	// global exec policy: server-side block list applied to every client
 	execPolicy execPolicy
 
+	// ui is the browser UI's configuration and session state. Nil when OIDC is
+	// not configured, in which case none of its routes are registered at all.
+	ui *uiConfig
+
 	// cleanup ticker stop
 	cleanupStop chan struct{}
+}
+
+// initUI loads the web UI's configuration from the environment. With no OIDC
+// variables set the UI stays nil: off, and with no routes, which is the strongest
+// form of "off by default" — an unconfigured deployment does not merely refuse
+// the UI, it has no such surface to probe.
+func (s *Server) initUI() error {
+	cfg, err := loadUIConfig(os.Getenv("MACH_PUBLIC_URL"))
+	if err != nil {
+		return err
+	}
+	s.ui = cfg
+	if cfg != nil {
+		log.Printf("server: web UI enabled (issuer %s, callback %s)", cfg.issuer, cfg.redirectURL)
+		if len(cfg.domains) == 0 {
+			log.Printf("server: web UI: no %s set — ANY identity this issuer verifies may sign in and manage the fleet", envOIDCDomains)
+		}
+	}
+	return nil
+}
+
+// EnableUI turns on the browser UI with an explicit provider, for tests. It is
+// the seam that keeps the handler tests off the network: they install a fake
+// provider here rather than standing up an identity provider.
+func (s *Server) EnableUI(p oidcauth.Provider, redirectURL string, cookieSecure bool) {
+	s.ui = &uiConfig{
+		issuer: "test", clientID: "test", redirectURL: redirectURL, cookieSecure: cookieSecure,
+		provider:     p,
+		sessions:     newUISessionStore(),
+		logins:       newUILoginStore(),
+		loginRate:    newIPLimiter(30, 10*time.Minute),
+		callbackRate: newIPLimiter(20, 10*time.Minute),
+	}
 }
 
 func New(st *store.Store, br *broker.Broker, org, keyPath string) *Server {
@@ -94,6 +133,14 @@ func New(st *store.Store, br *broker.Broker, org, keyPath string) *Server {
 	}
 	s.logExecPolicy()
 	s.logE2E()
+	if err := s.initUI(); err != nil {
+		// Panicking rather than warning, for the same reason the policy file
+		// does: a control plane that boots with its admin surface missing because
+		// one variable was misspelled is far worse than one that refuses to start
+		// and names the variable. A *partial* MACH_OIDC_* set is the case this
+		// catches; setting none of them disables the UI, which is not an error.
+		panic("server: " + err.Error())
+	}
 	// Housekeeping: purge terminal pairings hourly (keep 24h for forensics),
 	// and pick up global exec-policy edits without a restart.
 	go func() {
@@ -207,6 +254,33 @@ func (s *Server) Routes() http.Handler {
 	// Enrollment landing page: OS-detected agent downloads.
 	mux.HandleFunc("GET /{$}", s.handleEnrollRoot)
 	mux.HandleFunc("GET /download/{file}", s.handleAgentDownload)
+
+	// Vendored scripts. Always registered: the enrollment page uses them too, and
+	// that page is unauthenticated.
+	mux.HandleFunc("GET /static/{file}", s.handleUIStatic)
+	mux.HandleFunc("GET /partials/enroll/{os}/{arch}", s.handleEnrollPlatform)
+
+	// Browser UI. Registered ONLY when OIDC is configured, so an unconfigured
+	// control plane has no /ui surface at all rather than one that refuses.
+	if s.ui != nil {
+		mux.HandleFunc("GET /ui", s.uiGet(s.handleUIFleet))
+		mux.HandleFunc("GET /ui/{$}", s.uiGet(s.handleUIFleet))
+		mux.HandleFunc("GET /ui/machines", s.uiGet(s.handleUIMachines))
+		mux.HandleFunc("GET /ui/orgs", s.uiGet(s.handleUIOrgs))
+		mux.HandleFunc("GET /ui/orgs/{org}", s.uiGet(s.handleUIOrgMember))
+		mux.HandleFunc("GET /ui/login", s.handleUILogin)
+		mux.HandleFunc("GET /ui/callback", s.handleUICallback)
+		mux.HandleFunc("POST /ui/logout", s.uiPost(s.handleUILogout))
+
+		mux.HandleFunc("POST /ui/block", s.uiPost(s.handleUIBlock))
+		mux.HandleFunc("POST /ui/unblock", s.uiPost(s.handleUIUnblock))
+		mux.HandleFunc("POST /ui/revoke", s.uiPost(s.handleUIRevoke))
+		mux.HandleFunc("POST /ui/delete", s.uiPost(s.handleUIDelete))
+
+		mux.HandleFunc("POST /ui/orgs/add", s.uiPost(s.handleUIOrgAdd))
+		mux.HandleFunc("POST /ui/orgs/remove", s.uiPost(s.handleUIOrgRemove))
+		mux.HandleFunc("POST /ui/orgs/e2e", s.uiPost(s.handleUIOrgE2E))
+	}
 	return mux
 }
 
