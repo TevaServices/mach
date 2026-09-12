@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 )
@@ -30,6 +31,10 @@ func Open(path string) (*Store, error) {
 	}
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := s.verifySchema(); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -55,7 +60,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
 	id INTEGER PRIMARY KEY,
 	name TEXT NOT NULL,
 	salt TEXT NOT NULL,
-	key_hash TEXT NOT NULL UNIQUE,
+	key_lookup TEXT NOT NULL UNIQUE,
+	key_hash TEXT NOT NULL,
 	scopes TEXT NOT NULL DEFAULT 'exec:*',
 	created_at TEXT NOT NULL,
 	revoked INTEGER DEFAULT 0
@@ -99,6 +105,47 @@ CREATE TABLE IF NOT EXISTS pending_updates (
 );
 `)
 	return err
+}
+
+// verifySchema refuses to run against a database created by an earlier
+// schema version. There is no migration path: mach is pre-1.0 and has never
+// shipped, so a stale file is a development artifact — and quietly reading
+// one with different column semantics (or silently missing the indexed
+// lookup column and falling back to a table scan on an unauthenticated path)
+// is worse than refusing to start.
+func (s *Store) verifySchema() error {
+	cols, err := s.tableColumns("api_keys")
+	if err != nil {
+		return err
+	}
+	if !cols["key_lookup"] {
+		return errors.New("database predates the current schema (api_keys.key_lookup missing); delete it and re-enroll — pre-1.0, no migration path")
+	}
+	cols, err = s.tableColumns("pairings")
+	if err != nil {
+		return err
+	}
+	if !cols["code_salt"] {
+		return errors.New("database predates the current schema (pairings.code_salt missing); delete it and re-enroll — pre-1.0, no migration path")
+	}
+	return nil
+}
+
+func (s *Store) tableColumns(table string) (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out[name] = true
+	}
+	return out, rows.Err()
 }
 
 func randHex(n int) string {
@@ -158,6 +205,23 @@ func HashSecret(secret, salt string) string { return stretch(secret, salt, stret
 
 // HashKey is an alias kept for API-key call sites.
 func HashKey(key, salt string) string { return HashSecret(key, salt) }
+
+// LookupHash is the deterministic, unsalted digest used to find a row by a
+// high-entropy secret in one indexed query.
+//
+// Salting and stretching exist to slow down guessing of *low-entropy*
+// secrets. Pairing tokens are 256 bits and API keys 192 bits of CSPRNG
+// output, so there is nothing to guess: what the salt bought us was a
+// per-row hash of every candidate on every request, i.e. unbounded CPU work
+// on unauthenticated endpoints proportional to table size. This makes the
+// lookup O(1) while the stored secret remains unguessable.
+//
+// Low-entropy secrets (the 12-character pairing challenge code, which a human
+// types) keep the salted, stretched hash via HashSecret.
+func LookupHash(secret string) string {
+	sum := sha256.Sum256([]byte("mach-lookup\x00" + secret))
+	return hex.EncodeToString(sum[:])
+}
 
 // ValidOrgName enforces the org-prefix naming rule: "<org>-<machine>".
 // Org: 2-20 chars; machine part: 1-48 chars; letters/digits/hyphen.
@@ -269,31 +333,33 @@ func (s *Store) RevokeMachine(name string) error {
 // "readonly" = machines + audit only; "enroll" = API-key enrollment only.
 func (s *Store) CreateAPIKey(name, key, scopes string) error {
 	salt := randHex(16)
-	_, err := s.db.Exec(`INSERT INTO api_keys (name, salt, key_hash, scopes, created_at) VALUES (?,?,?,?,?)`,
-		name, salt, HashKey(key, salt), scopes, now())
+	_, err := s.db.Exec(`INSERT INTO api_keys (name, salt, key_lookup, key_hash, scopes, created_at) VALUES (?,?,?,?,?,?)`,
+		name, salt, LookupHash(key), HashKey(key, salt), scopes, now())
 	return err
 }
 
+// APIKeyExists resolves a bearer key in one indexed query. The indexed
+// lookup hash is deterministic (see LookupHash); the stretched hash is then
+// compared in constant time, so a caller cannot learn from timing how close
+// a guess was.
 func (s *Store) APIKeyExists(key string) (ok bool, keyName, scopes string, err error) {
-	rows, err := s.db.Query(`SELECT name, salt, key_hash, scopes, revoked FROM api_keys`)
+	var name, salt, keyHash, scopesCol string
+	var revoked int
+	err = s.db.QueryRow(`SELECT name, salt, key_hash, scopes, revoked FROM api_keys WHERE key_lookup = ?`,
+		LookupHash(key)).Scan(&name, &salt, &keyHash, &scopesCol, &revoked)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, "", "", nil
+	}
 	if err != nil {
 		return false, "", "", err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var name, salt, keyHash, scopes string
-		var revoked int
-		if err := rows.Scan(&name, &salt, &keyHash, &scopes, &revoked); err != nil {
-			return false, "", "", err
-		}
-		if revoked != 0 {
-			continue
-		}
-		if subtle.ConstantTimeCompare([]byte(HashKey(key, salt)), []byte(keyHash)) == 1 {
-			return true, name, scopes, nil
-		}
+	if revoked != 0 {
+		return false, "", "", nil
 	}
-	return false, "", "", rows.Err()
+	if subtle.ConstantTimeCompare([]byte(HashKey(key, salt)), []byte(keyHash)) != 1 {
+		return false, "", "", nil
+	}
+	return true, name, scopesCol, nil
 }
 
 // ---- pairings ----
@@ -337,49 +403,30 @@ func (s *Store) CreatePairing(pubkey, hostname, os, arch, agentVer string, ttl t
 	codeSalt := randHex(16)
 	_, err = s.db.Exec(`INSERT INTO pairings (id, token_hash, pubkey, hostname, os, arch, agent_version, code_hash, code_salt, state, created_at, expires_at)
 		VALUES (?,?,?,?,?,?,?,?,?,'pending',?,?)`,
-		id, HashKey(token, codeSalt), pubkey, hostname, os, arch, agentVer,
+		id, LookupHash(token), pubkey, hostname, os, arch, agentVer,
 		HashSecret(code, codeSalt), codeSalt, now(),
 		time.Now().UTC().Add(ttl).Format(time.RFC3339))
 	return id, token, code, err
 }
 
-// pairingScanCap bounds how many candidate pairings a token lookup hashes
-// (most recent first). Each candidate costs a 50k-iteration stretched hash,
-// and this lookup runs on unauthenticated endpoints — the cap keeps the
-// per-request work constant instead of scaling with table size. Live
-// pairings are short-lived (pending TTL is minutes; approved-but-unclaimed
-// rows are cleaned up after a day), so 64 comfortably covers real traffic.
-const pairingScanCap = 64
-
+// PairingByToken resolves the one-time bearer token carried in the QR link.
+// The token is a 256-bit random value, so it is matched by its deterministic
+// hash (LookupHash) in a single indexed query rather than by hashing every
+// candidate row: this lookup runs on unauthenticated endpoints, and its cost
+// must not grow with the table.
+//
+// Any state, consumed or not: the agent poller has to see the state
+// transition (expired/denied/approved), not a blind 404.
 func (s *Store) PairingByToken(token string) (*Pairing, error) {
-	// Tokens are hashed under each pairing's own salt; one pass computes the
-	// candidate hash per live (non-consumed) pairing and constant-time
-	// compares. Non-consumed of any state: the agent poller must see the
-	// state transition (expired/denied), not a blind 404.
-	rows, err := s.db.Query(`SELECT id, code_salt, token_hash FROM pairings WHERE consumed=0 ORDER BY created_at DESC LIMIT ?`, pairingScanCap)
+	var id string
+	err := s.db.QueryRow(`SELECT id FROM pairings WHERE token_hash = ?`, LookupHash(token)).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	type cand struct{ id, salt, tokHash string }
-	var cands []cand
-	for rows.Next() {
-		var c cand
-		if err := rows.Scan(&c.id, &c.salt, &c.tokHash); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		cands = append(cands, c)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	for _, c := range cands {
-		if subtle.ConstantTimeCompare([]byte(HashKey(token, c.salt)), []byte(c.tokHash)) == 1 {
-			return s.pairingByID(c.id)
-		}
-	}
-	return nil, nil
+	return s.pairingByID(id)
 }
 
 func (s *Store) pairingByID(id string) (*Pairing, error) {
@@ -497,11 +544,21 @@ func (s *Store) ConsumePairing(p *Pairing) (bool, error) {
 
 // CleanupExpiredPairings deletes terminal-state pairings older than maxAge.
 // Approved-but-never-claimed pairings count as terminal after maxAge: they
-// are claimable indefinitely otherwise, and their token lookup cost is paid
-// on every unauthenticated pair-page request.
+// are claimable indefinitely otherwise.
+//
+// Pairings still marked pending are dropped once they are past their own
+// expiry by more than maxAge. Nothing else ever clears them — a pending row
+// whose agent gave up is never looked up again, so without this the table
+// (which any unauthenticated caller can append to via pair-start) grows
+// without bound.
 func (s *Store) CleanupExpiredPairings(maxAge time.Duration) (int64, error) {
-	cutoff := time.Now().UTC().Add(-maxAge).Format(time.RFC3339)
-	res, err := s.db.Exec(`DELETE FROM pairings WHERE (state IN ('expired','denied','approved') OR consumed=1) AND created_at < ?`, cutoff)
+	nowT := time.Now().UTC()
+	createdCutoff := nowT.Add(-maxAge).Format(time.RFC3339)
+	expiryCutoff := nowT.Add(-maxAge).Format(time.RFC3339)
+	res, err := s.db.Exec(`DELETE FROM pairings
+		WHERE (state IN ('expired','denied','approved') OR consumed=1) AND created_at < ?
+		   OR (state = 'pending' AND expires_at < ?)`,
+		createdCutoff, expiryCutoff)
 	if err != nil {
 		return 0, err
 	}
@@ -522,12 +579,18 @@ type AuditEntry struct {
 	StderrSnip string
 }
 
+// snippet trims to a byte budget without splitting a UTF-8 rune, so audit
+// rows never contain a mangled tail character.
 func snippet(s string, n int) string {
 	s = strings.ReplaceAll(s, "\x00", "")
-	if len(s) > n {
-		return s[:n]
+	if len(s) <= n {
+		return s
 	}
-	return s
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 // RedactScrubs masks values next to secret-bearing keywords while keeping
