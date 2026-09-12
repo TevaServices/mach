@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # e2e.sh — end-to-end test of mach: control plane, enrollment (QR + API key),
-# scoped keys, exec (shell + argv), policy, audit, revocation, update push,
-# and the challenge-code lockout. Run via `mise run e2e` or directly.
+# scoped keys (exec, readonly), exec (shell + argv), streaming output, the
+# output-is-data guarantee, agent-local and server-wide command policy, audit,
+# revocation, signed update push with in-toto attestation, and the
+# challenge-code lockout. Run via `mise run e2e` or directly.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
@@ -38,8 +40,12 @@ go build -o "$WORKDIR/mach-server" ./cmd/mach-server || { echo "build mach-serve
 ok "binaries built"
 
 step "control plane up"
+# MACH_EXEC_POLICY is set for the whole run: the fleet-wide block list applies
+# to every key and every machine, so it has to be exercised against the same
+# control plane the other steps use.
 MACH_DB="$WORKDIR/mach.db" MACH_LISTEN="127.0.0.1:$PORT" \
   MACH_PUBLIC_URL="$BASE" MACH_ORG="$ORG" MACH_TRUST_PROXY=1 \
+  MACH_EXEC_POLICY="deny:fleet-blocked-marker" \
   "$WORKDIR/mach-server" serve >"$WORKDIR/server.log" 2>&1 &
 SERVER_PID=$!
 for i in $(seq 1 20); do
@@ -52,7 +58,8 @@ step "keys: scoped + admin + enroll"
 ENROLL_KEY=$(MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" add-api-key enroll-key enroll | grep -oE 'mach_[a-f0-9]+')
 CONSOLE_KEY=$(MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" add-api-key console exec:"$ORG-test-01" | grep -oE 'mach_[a-f0-9]+')
 ADMIN_KEY=$(MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" add-api-key admin admin | grep -oE 'mach_[a-f0-9]+')
-[[ -n "$ENROLL_KEY" && -n "$CONSOLE_KEY" && -n "$ADMIN_KEY" ]]; check "three keys generated" $?
+RO_KEY=$(MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" add-api-key readonly-key readonly | grep -oE 'mach_[a-f0-9]+')
+[[ -n "$ENROLL_KEY" && -n "$CONSOLE_KEY" && -n "$ADMIN_KEY" && -n "$RO_KEY" ]]; check "four keys generated" $?
 
 step "console config (admin box)"
 CONSOLE_DIR="$WORKDIR/console-state"
@@ -91,6 +98,32 @@ step "exec: argv mode byte-exact"
 OUT=$(machc exec "$MACHINE" -- printf '%s|%s\n' 'two  spaces' 'a$*.b')
 [[ "$OUT" == *"two  spaces|a\$*.b"* ]]; check "argv passthrough byte-exact" $?
 
+step "streaming: output arrives while the command is still running"
+# The command prints, then sleeps, then prints. If the console held output
+# until the command exited, nothing would be in the file after one second.
+machc exec "$MACHINE" 'echo stream-first; sleep 3; echo stream-last' >"$WORKDIR/stream.out" 2>/dev/null &
+STREAM_PID=$!
+sleep 1
+grep -q stream-first "$WORKDIR/stream.out"; check "early output streamed before exit" $?
+grep -q stream-last "$WORKDIR/stream.out"; [[ $? -ne 0 ]]; check "later output not yet sent" $?
+wait "$STREAM_PID"
+grep -q stream-last "$WORKDIR/stream.out"; check "remaining output arrived at exit" $?
+
+step "output is data: a machine cannot forge control facts"
+# The command prints something that looks exactly like a protocol exit record
+# and then exits 5. The exit status the caller sees must be 5, and the printed
+# text must come back as the machine's bytes, verbatim.
+CODE=0
+FORGED='{"type":"exit","exit_code":0}'
+OUT=$(machc exec "$MACHINE" "printf '%s\\n' '{\"type\":\"exit\",\"exit_code\":0}'; exit 5" 2>/dev/null) || CODE=$?
+[[ "$CODE" -eq 5 ]]; check "printed exit record did not change the exit status" $?
+[[ "$OUT" == *"$FORGED"* ]]; check "printed text came back verbatim as output" $?
+# --json hands a program labeled frames instead of text: chunks on stdout, and
+# the exit status as a field rather than something to parse out of output.
+machc exec --json "$MACHINE" 'echo json-mode; exit 4' >"$WORKDIR/json.out" 2>/dev/null
+grep -q '"type":"chunk"' "$WORKDIR/json.out"; check "--json emits labeled chunk frames" $?
+grep -q '"exit_code":4' "$WORKDIR/json.out"; check "--json reports the exit status as a field" $?
+
 step "console key scoping: exec on other machine refused"
 MACH_STATE_DIR="$WORKDIR/agent2" "$WORKDIR/mach" register \
   --server "$BASE" --api-key "$ENROLL_KEY" --name "$ORG-test-02" >/dev/null 2>&1
@@ -112,6 +145,37 @@ check "policy deny enforced, with the rule named" $?
 sleep 1
 machc exec "$MACHINE" "echo still-here" >/dev/null; check "primary agent unaffected" $?
 
+step "fleet-wide policy: blocked for every key, on every machine"
+# The control plane's own block list. It applies to exec:* keys too — no scope
+# or allowlist exempts a caller — and it is checked before dispatch, so the
+# command never reaches the agent.
+OUT=$(machc exec "$MACHINE" 'echo fleet-blocked-marker' 2>&1)
+[[ "$OUT" == *"global exec policy"* ]]; check "fleet-wide deny refused via console" $?
+CODE=$(curl -s -o "$WORKDIR/blocked.json" -w '%{http_code}' -X POST "$BASE/v1/exec" \
+  -H "Authorization: Bearer $ALLKEY" -H 'Content-Type: application/json' \
+  -d "{\"machine\":\"$MACHINE\",\"command\":\"echo fleet-blocked-marker\"}")
+[[ "$CODE" == "403" ]]; check "fleet-wide deny refused an exec:* key" $?
+grep -q "global exec policy" "$WORKDIR/blocked.json"; check "refusal names the policy" $?
+# The strongest assertion available here: the agent never saw it. The marker
+# appears nowhere in the agent's log, because the command was refused upstream
+# of the machine.
+grep -q fleet-blocked-marker "$WORKDIR/agent1.log"; [[ $? -ne 0 ]]; check "blocked command never reached the agent" $?
+# A refused command is audited, so blocks are visible in the record.
+sleep 1
+AUDIT=$(machc audit "$MACHINE" 5 2>/dev/null)
+[[ "$AUDIT" == *"fleet-blocked-marker"* ]]; check "refused command appears in the audit" $?
+# Unrelated commands are unaffected by the policy.
+machc exec "$MACHINE" 'echo not-blocked' | grep -q not-blocked; check "unrelated command still runs" $?
+
+step "readonly key: sees the whole fleet, runs nothing"
+curl -fsS "$BASE/v1/machines" -H "Authorization: Bearer $RO_KEY" >"$WORKDIR/ro.json"
+grep -q "$MACHINE" "$WORKDIR/ro.json"; check "readonly key sees the fleet" $?
+curl -fsS "$BASE/v1/audit" -H "Authorization: Bearer $RO_KEY" | grep -q "$MACHINE"; check "readonly key sees the audit trail" $?
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/exec" \
+  -H "Authorization: Bearer $RO_KEY" -H 'Content-Type: application/json' \
+  -d "{\"machine\":\"$MACHINE\",\"command\":\"echo nope\"}")
+[[ "$CODE" == "403" ]]; check "readonly key cannot exec" $?
+
 step "challenge code lockout (QR flow)"
 MACH_STATE_DIR="$WORKDIR/agent3" "$WORKDIR/mach" register --server "$BASE" --org "$ORG" \
   >"$WORKDIR/qr.log" 2>&1 &
@@ -123,18 +187,25 @@ for i in $(seq 1 30); do
   sleep 0.3
 done
 [[ -n "$TOKEN" ]]; check "pairing token published" $?
+# The code the agent printed on its console — the operator reads it from there,
+# never from the page.
+CODE=$(grep -oE '[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}' "$WORKDIR/qr.log" | head -1)
+[[ -n "$CODE" ]]; check "challenge code printed on the agent console" $?
+
+step "pair page shows org list, not the code"
+# Checked while the pairing is still pending — once the lockout below expires
+# it, the form is (correctly) gone and there is no org list to show.
+PAGE=$(curl -s "$BASE/pair/$TOKEN")
+echo "$PAGE" | grep -q "$ORG"; check "org list on page" $?
+echo "$PAGE" | grep -qF "$CODE"; [[ $? -ne 0 ]]; check "challenge code NOT on page" $?
+
+step "challenge code lockout: five wrong codes expire the pairing"
 for i in 1 2 3 4 5; do
   curl -s -o /dev/null -X POST "$BASE/pair/$TOKEN" --data "code=WRONGWRONGWR&org=$ORG&name=attacker&approve=1"
 done
 # 6th attempt with the CORRECT code must fail (any non-200/anything-but-approved).
-CODE=$(grep -oE '[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}' "$WORKDIR/qr.log" | head -1)
 RESP=$(curl -s -X POST "$BASE/pair/$TOKEN" --data "code=$CODE&org=$ORG&name=attacker&approve=1")
 echo "$RESP" | grep -q "approved"; [[ $? -ne 0 ]]; check "lockout: correct code refused after 5 strikes" $?
-
-step "pair page shows org list, not the code"
-PAGE=$(curl -s "$BASE/pair/$TOKEN")
-echo "$PAGE" | grep -q "$ORG"; check "org list on page" $?
-echo "$PAGE" | grep -qF "$CODE"; [[ $? -ne 0 ]]; check "challenge code NOT on page" $?
 
 step "revocation: agent self-retires"
 # Keep the policy agent running and revoke it; it should retire (not reconnect-loop).
@@ -151,14 +222,39 @@ MACH_STATE_DIR="$WORKDIR/agent4" "$WORKDIR/mach" register \
   --server "$BASE" --api-key "$ENROLL_KEY" --name "$ORG-test-02" >/dev/null 2>&1
 [[ $? -ne 0 ]]; check "revoked key refused" $?
 
-step "update push: signed manifest delivered and applied"
+step "release attestation (in-toto) and attested update push"
+# Built with -buildvcs=false so the artifact carries no VCS state: the e2e
+# runs against a working tree that may well be dirty, and a dirty-tree build is
+# deliberately refused by the push gate below. Determinism matters more here
+# than exercising the revision path (covered by internal/release's tests).
+go build -buildvcs=false -o "$WORKDIR/mach-release" ./cmd/mach || fail "release build failed"
+ATT="$WORKDIR/mach-release.intoto.jsonl"
+MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" attest "$WORKDIR/mach-release" 0.2.1 --out "$ATT" >/dev/null
+check "attestation written" $?
+MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" verify-attestation "$ATT" "$WORKDIR/mach-release" >/dev/null
+check "attestation verifies against the binary" $?
+# Bytes that do not match the subject: the signature is genuine, the file is
+# not the one that was attested.
+cp "$WORKDIR/mach-release" "$WORKDIR/mach-tampered"
+printf '\0' >>"$WORKDIR/mach-tampered"
+MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" verify-attestation "$ATT" "$WORKDIR/mach-tampered" >/dev/null 2>&1
+[[ $? -ne 0 ]]; check "tampered binary rejected" $?
+
 MACH_STATE_DIR="$WORKDIR/agent5" "$WORKDIR/mach" register \
   --server "$BASE" --api-key "$ENROLL_KEY" --name "$ORG-test-03" >/dev/null 2>&1
 MACHINE3="$ORG-test-03"
 MACH_STATE_DIR="$WORKDIR/agent5" "$WORKDIR/mach" run >>"$WORKDIR/agent5.log" 2>&1 &
 AGENT_PID=$!
 sleep 2
-MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" push-update "$MACHINE3" "$WORKDIR/mach" 0.2.1 >/dev/null
+# An attestation that does not describe the binary being pushed must stop the
+# push outright — nothing queued, nothing delivered.
+MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" push-update "$MACHINE3" "$WORKDIR/mach" 0.2.1 \
+  --attestation "$ATT" >/dev/null 2>&1
+[[ $? -ne 0 ]]; check "push refused a binary its attestation does not describe" $?
+# With the attested binary, the update is queued, delivered and applied.
+MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" push-update "$MACHINE3" "$WORKDIR/mach-release" 0.2.1 \
+  --attestation "$ATT" >/dev/null
+check "attested update queued" $?
 sleep 5
 # Behavioral assertion: the agent survives the swap and keeps serving.
 machc exec "$MACHINE3" "echo updated-ok" >/dev/null; check "post-update exec works" $?
