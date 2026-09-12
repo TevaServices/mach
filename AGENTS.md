@@ -267,3 +267,66 @@ only covered at the SQL-translation level.
   Never make a client silently downgrade from sealed to plaintext — an operator
   who believes a command was encrypted when it was not is the failure mode this
   exists to prevent.
+
+## Working notes (traps that cost time here)
+
+Not opinions — each of these is something that went wrong in this repo, with the
+rule that would have prevented it.
+
+- **A scripted edit can silently not apply.** Agents edit by string substitution
+  across many files, and a replacement that does not match the file's actual text
+  fails without saying so. One did, in this repo: the policy-file
+  reload updated the control plane and pushed nothing to the agents, which is a
+  hole in a security control, and it looked like success. So: after a scripted
+  edit, `grep` for the call or marker you inserted in that file, and for anything
+  behavioural, write the test, then **revert the change and watch the test fail**
+  before trusting it. (`TestPolicyFileReloadReachesConnectedAgents` is the
+  example: with `broadcastFleetPolicy()` removed it fails, which is the only
+  reason to believe it is testing anything.)
+- **`cmd | grep -q pat` can fail spuriously in `scripts/e2e.sh`.** The script sets
+  `set -o pipefail`, so when grep exits at its first match the writer takes
+  SIGPIPE and the pipeline status is non-zero — a check reports FAIL while the
+  output was correct. Capture and compare instead, the way the rest of the script
+  does: `OUT=$(cmd 2>&1); [[ "$OUT" == *pat* ]]; check "..." $?`. Remember `check`
+  asserts the status you hand it, so whatever produces that status is the test.
+- **Update "Green = N checks" in the Testing section** when you add or remove a
+  check. The number is the only thing telling the next agent whether the suite
+  they ran is the suite this file describes.
+- **`internal/console` tests touch the state dir.** Anything that execs resolves
+  `MACH_STATE_DIR`, else `$HOME/.mach`. A client test that seals without
+  `t.Setenv("MACH_STATE_DIR", t.TempDir())` writes real pin files into the
+  developer's home directory — which is how that was noticed. Use `pinState(t)`
+  or an equivalent temp state dir.
+- **Server goroutines outlive tests.** `server.New` starts a cleanup ticker, and
+  nothing ever closes `cleanupStop` (there is no `Close()`), so it keeps running
+  for the life of the process — including in every test that builds a server. It
+  will therefore read anything you make mutable. A
+  package-level `var` for the policy poll interval was a data race between one
+  test's cleanup and another test's running server. Hence: keep such knobs
+  `const` and expose the tick's body as a function (`pollPolicyOnce`) that a test
+  can call directly. That is also faster and less flaky than shrinking a timer.
+- **What the server writes into an agent's log becomes greppable test data.** The
+  fleet rules are mirrored onto agents and logged there, so the e2e check "the
+  blocked marker never appears in the agent's log" started matching the *rule*
+  text rather than a dispatched command. Assert on the dispatch path, not on a
+  string appearing anywhere in a file.
+- **`json.Unmarshal` into a reused struct keeps fields the new JSON omits.** With
+  `omitempty` fields (most protocol structs), decoding a second frame into the
+  same variable can leave the previous frame's `error` in place. Decode into a
+  fresh value.
+- **The e2e flips the E2E setting per org mid-run**, so a new step has to know
+  which mode is in force — and only a *sealed* command proves anything about what
+  reached the machine, because a plaintext one is judged by the control plane.
+  That distinction is the whole reason the mirroring tests look the way they do.
+- **`gofmt -l .` should be empty before you commit** (there is no mise task for
+  it). Files merged in from another branch arrived without trailing newlines, and
+  the diff noise from fixing that later is avoidable.
+- **Read the merge commit's message before "fixing" something that looks
+  redundant.** Two independent implementations of the same four limitations were
+  reconciled in `c620a16`; the decisions that look odd in isolation (one-shot exec
+  buffered while the console streams, E2E per org and refusable, the block list
+  running on the machine) are recorded there with their reasoning.
+- **The Postgres path is not exercised by default.** There is neither a Postgres
+  server nor a Docker daemon in this environment, so `TestPostgresStoreEndToEnd`
+  skips unless you set `MACH_TEST_POSTGRES`. Do not describe that path as verified
+  end to end when it has only been checked at the SQL-translation level.
