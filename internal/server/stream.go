@@ -157,6 +157,18 @@ func unregisterStream(sessionID, machine string) {
 // away, and synthesising a stream_kill here would be a new remote-kill
 // capability rather than a freeze on terminal communication. The audit row
 // records the session as ending without an exit status, which is what happened.
+// streamCountForMachine reports how many console sessions are live for a
+// machine.
+//
+// It exists so a test can assert the index without reaching into the map, which
+// would be a read outside streamMu — a race the detector catches, and one that
+// would be invisible in production because every real caller holds the lock.
+func streamCountForMachine(machine string) int {
+	streamMu.Lock()
+	defer streamMu.Unlock()
+	return len(streamsByMachine[machine])
+}
+
 func (s *Server) killStreamsForMachine(machine, reason string) int {
 	streamMu.Lock()
 	relays := make([]*streamRelay, 0, len(streamsByMachine[machine]))

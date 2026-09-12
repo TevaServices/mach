@@ -17,7 +17,9 @@
 # `push-update --attestation` refuses to ship such a build.
 FROM golang:1.26-alpine AS build
 WORKDIR /src
-COPY go.mod ./
+# go.sum too, so the layer is verified against the committed hashes rather than
+# letting `go mod download` write a fresh go.sum for whatever the proxy served.
+COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN <<EOF

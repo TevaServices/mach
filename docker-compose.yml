@@ -14,3 +14,13 @@ services:
     environment:
       MACH_PUBLIC_URL: ${MACH_PUBLIC_URL}
       MACH_LISTEN: ":8080"
+      # Web UI (optional). All three of the OIDC variables or none: with none the
+      # /ui routes are not registered, and a partial set is a startup error naming
+      # what is missing rather than a silently absent admin surface.
+      MACH_OIDC_ISSUER: ${MACH_OIDC_ISSUER:-}
+      MACH_OIDC_CLIENT_ID: ${MACH_OIDC_CLIENT_ID:-}
+      MACH_OIDC_CLIENT_SECRET: ${MACH_OIDC_CLIENT_SECRET:-}
+      MACH_OIDC_REDIRECT_URL: ${MACH_OIDC_REDIRECT_URL:-}
+      # Empty means ANY identity the issuer verifies may manage the fleet. Set it
+      # unless that is what you mean.
+      MACH_OIDC_ALLOWED_DOMAINS: ${MACH_OIDC_ALLOWED_DOMAINS:-}

@@ -15,8 +15,9 @@ This is `mach`: remote CLI access to registered machines, outbound-only
 ## Ground rules
 
 - **Do not modify** `internal/server/*`, `internal/agent/run.go`,
-  `internal/store/*`, `internal/console/*`, `internal/policy/*`, or
-  `internal/release/*` without running `go test ./...` AND `scripts/e2e.sh`.
+  `internal/store/*`, `internal/console/*`, `internal/policy/*`,
+  `internal/oidcauth/*`, or `internal/release/*` without running
+  `go test ./...` AND `scripts/e2e.sh`.
   These files implement the security properties listed below; a change that
   breaks a test is a regression.
 - **Never weaken a security control to make a test pass.** If a test fails
@@ -117,6 +118,41 @@ This is `mach`: remote CLI access to registered machines, outbound-only
     refusal is audited as `126` with the rule that refused it, on both paths.
 17. **`readonly` cannot stream.** `/v1/console/stream` is command execution; a
     key that can only watch must not reach it, or the scope is decorative.
+18. **The web UI is off unless it is fully configured, and never served without
+    OIDC.** With no `MACH_OIDC_*` the `/ui` routes are not registered at all —
+    not a UI that refuses, no surface to probe. A *partial* configuration is a
+    startup failure naming the missing variable. The UI is not a second
+    authorization system: any identity the issuer verifies may act, so **that
+    issuer's own registration policy is the entire authorization model** unless
+    `MACH_OIDC_ALLOWED_DOMAINS` is set. Do not add a UI route outside that gate.
+19. **Block is soft, and it is not containment.** A blocked machine stays
+    connected and keeps answering keepalives; the control plane sends it no
+    commands. Every server→agent *command* path must go through
+    `dispatchRefusal` — exec, and the streaming relay's `exec_stream` **and**
+    `stream_stdin`/`stream_kill`, since refusing only the first leaves a session
+    that can still feed or kill a running command. The policy mirror is
+    deliberately **not** gated: it is configuration, and a blocked machine that
+    missed a rule change would enforce stale rules against sealed commands the
+    moment it was unblocked. Blocking ends live console sessions; it does not
+    cancel the command already running on the machine.
+20. **Revoke and delete are different, and delete does not reserve the name.**
+    Revoke is the sticky tombstone (#10): the row stays, so the name and key stay
+    reserved. Delete removes the row and the key, frees the name, and tells a
+    connected agent to retire. Delete is the recovery path for a re-imaged box —
+    exactly what revocation cannot express — so it is the sharper tool and needs
+    the stronger confirmation. Neither writes the other's field.
+21. **Enrollment resolves any configured org, not just the primary one.** Orgs
+    live in the database (`orgs` table) as well as the environment; `MACH_ORG`
+    and `MACH_ORGS` are a pin the UI cannot remove, and an org with machines
+    cannot be removed at all. The naming invariant is unchanged
+    (`<org>-<machine>` for a *configured* org), but an `enroll`-scoped key can
+    now register under any of them.
+22. **The agent exits 0 to mean stop.** The installed service restarts on
+    failure (`Restart=on-failure`, launchd `SuccessfulExit=false`), so a clean
+    exit is how a retirement — revoked or deleted — actually takes effect. Never
+    change those to restart unconditionally: it turns a deliberate retirement into
+    a restart loop, and it races the update path, which starts its own detached
+    replacement and then exits 0.
 
 ## Environment variables (control plane)
 
@@ -130,6 +166,10 @@ This is `mach`: remote CLI access to registered machines, outbound-only
 | `MACH_TRUST_PROXY` | `1` = honor X-Forwarded-For (only behind your TLS proxy) |
 | `MACH_SERVER_KEY` | control-plane identity key path (default `<MACH_DB>.key`) |
 | `MACH_E2E` | `on`/`off`: overrides the stored E2E setting for **every** org (validated at startup; an unusable value is fatal) |
+| `MACH_OIDC_ISSUER`, `MACH_OIDC_CLIENT_ID`, `MACH_OIDC_CLIENT_SECRET` | enable the browser UI; **all three or none** (a partial set is fatal). Issuer must be https unless `MACH_PUBLIC_URL` is http |
+| `MACH_OIDC_REDIRECT_URL` | default `MACH_PUBLIC_URL + /ui/callback`; required if the public URL has a path prefix |
+| `MACH_OIDC_SCOPES` | default `openid,email,profile` |
+| `MACH_OIDC_ALLOWED_DOMAINS` | comma-separated email domains; **empty means any identity the issuer verifies may act**. The UI logs this at startup when it is unset |
 
 | `MACH_EXEC_POLICY` | fleet-wide block list, inline (`deny:`/`allowonly`/`allow:`) |
 | `MACH_EXEC_POLICY_FILE` | fleet-wide block list from a file, re-read on mtime change every 15s; unreadable at startup is fatal |
@@ -144,14 +184,17 @@ only covered at the SQL-translation level.
 ## Testing
 
 - `mise run test` — unit tests (`-race -cover`). Store (both drivers, SQL
-  translation), server (scopes, orgs, normalizeCode, pair page, fleet-wide
-  policy, the streaming relay, the per-org E2E flag and its control signal, the
-  fleet-rules mirror and its propagation), agent (policy — including fleet rules
-  binding a sealed command — shells, streaming writers, confinement), console
+  translation, the soft block, org CRUD, single-delivery update pop), server
+  (scopes, orgs, normalizeCode, pair page, fleet-wide policy, the streaming
+  relay, the per-org E2E flag and its control signal, the fleet-rules mirror and
+  its propagation, the block gates on both dispatch paths, the web UI's
+  fail-closed routing and CSRF layers), agent (policy — including fleet rules
+  binding a sealed command — shells, streaming writers, confinement, the
+  supervisor directives), console
   (the E2E signal, key pinning, trust)
   (output-is-data, lost-stream, obeying/refusing the E2E signal), policy,
-  protocol, release and in-toto all have coverage; keep it that way for touched
-  code.
+  protocol, oidcauth (a fake issuer, one broken check per test), release and
+  in-toto all have coverage; keep it that way for touched code.
 - `mise run e2e` — full end-to-end (builds binaries, spins up the control
   plane on 127.0.0.1:8099 with a fleet-wide policy installed, enrolls via API
   key + QR, exercises exec in both modes, the console relay, output-is-data,
@@ -164,7 +207,11 @@ only covered at the SQL-translation level.
   refuse them there) and that a rule added to the policy file on disk reaches a
   machine that is already connected. Pinning is covered too: the first sealed
   command reports the pin, a pin that no longer matches what the control plane
-  advertises refuses to seal, and `mach trust` is the only thing that accepts it. Green = 78 checks.
+  advertises refuses to seal, and `mach trust` is the only thing that accepts it.
+  It also stands up a **second** control plane with OIDC enabled plus
+  `scripts/fakeidp` (a stdlib-only loopback identity provider), signs in through
+  the real browser flow with a cookie jar, and drives block / unblock / the
+  orgs / the typed-name delete / sign-out from the UI. Green = 116 checks.
 - Timing-sensitive e2e checks (streaming) use a real sleep and a real
   background process; if one flakes, make the sleep longer rather than
   weakening the assertion.
@@ -273,6 +320,14 @@ only covered at the SQL-translation level.
 Not opinions — each of these is something that went wrong in this repo, with the
 rule that would have prevented it.
 
+- **A stale control plane holding a port makes the whole e2e UI section lie.**
+  The web-UI checks run a second control plane on `MACH_TEST_UI_PORT` (8098) and
+  a fake IdP on `MACH_TEST_IDP_PORT` (8097). A `mach-server` left over from
+  manual testing keeps the port, the second one fails to bind with only
+  `listen tcp ...: address already in use` in its log, and the *stale* server
+  answers every request — with a different database. Sign-in still works, so the
+  failures look like 21 unrelated broken assertions rather than one occupied
+  port. Check the ports before believing a wholesale UI failure.
 - **A scripted edit can silently not apply.** Agents edit by string substitution
   across many files, and a replacement that does not match the file's actual text
   fails without saying so. One did, in this repo: the policy-file

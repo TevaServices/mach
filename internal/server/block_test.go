@@ -376,9 +376,10 @@ func TestBlockEndsLiveStreamSession(t *testing.T) {
 	}
 
 	// The session is unregistered, so it is not still sitting in the index.
-	if n := len(streamsByMachine[h.mach]); n != 0 {
-		t.Fatalf("%d stream sessions still registered for a blocked machine", n)
-	}
+	// Polled through the accessor (not the map) because the teardown that
+	// unregisters it runs in the handler's own goroutine.
+	waitFor(t, 3*time.Second, func() bool { return streamCountForMachine(h.mach) == 0 },
+		"a stream session is still registered for a blocked machine")
 
 	// And the teardown recorded the command as ending without an exit status —
 	// the command is not cancelled by the console going away, so the row says
