@@ -4,6 +4,7 @@
 package controlplane
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/bcross/mach/internal/broker"
+	"github.com/bcross/mach/internal/release"
 	"github.com/bcross/mach/internal/server"
 	"github.com/bcross/mach/internal/store"
 )
@@ -150,6 +152,37 @@ func RevokeMachine(name string, purgeAudit bool) error {
 	return nil
 }
 
+// DeleteMachine removes a machine row so its name and agent key can be used
+// again. This is the recovery path for a revoked machine that has to
+// re-enroll — the agent on that host must be stopped first, or it will keep
+// retrying with a key the control plane no longer knows.
+//
+// The audit trail is kept unless purgeAudit is set: erasing a machine's
+// command history is a separate decision from retiring the machine.
+func DeleteMachine(name string, purgeAudit bool) error {
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	if m, err := st.MachineByName(name); err != nil {
+		return err
+	} else if m == nil {
+		return fmt.Errorf("unknown machine %q", name)
+	}
+	if err := st.DeleteMachine(name); err != nil {
+		return err
+	}
+	if purgeAudit {
+		_ = st.RemoveMachineAudit(name)
+		fmt.Printf("machine %q deleted, and its audit history purged\n", name)
+	} else {
+		fmt.Printf("machine %q deleted (audit history kept — use --purge-audit to erase it)\n", name)
+	}
+	fmt.Printf("its agent key is no longer known here; stop the agent on that host before re-enrolling\n")
+	return nil
+}
+
 // updateManifest mirrors the wire struct without importing protocol here.
 type updateManifest struct {
 	Version string
@@ -175,20 +208,55 @@ func loadServerPriv() (ed25519.PrivateKey, error) {
 
 // PushUpdate signs the manifest for a local agent binary and queues it for
 // delivery on the machine's next live connection.
-func PushUpdate(machine, binPath, version string) error {
+//
+// When attestation is non-empty, the binary must be proved to be the one that
+// attestation describes — same signature key, same sha256 — before it is
+// queued. This is a release-pipeline gate rather than an agent-side control:
+// the agent cannot check an attestation, because it does not receive one. What
+// the agent already enforces (the pinned-key manifest signature over the
+// sha256) is what protects the wire; the attestation is what makes the
+// pipeline refuse to ship bytes no build recorded.
+func PushUpdate(machine, binPath, version, attestation string) error {
+	priv, err := loadServerPriv()
+	if err != nil {
+		return err
+	}
 	bin, err := os.ReadFile(binPath)
 	if err != nil {
 		return fmt.Errorf("reading agent binary: %w", err)
 	}
+	if len(bin) == 0 {
+		return fmt.Errorf("agent binary %s is empty", binPath)
+	}
 	sum := sha256.Sum256(bin)
+	sha := hex.EncodeToString(sum[:])
+
+	if attestation != "" {
+		env, err := release.LoadAttestation(attestation)
+		if err != nil {
+			return err
+		}
+		st, err := release.Open(context.Background(), env, priv.Public().(ed25519.PublicKey))
+		if err != nil {
+			return fmt.Errorf("attestation rejected: %w", err)
+		}
+		if err := st.VerifyArtifact("", binPath); err != nil {
+			return fmt.Errorf("attestation does not describe this binary: %w", err)
+		}
+		pred, err := st.PredicateOf()
+		if err == nil && pred.Version != version {
+			return fmt.Errorf("attestation is for version %q but this push declares %q", pred.Version, version)
+		}
+		if err == nil && pred.Byproducts.VCSModified {
+			return fmt.Errorf("attestation records a build from a modified tree — refusing to ship it; rebuild from a clean tree and re-attest")
+		}
+		fmt.Printf("attestation verified: %s describes %s (version %s)\n", attestation, binPath, version)
+	}
+
 	manifest := updateManifest{
 		Version: version,
-		Sha256:  hex.EncodeToString(sum[:]),
+		Sha256:  sha,
 		DataB64: base64.StdEncoding.EncodeToString(bin),
-	}
-	priv, err := loadServerPriv()
-	if err != nil {
-		return err
 	}
 	sig := ed25519.Sign(priv, []byte(manifest.Version+"|"+manifest.Sha256))
 	st, err := openStore()
