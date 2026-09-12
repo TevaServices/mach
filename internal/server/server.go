@@ -86,10 +86,13 @@ func (s *Server) initUI() error {
 	return nil
 }
 
-// EnableUI turns on the browser UI with an explicit provider, for tests. It is
-// the seam that keeps the handler tests off the network: they install a fake
-// provider here rather than standing up an identity provider.
-func (s *Server) EnableUI(p oidcauth.Provider, redirectURL string, cookieSecure bool) {
+// enableUI turns on the browser UI with an explicit provider.
+//
+// Unexported, and only reachable from this package's tests: it is the seam that
+// keeps the handler tests off the network (they install a fake provider instead
+// of standing up an identity provider), and nothing in production should be able
+// to bypass loadUIConfig's fail-closed checks to switch the UI on.
+func (s *Server) enableUI(p oidcauth.Provider, redirectURL string, cookieSecure bool) {
 	s.ui = &uiConfig{
 		issuer: "test", clientID: "test", redirectURL: redirectURL, cookieSecure: cookieSecure,
 		provider:     p,

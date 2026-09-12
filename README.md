@@ -185,6 +185,10 @@ Put Caddy/nginx in front for TLS (agents speak wss://).
   key, freeing the name so a re-imaged box can enroll again), plus org
   management: add or remove org prefixes, set sealed-exec per org, and see which
   machines and keys belong to each. Deleting needs the machine name typed.
+  The same three actions are on the console API for scripts, gated on an
+  `exec:*` key exactly like `revoke` — `POST /v1/admin/block`
+  (`{"machine":"…","blocked":true|false}`) and `POST /v1/admin/delete`
+  (`{"machine":"…"}`) — so a fleet is operable without a browser.
   Set `MACH_OIDC_ISSUER`, `MACH_OIDC_CLIENT_ID` and `MACH_OIDC_CLIENT_SECRET` to
   turn it on — all three or none; with none, `/ui` does not exist. The pages are
   server-rendered with a vendored htmx (no CDN, no build step), so state stays
