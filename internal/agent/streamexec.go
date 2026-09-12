@@ -19,7 +19,7 @@ import (
 // handleStream runs a streaming exec session (server already verified auth
 // and routed the frame by session ID). Streaming is plaintext by design:
 // it serves the interactive console; one-shot exec is the E2E-able path.
-func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{}, stateDir string) {
+func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{}) {
 	var start protocol.StreamStart
 	if err := json.Unmarshal(env.Payload, &start); err != nil {
 		_ = conn.WriteEnvelope(protocol.Envelope{

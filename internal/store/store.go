@@ -487,9 +487,58 @@ func (s *Store) RemoveMachine(name string) error {
 }
 
 // RevokeMachine marks a machine revoked; agents self-retire on seeing it.
+//
+// Revocation is a forced re-enrollment, not a permanent ban: the row stays as the
+// record (and so keeps the name and key reserved), the live agent is refused on
+// reconnect, and enrolling again revives it — see ReactivateMachine. Deleting is
+// the other path, and frees the name instead.
 func (s *Store) RevokeMachine(name string) error {
 	_, err := s.exec(`UPDATE machines SET revoked=1 WHERE name=?`, name)
 	return err
+}
+
+// execer is the SQL surface the enrollment write needs, so the create-or-revive
+// decision can run both inside ConsumePairing's transaction and outside one from
+// the API-key path without duplicating its statement.
+type execer interface {
+	exec(q string, args ...any) (sql.Result, error)
+}
+
+// reactivateRevoked re-keys a revoked machine in place and clears the
+// revocation, reporting whether a row was actually revived.
+//
+// Enrollment may revive a REVOKED machine and nothing else. That guard is the
+// WHERE clause rather than a check-then-write in Go on purpose: "do not displace
+// an active agent" has to hold against a race between a caller's existence check
+// and this write, and only the SQL can promise it.
+//
+// blocked is deliberately left alone. It is an independent axis — neither block
+// nor revoke writes the other's field — and a block left in place announces
+// itself as a refusal that names the block, which is discoverable, where
+// silently clearing an operator's block would not be.
+func reactivateRevoked(ex execer, name, pubkey, hostname, os, arch, agentVer, pubE2E string) (bool, error) {
+	res, err := ex.exec(`UPDATE machines
+		SET pubkey=?, hostname=?, os=?, arch=?, agent_version=?, pub_e2e=?, revoked=0
+		WHERE name=? AND revoked=1`,
+		pubkey, hostname, os, arch, agentVer, pubE2E, name)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		// Both drivers report this, but a driver that could not means the caller
+		// cannot tell "revived" from "no such revoked machine" — and guessing
+		// wrong either skips the insert or duplicates the row.
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// ReactivateMachine revives a revoked machine for a new enrollment, re-keying it
+// if the agent presents a different key (which a temporary session always does).
+// ok is false when there is no revoked machine by that name.
+func (s *Store) ReactivateMachine(name, pubkey, hostname, os, arch, agentVer, pubE2E string) (bool, error) {
+	return reactivateRevoked(s, name, pubkey, hostname, os, arch, agentVer, pubE2E)
 }
 
 // SetMachineBlocked sets or clears the operator's soft block on a machine.
@@ -874,11 +923,20 @@ func (s *Store) ConsumePairing(p *Pairing, pubE2E string) (bool, error) {
 	if n == 0 {
 		return false, nil
 	}
-	if _, err := tx.exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at, pub_e2e)
-		VALUES (?,?,?,?,?,?,?,?)`, p.Name, p.PubKey, p.Hostname, p.OS, p.Arch, p.AgentVer, now(), pubE2E); err != nil {
-		// consumed=1 rolls back with the transaction: the pairing survives
-		// and the agent surfaces the error (usually a name conflict).
+	// Revive a revoked machine in place, or create a new one. A revoked row is
+	// the only case enrollment may take over, and reactivateRevoked's WHERE
+	// clause is what enforces that — not a check in the caller.
+	revived, err := reactivateRevoked(tx, p.Name, p.PubKey, p.Hostname, p.OS, p.Arch, p.AgentVer, pubE2E)
+	if err != nil {
 		return false, err
+	}
+	if !revived {
+		if _, err := tx.exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at, pub_e2e)
+			VALUES (?,?,?,?,?,?,?,?)`, p.Name, p.PubKey, p.Hostname, p.OS, p.Arch, p.AgentVer, now(), pubE2E); err != nil {
+			// consumed=1 rolls back with the transaction: the pairing survives
+			// and the agent surfaces the error (usually a name conflict).
+			return false, err
+		}
 	}
 	return true, sqltx.Commit()
 }

@@ -372,10 +372,61 @@ grep -qE "revoked by the operator|retiring" "$WORKDIR/agent2.log"; check "agent 
 machc exec "$ORG-test-02" "echo hi" >/dev/null 2>&1
 [[ $? -ne 0 ]]; check "revoked machine offline" $?
 
-step "re-enrollment with revoked key refused"
+step "re-enrollment after revocation: a revoked machine returns, an active one is safe"
+# Revocation is a FORCED RE-ENROLLMENT, not a one-way door: the agent self-retires
+# and the name and key stay reserved, but enrolling again revives the machine.
+# (This check used to assert the opposite. The change is deliberate — it is what
+# makes "revoke" recoverable without handing out the delete power.)
 MACH_STATE_DIR="$WORKDIR/agent4" "$WORKDIR/mach" register \
   --server "$BASE" --api-key "$ENROLL_KEY" --name "$ORG-test-02" >/dev/null 2>&1
-[[ $? -ne 0 ]]; check "revoked key refused" $?
+check "a revoked machine re-enrolls with a fresh key" $?
+OUT=$(curl -sS "$BASE/v1/machines" -H "Authorization: Bearer $ADMIN_KEY" 2>&1)
+[[ "$OUT" == *"$ORG-test-02"* ]]; check "the revived machine is back in the fleet" $?
+# And it works: the revived agent connects and runs a command.
+MACH_STATE_DIR="$WORKDIR/agent4" "$WORKDIR/mach" run >"$WORKDIR/agent4.log" 2>&1 &
+sleep 2
+machc exec "$ORG-test-02" "echo revived-ok" >/dev/null 2>&1
+check "the revived machine runs commands again" $?
+
+# The counterweight, and the reason the revive is guarded in SQL: an ACTIVELY
+# enrolled machine's name must not be takeable by an enrollment. Without this,
+# a typo would displace a working agent.
+MACH_STATE_DIR="$WORKDIR/agent-displace" "$WORKDIR/mach" register \
+  --server "$BASE" --api-key "$ENROLL_KEY" --name "$MACHINE" >/dev/null 2>&1
+[[ $? -ne 0 ]]; check "an active machine's name cannot be taken over" $?
+OUT=$(curl -sS "$BASE/v1/machines" -H "Authorization: Bearer $ADMIN_KEY" 2>&1)
+[[ "$OUT" == *"$MACHINE"* ]]; check "the active machine is still enrolled" $?
+
+step "plain mach on a target is the temporary session"
+# Bare `mach` is now a TEMPORARY session: it enrolls in memory and holds the
+# connection, writing nothing. Ctrl-C ends it and running it again re-enrolls.
+# It is launched here only far enough to observe the first two properties: the
+# pairing flow then waits for a phone that this script does not have.
+TMP_STATE="$WORKDIR/agent-tmp"
+MACH_SERVER="$BASE" MACH_ORG="$ORG" MACH_STATE_DIR="$TMP_STATE" \
+  "$WORKDIR/mach" >"$WORKDIR/agent-tmp.log" 2>&1 &
+TMP_PID=$!
+sleep 3
+OUT=$(cat "$WORKDIR/agent-tmp.log" 2>&1)
+[[ "$OUT" == *"TEMPORARY session"* ]]; check "plain mach announces that it is temporary" $?
+# The property that makes it temporary: nothing on disk, so the next run cannot
+# silently reuse an identity.
+ENTRIES=$(ls -A "$TMP_STATE" 2>/dev/null | wc -l | tr -d ' ')
+[[ "$ENTRIES" == "0" ]]; check "the temporary session wrote nothing to the state dir" $?
+# It did reach the control plane: a pairing exists and is waiting for approval.
+OUT=$(curl -sS "$BASE/v1/machines" -H "Authorization: Bearer $ADMIN_KEY" 2>&1)
+[[ "$OUT" != *"$MACHINE-tmp"* ]]; check "the temporary session is not enrolled before approval" $?
+kill "$TMP_PID" 2>/dev/null
+wait "$TMP_PID" 2>/dev/null
+ENTRIES=$(ls -A "$TMP_STATE" 2>/dev/null | wc -l | tr -d ' ')
+[[ "$ENTRIES" == "0" ]]; check "still nothing on disk after the session ends" $?
+
+# And on a host that is already installed, plain `mach` must NOT start a second
+# identity competing with the service — it says so and exits. (agent1 is the
+# state dir of the installed agent from the enrollment steps above.)
+OUT=$(MACH_STATE_DIR="$WORKDIR/agent1" "$WORKDIR/mach" 2>&1)
+[[ $? -ne 0 ]]; check "plain mach on an installed host refuses" $?
+[[ "$OUT" == *"already enrolled"* ]]; check "and explains why, pointing at mach run/install" $?
 
 step "release attestation (in-toto) and attested update push"
 # Built with -buildvcs=false so the artifact carries no VCS state: the e2e

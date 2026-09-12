@@ -78,12 +78,23 @@ func Run(stateDir string) error {
 	if err != nil {
 		return err
 	}
+	e2eKey, err := LoadOrCreateE2EKey(stateDir)
+	if err != nil {
+		return err
+	}
 	DropPrivileges()
+	return serveLoop(cfg, id, e2eKey)
+}
 
+// serveLoop is the reconnect loop, shared by the installed agent and the
+// temporary session. The two differ only in where their secrets come from —
+// files under the state directory, or nothing but this process's memory — so
+// everything below is common, including what a terminal frame means.
+func serveLoop(cfg *Config, id *Identity, e2eKey *E2EKeyPair) error {
 	backoff := 2 * time.Second
 	for {
 		iterStart := time.Now()
-		err := dialAndServe(cfg, id, stateDir)
+		err := dialAndServe(cfg, id, e2eKey)
 		if errors.Is(err, errShutdown) {
 			return nil
 		}
@@ -145,7 +156,7 @@ func terminalFrame(frameType string) error {
 	return nil
 }
 
-func dialAndServe(cfg *Config, id *Identity, stateDir string) error {
+func dialAndServe(cfg *Config, id *Identity, e2eKey *E2EKeyPair) error {
 	url := wsURL(cfg.Server) + "/v1/agent/ws?name=" + urlQueryEscape(cfg.Name)
 	ws, resp, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
@@ -263,9 +274,9 @@ func dialAndServe(cfg *Config, id *Identity, stateDir string) error {
 		}
 		switch env.Type {
 		case "exec":
-			go handleExecFrame(conn, env, execSem, stateDir)
+			go handleExecFrame(conn, env, execSem, e2eKey)
 		case "exec_stream":
-			go handleStream(conn, env, execSem, stateDir)
+			go handleStream(conn, env, execSem)
 		case "stream_stdin", "stream_kill":
 			// Routed to a live session via the stream registry (server
 			// relays by session ID). Sessions not found are ignored —

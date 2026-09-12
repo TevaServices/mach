@@ -40,8 +40,12 @@ func sealedExecForTest(t *testing.T, command string) protocol.ExecResult {
 		Timeout:   5,
 	}
 	payload, _ := json.Marshal(req)
+	// The handler takes the keypair, not a directory: that is what lets a
+	// temporary session, whose key exists only in memory, run a sealed command
+	// without writing one. This test still loads it from a state dir, so the
+	// file-backed path stays exercised.
 	handleSealedExec(conn, protocol.Envelope{Type: "exec", ReqID: "sealed-1", Payload: payload},
-		req, stateDir, make(chan struct{}, 1))
+		req, machine, make(chan struct{}, 1))
 
 	env := readEnvelope(t, peer)
 	if env.Type != "exec_result" {
