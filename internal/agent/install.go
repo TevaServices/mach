@@ -15,6 +15,13 @@ import (
 //   - darwin: launchd plist ~/Library/LaunchAgents/com.bcross.mach.plist
 //   - windows: Task Scheduler job "machd", runs at logon, restarts daily
 //
+// The supervisor restarts the agent on FAILURE, not on any exit: exit 0 means
+// stop. A clean exit is how the agent reports that the control plane retired it
+// — revoked, or deleted — and a supervisor that restarts it anyway turns a
+// deliberate retirement into a restart loop. It also races the update path,
+// which starts its own detached replacement and then exits 0; under
+// Restart=always the supervisor would resurrect the old image alongside it.
+//
 // Best-effort on unsupported setups: returns guidance instead of failing hard.
 func Install(stateDir string) error {
 	cfg, err := LoadConfig(stateDir)
@@ -94,20 +101,7 @@ func installSystemd(name, exe, stateDir string) error {
 			runAs = "root"
 		}
 	}
-	unit := fmt.Sprintf(`[Unit]
-Description=mach agent (%s)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-%s%sExecStart="%s" run
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-`, name, userLine, envLine, exe)
+	unit := systemdUnit(name, userLine, envLine, exe)
 
 	unitPath := "/etc/systemd/system/machd.service"
 	if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
@@ -137,23 +131,7 @@ func installLaunchd(name, exe, stateDir string) error {
 	plistPath := filepath.Join(plistDir, "com.bcross.mach.plist")
 	logPath := filepath.Join(stateDir, "machd.log")
 
-	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.bcross.mach</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>%s</string>
-    <string>run</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>%s</string>
-  <key>StandardErrorPath</key><string>%s</string>
-</dict>
-</plist>
-`, xmlEscape(exe), xmlEscape(logPath), xmlEscape(logPath))
+	plist := launchdPlist(exe, logPath)
 
 	if err := os.MkdirAll(plistDir, 0o755); err != nil {
 		return err
@@ -166,7 +144,7 @@ func installLaunchd(name, exe, stateDir string) error {
 	if out, err := runCmd("launchctl", "load", plistPath); err != nil {
 		return fmt.Errorf("launchctl load: %v: %s", err, out)
 	}
-	fmt.Printf("Installed and loaded LaunchAgent %s (machine %q). It starts at login and keeps running (KeepAlive).\n", label, name)
+	fmt.Printf("Installed and loaded LaunchAgent %s (machine %q). It starts at login and is restarted if it crashes; a clean exit (the control plane retiring this machine) is left alone.\n", label, name)
 	fmt.Printf("Note: for a headless Mac that runs before login, also run: sudo launchctl bootstrap system %s\n", plistPath)
 	return nil
 }
@@ -176,6 +154,56 @@ func installLaunchd(name, exe, stateDir string) error {
 func xmlEscape(s string) string {
 	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&apos;")
 	return r.Replace(s)
+}
+
+// systemdUnit renders the Linux unit file.
+//
+// Split out of Install so the supervisor semantics are assertable without root
+// and without a systemd running: Restart=on-failure is a correctness property —
+// it is what makes a clean exit mean "stop" — and a property that only shows up
+// on a machine you are trying to retire is one worth pinning in a test.
+func systemdUnit(name, userLine, envLine, exe string) string {
+	return fmt.Sprintf(`[Unit]
+Description=mach agent (%s)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+%s%sExecStart="%s" run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+`, name, userLine, envLine, exe)
+}
+
+// launchdPlist renders the macOS LaunchAgent.
+//
+// KeepAlive is SuccessfulExit=false rather than true, for the same reason the
+// unit says on-failure: exit 0 means stop. KeepAlive <true/> restarts a retired
+// agent forever, and races the update path, which starts its own detached
+// replacement and then exits 0.
+func launchdPlist(exe, logPath string) string {
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.bcross.mach</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>%s</string>
+    <string>run</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>StandardOutPath</key><string>%s</string>
+  <key>StandardErrorPath</key><string>%s</string>
+</dict>
+</plist>
+`, xmlEscape(exe), xmlEscape(logPath), xmlEscape(logPath))
 }
 
 // ---- Windows: Task Scheduler ----
