@@ -29,7 +29,7 @@ func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{
 		return
 	}
 
-	if reason := globalPolicy.Evaluate(start.Command, start.Argv); reason != "" {
+	if reason := checkCommand(start.Command, start.Argv); reason != "" {
 		_ = conn.WriteEnvelope(protocol.Envelope{
 			Type: "stream_end", ReqID: env.ReqID,
 			Payload: mustJSONStream(protocol.StreamEnd{ExitCode: 126, Error: reason}),

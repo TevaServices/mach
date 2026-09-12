@@ -255,6 +255,13 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 
 	_ = s.st.UpdateMachineMeta(machine.ID, hr.Hostname, hr.OS, hr.Arch, hr.AgentVer)
 
+	// Mirror the fleet-wide exec rules onto the machine, unconditionally and
+	// including when there are none. A sealed command is only readable on the
+	// machine, so that is where the fleet block list has to run; and an empty
+	// ruleset is a real instruction ("stop enforcing what you were sent
+	// before"), which is why this is not skipped when the policy is empty.
+	s.pushFleetPolicy(ac)
+
 	// Deliver any queued, signed update before the command loop.
 	if version, sha256Hex, url, dataB64, sigB64, ok, err := s.st.PopPendingUpdate(machine.Name); err == nil && ok {
 		manifest, _ := json.Marshal(protocol.UpdateCommand{
@@ -278,6 +285,8 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		switch env.Type {
 		case "exec_result":
 			s.completeExec(env, machine.Name)
+		case "policy_ack":
+			s.recordPolicyAck(machine.Name, env)
 		case "stream_out", "stream_end":
 			// A streaming console session's output, tagged with the session ID
 			// the console's handler put on the frame. Routed only when the

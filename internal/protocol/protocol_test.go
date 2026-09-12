@@ -204,3 +204,52 @@ func TestSealedExecWireFormats(t *testing.T) {
 		t.Errorf("SealedExecResult JSON is missing sealed_b64: %s", raw)
 	}
 }
+
+func TestPolicyWireFormats(t *testing.T) {
+	// The mirror is the one frame whose payload decides what a machine will
+	// refuse to run, so its field names are pinned literally: an agent and a
+	// control plane updated independently must agree on them, and a typo here
+	// would show up as a machine silently enforcing nothing.
+	raw, err := json.Marshal(PolicyUpdate{Rules: "deny:rm -rf", Version: "abc123"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, k := range []string{"rules", "version"} {
+		if _, ok := fields[k]; !ok {
+			t.Errorf("PolicyUpdate JSON is missing %q: %s", k, raw)
+		}
+	}
+	if len(fields) != 2 {
+		t.Errorf("PolicyUpdate JSON has unexpected fields: %s", raw)
+	}
+	// An empty ruleset is an instruction, not an absent field: sending it must
+	// be possible, or a withdrawn policy could not reach the machines.
+	raw, err = json.Marshal(PolicyUpdate{})
+	if err != nil {
+		t.Fatalf("marshal empty: %v", err)
+	}
+	fields = nil
+	_ = json.Unmarshal(raw, &fields)
+	if _, ok := fields["rules"]; !ok {
+		t.Errorf("an empty ruleset was dropped from the JSON: %s", raw)
+	}
+	if _, ok := fields["version"]; !ok {
+		t.Errorf("an empty version was dropped from the JSON: %s", raw)
+	}
+
+	// The ack's version is a state a control plane compares, so it is never
+	// omitempty; its error is a reason, so it is.
+	raw, _ = json.Marshal(PolicyAck{Version: ""})
+	fields = nil
+	_ = json.Unmarshal(raw, &fields)
+	if v, ok := fields["version"]; !ok || string(v) != `""` {
+		t.Errorf("empty acks must still carry a version: %s", raw)
+	}
+	if _, ok := fields["error"]; ok {
+		t.Errorf("a successful ack carried an error: %s", raw)
+	}
+}

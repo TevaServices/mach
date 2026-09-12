@@ -49,6 +49,11 @@ type Server struct {
 	// to justify a tighter limit here is gone.
 	pairLookups *ipLimiter
 
+	// policyAcks records the fleet-policy version each machine last confirmed,
+	// so "which agents are enforcing the current rules" is answerable.
+	policyMu   sync.Mutex
+	policyAcks map[string]string
+
 	// global exec policy: server-side block list applied to every client
 	execPolicy execPolicy
 
@@ -108,10 +113,7 @@ func New(st *store.Store, br *broker.Broker, org, keyPath string) *Server {
 					log.Printf("server: pairing cleanup: removed %d", n)
 				}
 			case <-pt.C:
-				if s.execPolicy.reloadFile() {
-					log.Printf("server: %s changed on disk; reloaded", s.execPolicy.Source())
-					s.logExecPolicy()
-				}
+				s.pollPolicyOnce()
 			}
 		}
 	}()
@@ -155,6 +157,7 @@ func (s *Server) logE2E() {
 func (s *Server) SetExecPolicy(spec string) {
 	s.execPolicy.Replace(spec, "SetExecPolicy")
 	s.logExecPolicy()
+	s.broadcastFleetPolicy()
 }
 
 // SetTrustProxy controls whether X-Forwarded-For is honored. Only enable

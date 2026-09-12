@@ -41,12 +41,13 @@ message saying they cannot do what they were asked to.
 **What the setting means, in both directions:**
 
 - **On** (the default): the control plane relays sealed commands and hands out
-  the machine's key. The block list cannot inspect what it relays.
+  the machine's key. It cannot read them, so the fleet-wide block list is
+  enforced by the machine instead — the rules are mirrored to every agent and
+  evaluated where the command is decrypted (see "Command policy" below).
 - **Off**: sealed exec is refused before dispatch (`403`, audited, with the
   reason in the response) and no key is advertised, so an obeying console never
-  tries. Every command for that org runs in plaintext, where the block list can
-  read it. This is how an operator who needs the fleet-wide block list over the
-  one-shot path gets it.
+  tries. Every command for that org runs in plaintext, where the control plane
+  itself can read and refuse it before dispatching anything.
 
 **Nothing on any agent changes in either direction.** An agent keeps its
 `e2e.key`, keeps registering the public half at enrollment, and keeps opening
@@ -85,6 +86,7 @@ from the broker; nothing protects content from the machine's own operator.
 | Scoped API keys (enroll / readonly / exec:* / exec:m1\|m2), server-generated 192-bit secrets, stretched salted hashes | controlplane.AddAPIKey, store |
 | Read-only keys see the whole fleet and the whole audit trail, and nothing else | server/consoleapi.go canRead/readScope |
 | **Fleet-wide command block list** (`MACH_EXEC_POLICY` / `MACH_EXEC_POLICY_FILE`), enforced for every key, scope and machine before dispatch — on `mach exec` **and** on the streaming console | server/policy.go, consoleapi.go handleExec, stream.go handleConsoleStreamWS |
+| **The same rules mirrored onto every machine** (pushed at connect, and on every change) and evaluated where a sealed command is decrypted, so the block list applies to E2E commands too; the agent acknowledges the ruleset version it holds | server/policy.go pushFleetPolicy, agent/policy.go fleetPolicy |
 | **E2E as a per-org server setting** (`mach-server e2e on\|off\|inherit --org X`, stored in `settings`; `MACH_E2E` pins every org), with the control signal clients obey or refuse on | server/e2eflag.go, consoleapi.go handleExec/handleE2EPub |
 | Sealed exec refused while the setting is off, before dispatch, and no key advertised — so a client cannot believe it sealed | consoleapi.go handleExec, handleE2EPub |
 | Per-machine command policy on the agent itself (`MACH_POLICY` / `policy.txt`), evaluated where no upstream can override it, on both paths | agent/policy.go, internal/policy |
@@ -123,6 +125,24 @@ covers one of them is a suggestion.
    blocked attempt is audited with exit code 126 rather than silently dropped.
    Because it matches text, it cannot judge a sealed command — which is why
    sealing is refused while this layer is configured (see "Trust model").
+
+The fleet-wide rules are **also mirrored onto every machine** and evaluated
+there, because that is the only place a sealed command's text exists: a control
+plane that cannot read a command cannot apply a text-matching rule to it. The
+ruleset is pushed when an agent connects and again on every change (a runtime
+`SetExecPolicy`, or an edit to `MACH_EXEC_POLICY_FILE`, which is re-read on mtime
+change), and the agent acknowledges the version it is enforcing. Two
+consequences worth knowing:
+
+- **The rules now run in two places**: the control plane checks every plaintext
+  command before dispatch (and can audit a refusal with the rule named even
+  though it never dispatches anything), and the machine checks everything it is
+  asked to run, sealed or not. Both refuse with exit code 126.
+- **What the control plane sends cannot loosen what the machine owner wrote.**
+  Both layers are evaluated and a refusal from either stands; the local rules are
+  not replaced, appended to, or overridable, and an empty fleet ruleset is not a
+  way past them. The refusal says which layer refused, because the two rule sets
+  usually have different authors.
 
 Grammar: `deny:<substring>`, `allowonly`, `allow:<prefix>`, matched against
 whitespace-normalized text so `r''m` and `r${IFS}m` do not slip past a
@@ -260,12 +280,19 @@ signature protects delivery, the attestation records provenance.
    and a distributed source is not one IP. The pairing and enrollment paths
    are single indexed lookups, so the amplification that would have justified
    tighter limits is gone; the limits that remain are there to slow scanning.
-6. **The fleet-wide block list cannot inspect a sealed command**, and no
-   normalizer will change that — it needs text, and a seal exists to deny text.
-   With E2E on, the one-shot path is therefore outside the block list's reach by
-   the operator's own choice; turn E2E off for the org to bring it back inside,
-   or keep the guarantee on the machine with `MACH_POLICY`, which runs where the
-   command is decrypted and no upstream can override it.
+6. **The fleet-wide block list applies to sealed commands by running on the
+   machine, and that has a residue worth naming.** The rules have to travel to
+   the agent and be evaluated there, which means: an agent that has not yet
+   received them (it is connecting, or the control plane is mid-change) enforces
+   whatever it held before; the rules are only as trustworthy as the control
+   plane that sends them, which could in principle send none — that is why the
+   machine's own `MACH_POLICY` remains the layer that holds against a hostile
+   control plane, and it is still the only one that does; and a refusal on this
+   path is audited by the control plane as `[E2E sealed command]` with exit 126,
+   so the rule that refused it is visible to the console but not to the audit
+   log (which cannot read what it cannot decrypt). The agent acknowledges the
+   ruleset version it holds, so "which machines have the current rules" is
+   answerable rather than assumed.
 7. **The copies of the agent binaries baked into the container image are not
    attested** by `push-update --attestation`, which covers runtime pushes only
    (issue #4).

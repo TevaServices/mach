@@ -72,6 +72,33 @@ type MachineInfo struct {
 	E2EReason string `json:"e2e_reason,omitempty"`
 }
 
+// ---- fleet policy (control plane -> agent, agent -> control plane) ----
+
+// PolicyUpdate carries the control plane's fleet-wide exec rules to an agent.
+//
+// The control plane cannot read a sealed command, so it cannot apply its own
+// block list to one; the only place that text exists is on the machine, after
+// decryption. So the rules travel: the agent evaluates them exactly where it
+// evaluates its own, and a refusal is a refusal whoever wrote the rule.
+//
+// Rules is the same spec text MACH_POLICY takes (deny:/allowonly/allow:), and
+// an empty Rules is meaningful — it clears any ruleset a previous message
+// installed, so an operator who removes their fleet policy is not left with
+// stale rules being enforced on every machine. Version is a content hash the
+// agent echoes back in a PolicyAck.
+type PolicyUpdate struct {
+	Rules   string `json:"rules"`
+	Version string `json:"version"`
+}
+
+// PolicyAck confirms which fleet ruleset an agent is enforcing.
+type PolicyAck struct {
+	Version string `json:"version"`
+	// Error is set when the agent could not install what it was sent, so a
+	// control plane does not read silence as success.
+	Error string `json:"error,omitempty"`
+}
+
 // ---- control plane -> agent ----
 
 type ExecCommand struct {

@@ -1,12 +1,16 @@
 package server
 
 import (
+	"encoding/json"
+	"log"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/bcross/mach/internal/broker"
 	"github.com/bcross/mach/internal/policy"
+	"github.com/bcross/mach/internal/protocol"
 )
 
 // Global exec policy — the fleet-wide half of mach's command control.
@@ -46,13 +50,29 @@ const execRefused = 126
 const (
 	execPolicyEnv     = "MACH_EXEC_POLICY"
 	execPolicyFileEnv = "MACH_EXEC_POLICY_FILE"
-
 	// How often a policy file's mtime is re-checked. Editing the file is the
 	// intended way to change the block list, so it should not require a
 	// restart; 15s is well below the time it takes to notice in practice and
 	// costs one stat per tick.
 	execPolicyPollInterval = 15 * time.Second
 )
+
+// pollPolicyOnce re-reads the policy file when it changed and mirrors the result
+// onto every connected agent. The ticker calls this; tests call it directly, so
+// the reload-and-propagate path is covered without waiting out an interval and
+// without a mutable interval read from live goroutines.
+func (s *Server) pollPolicyOnce() {
+	if !s.execPolicy.reloadFile() {
+		return
+	}
+	log.Printf("server: %s changed on disk; reloaded", s.execPolicy.Source())
+	s.logExecPolicy()
+	// The rules are enforced on the machines (that is the only place a sealed
+	// command is readable), so an edit here has to reach every connected agent.
+	// Without this the control plane would hold the new rules while every
+	// running machine kept enforcing the old ones until it happened to reconnect.
+	s.broadcastFleetPolicy()
+}
 
 // Replace installs rules wholesale (the parser resets first, so this never
 // accumulates). An empty spec clears the policy.
@@ -75,6 +95,91 @@ func (e *execPolicy) Rules() []string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.p.Describe()
+}
+
+// Spec renders the rules the way the grammar writes them, which is what an
+// agent parses when the ruleset is mirrored onto the machine. Empty when there
+// are no rules — and an empty spec is a meaningful thing to send: it clears
+// whatever a machine was enforcing before.
+func (e *execPolicy) Spec() string {
+	return strings.Join(e.Rules(), "\n")
+}
+
+// Version fingerprints the ruleset so both ends can tell whether they hold the
+// same one.
+func (e *execPolicy) Version() string {
+	return policy.Fingerprint(e.Spec())
+}
+
+// pushFleetPolicy mirrors the current ruleset onto one agent connection.
+//
+// Always sent, at every connect, including when it is empty: a machine that
+// reconnects after the operator withdrew a fleet policy has to be told to stop
+// enforcing the old one, and "no message" cannot say that.
+func (s *Server) pushFleetPolicy(ac *broker.AgentConn) {
+	spec, version := s.execPolicy.Spec(), s.execPolicy.Version()
+	payload, err := json.Marshal(protocol.PolicyUpdate{Rules: spec, Version: version})
+	if err != nil {
+		s.logf("could not encode the fleet policy for %q: %v", ac.Name, err)
+		return
+	}
+	if err := ac.Conn.WriteEnvelope(protocol.Envelope{Type: "policy", Payload: payload}); err != nil {
+		s.logf("could not push the fleet policy to %q: %v", ac.Name, err)
+	}
+}
+
+// broadcastFleetPolicy mirrors a changed ruleset onto every connected agent.
+// The rules are enforced on the machines (that is where a sealed command is
+// readable), so a change that only updated this process would leave every
+// running agent enforcing the previous version until it happened to reconnect.
+func (s *Server) broadcastFleetPolicy() {
+	s.broadcastPolicy(s.execPolicy.Version())
+}
+
+// broadcastPolicy pushes the current ruleset to every live agent and logs the
+// version they were sent.
+func (s *Server) broadcastPolicy(version string) {
+	n := 0
+	s.br.Each(func(ac *broker.AgentConn) {
+		s.pushFleetPolicy(ac)
+		n++
+	})
+	if n > 0 {
+		s.logf("fleet exec policy %s pushed to %d agent(s)", version, n)
+	}
+}
+
+// recordPolicyAck notes which ruleset version a machine is enforcing, and warns
+// when it is not the current one — an agent enforcing yesterday's rules is a
+// silent hole in a control the operator believes is fleet-wide.
+func (s *Server) recordPolicyAck(machine string, env protocol.Envelope) {
+	var ack protocol.PolicyAck
+	if err := json.Unmarshal(env.Payload, &ack); err != nil {
+		s.logf("agent %q sent an unreadable policy_ack", machine)
+		return
+	}
+	if ack.Error != "" {
+		s.logf("agent %q could not install the fleet policy: %s", machine, ack.Error)
+		return
+	}
+	s.policyMu.Lock()
+	if s.policyAcks == nil {
+		s.policyAcks = map[string]string{}
+	}
+	s.policyAcks[machine] = ack.Version
+	s.policyMu.Unlock()
+
+	if want := s.execPolicy.Version(); ack.Version != want {
+		s.logf("agent %q is enforcing fleet policy %s, not the current %s — it will be updated on its next connect",
+			machine, ack.Version, want)
+	}
+}
+
+// policyAck reports the version a machine last confirmed ("" when unknown).
+func (s *Server) policyAck(machine string) string {
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
+	return s.policyAcks[machine]
 }
 
 func (e *execPolicy) Source() string {

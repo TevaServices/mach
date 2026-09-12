@@ -123,10 +123,11 @@ Put Caddy/nginx in front for TLS (agents speak wss://).
   can hold a fleet-wide one (`MACH_EXEC_POLICY` / `MACH_EXEC_POLICY_FILE`)
   applied to every key, scope and machine before a command is dispatched —
   on `mach console` as well as `mach exec`, so typing a blocked command into
-  the console is refused like any other. Both layers match text, so neither can
-  read a sealed command: with E2E on, the block list governs the commands it can
-  see (every plaintext one, on both paths), and an operator who needs it over
-  the *one-shot* path turns E2E off. Both layers are foot-guards against
+  the console is refused like any other. Both layers match text, so the fleet
+  rules are also mirrored onto every machine — pushed at connect and on every
+  change — and evaluated there, where a sealed (E2E) command is readable. A
+  sealed command the block list refuses is refused, with the rule named, and the
+  control plane still never sees it. Both layers are foot-guards against
   mistakes, not sandboxes — see `SECURITY-NOTES.md` for exactly what they can
   promise.
 - Output streams to the console as it is produced. It is carried as typed,
@@ -149,8 +150,9 @@ Put Caddy/nginx in front for TLS (agents speak wss://).
   (metadata only: machine, timestamp, source key, exit code). It is a
   server-side setting per org — `mach-server e2e on|off --org X`, default on,
   `MACH_E2E=on|off` pinning every org — and every client is told what the
-  server accepts (`mach list` shows it per machine) and obeys it: with sealing
-  off, commands run in plaintext where the block list can read them. Agents
+  server accepts (`mach list` shows it per machine) and obeys it. The fleet-wide
+  block list applies either way: on the machine when the command is sealed, on
+  the control plane when it is not. Agents
   register an X25519 key at enrollment and keep it whichever way the setting
   is, so flipping it needs no re-enrollment. A machine enrolled before this
   feature has no key, and `mach exec` says so rather than pretending.

@@ -8,10 +8,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/bcross/mach/internal/policy"
 	"github.com/bcross/mach/internal/protocol"
 	"github.com/bcross/mach/internal/store"
 	"github.com/gorilla/websocket"
@@ -22,12 +25,23 @@ import (
 // console. Everything the assertions below look at is what one of the two
 // clients actually received.
 type streamHarness struct {
-	srv    *httptest.Server
-	s      *Server
-	st     *store.Store
-	mach   string
-	agent  *websocket.Conn
-	frames chan protocol.Envelope // frames the fake agent was sent
+	srv   *httptest.Server
+	s     *Server
+	st    *store.Store
+	mach  string
+	agent *websocket.Conn
+	// frames carries the command-dispatch frames the fake agent was sent.
+	// Connect-time bookkeeping (the fleet policy mirror) is delivered on its own
+	// channel instead, so an assertion about what was dispatched is not
+	// disturbed by what was merely synchronized.
+	frames   chan protocol.Envelope
+	policies chan protocol.PolicyUpdate
+	// connectPolicy is the ruleset the control plane mirrored when this agent
+	// connected. Consumed here so a test's own broadcasts are the only thing it
+	// reads — and asserted, because "the rules arrive at connect" is the
+	// property that makes them current on a machine that was offline when they
+	// were configured.
+	connectPolicy protocol.PolicyUpdate
 }
 
 // newStreamHarness enrolls a machine, drives a real agent hello over a real
@@ -78,7 +92,11 @@ func newStreamHarness(t *testing.T) *streamHarness {
 		t.Fatalf("hello refused: %q %s", result.Type, hr.Error)
 	}
 
-	h := &streamHarness{srv: srv, s: s, st: st, mach: mach, agent: agent, frames: make(chan protocol.Envelope, 16)}
+	h := &streamHarness{
+		srv: srv, s: s, st: st, mach: mach, agent: agent,
+		frames:   make(chan protocol.Envelope, 16),
+		policies: make(chan protocol.PolicyUpdate, 8),
+	}
 	// Play the agent: record what the control plane sends, and answer one-shot
 	// execs so a test never waits out the dispatch grace period. Streaming
 	// frames are left for the test to answer, since the point of those tests is
@@ -89,6 +107,16 @@ func newStreamHarness(t *testing.T) *streamHarness {
 			var env protocol.Envelope
 			if err := agent.ReadJSON(&env); err != nil {
 				return
+			}
+			if env.Type == "policy" {
+				var upd protocol.PolicyUpdate
+				if json.Unmarshal(env.Payload, &upd) == nil {
+					select {
+					case h.policies <- upd:
+					default:
+					}
+				}
+				continue
 			}
 			select {
 			case h.frames <- env:
@@ -102,6 +130,14 @@ func newStreamHarness(t *testing.T) *streamHarness {
 	}()
 	if ac := s.br.WaitOnline(mach, 5*time.Second); ac == nil {
 		t.Fatal("agent never came online")
+	}
+	// The mirror is pushed immediately after the hello, so it is the agent's
+	// first frame after hello_result. Waiting for it here is what lets a test
+	// treat later pushes as its own.
+	select {
+	case h.connectPolicy = <-h.policies:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the control plane did not mirror the fleet policy at connect")
 	}
 	return h
 }
@@ -582,5 +618,131 @@ func TestStreamedCommandIsAudited(t *testing.T) {
 			t.Fatal("the streamed command left no audit row")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The fleet-wide block list has to reach the machines, because that is the only
+// place a sealed command is readable. This checks the mirror itself: the rules
+// are pushed at connect (even when empty, which is a real instruction), and the
+// agent's acknowledgement of the version is recorded.
+func TestFleetPolicyIsMirroredToAgents(t *testing.T) {
+	h := newStreamHarness(t)
+	h.s.execPolicy.Replace("deny:mirror-marker\nallowonly\n", "test")
+
+	// The connect-time mirror carried the ruleset as it stood then (none): the
+	// harness asserts it arrived, and here it is checked to be empty rather than
+	// a stale ruleset from some earlier state.
+	if h.connectPolicy.Rules != "" {
+		t.Errorf("connect-time ruleset = %q, want empty", h.connectPolicy.Rules)
+	}
+
+	// A change is broadcast to every live agent, because the rules run on the
+	// machines: a change that only updated this process would leave every
+	// running agent enforcing the previous version until it reconnected.
+	h.s.broadcastFleetPolicy()
+
+	want := policy.Fingerprint("deny:mirror-marker\nallowonly")
+	select {
+	case upd := <-h.policies:
+		if upd.Rules != "deny:mirror-marker\nallowonly" {
+			t.Errorf("rules = %q, want the spec text", upd.Rules)
+		}
+		if upd.Version != want {
+			t.Errorf("version = %q, want the fingerprint %q", upd.Version, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the fleet policy never reached the agent")
+	}
+
+	// Withdrawing the policy sends an empty ruleset. That is an instruction, not
+	// an absence: a machine that kept enforcing withdrawn rules would be a block
+	// list nobody can turn off.
+	h.s.execPolicy.Replace("", "test")
+	h.s.broadcastFleetPolicy()
+	select {
+	case upd := <-h.policies:
+		if upd.Rules != "" || upd.Version != policy.Fingerprint("") {
+			t.Errorf("cleared policy pushed %+v, want an empty ruleset and its fingerprint", upd)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the cleared policy never reached the agent")
+	}
+	h.s.execPolicy.Replace("deny:mirror-marker\nallowonly\n", "test")
+	h.s.broadcastFleetPolicy()
+	select {
+	case <-h.policies:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the restored policy never reached the agent")
+	}
+
+	// The agent acks; the control plane records what it is enforcing. Without
+	// the ack, "which machines hold the current rules" has no answer.
+	ack, _ := json.Marshal(protocol.PolicyAck{Version: want})
+	if err := h.agent.WriteJSON(protocol.Envelope{Type: "policy_ack", Payload: ack}); err != nil {
+		t.Fatalf("write ack: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if got := h.s.policyAck(h.mach); got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ack for %q was not recorded (got %q)", want, h.s.policyAck(h.mach))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A policy file edited on disk has to reach machines that are already connected.
+// The rules run on the machines, so a reload that updated only this process
+// would leave every running agent enforcing the withdrawn rules until it
+// happened to reconnect — a block list that quietly stops applying to the
+// machines it was written for.
+func TestPolicyFileReloadReachesConnectedAgents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fleet.policy")
+	if err := os.WriteFile(path, []byte("deny:first-marker\n"), 0o600); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+	t.Setenv(execPolicyFileEnv, path)
+
+	h := newStreamHarness(t)
+	if got, want := h.connectPolicy.Rules, "deny:first-marker"; got != want {
+		t.Fatalf("connect-time ruleset = %q, want %q", got, want)
+	}
+
+	// Edit the file the way an operator would, and make sure the mtime moves
+	// even on a filesystem with coarse timestamps.
+	if err := os.WriteFile(path, []byte("deny:first-marker\ndeny:second-marker\n"), 0o600); err != nil {
+		t.Fatalf("edit policy: %v", err)
+	}
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	want := "deny:first-marker\ndeny:second-marker"
+	// What the ticker does on every interval, driven directly: the ticker is
+	// three lines of stdlib, the reload-and-propagate path is the part that can
+	// be wrong, and this way it is asserted without waiting one out. (The e2e
+	// suite exercises the real interval against real binaries.)
+	h.s.pollPolicyOnce()
+	select {
+	case upd := <-h.policies:
+		if upd.Rules != want {
+			t.Errorf("pushed ruleset = %q, want %q", upd.Rules, want)
+		}
+		if upd.Version != policy.Fingerprint(want) {
+			t.Errorf("pushed version = %q, want the fingerprint of the new rules", upd.Version)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("an edited policy file never reached the connected agent")
+	}
+	// A second poll with nothing changed pushes nothing: a control plane that
+	// re-broadcast on every tick would keep waking every agent in the fleet.
+	h.s.pollPolicyOnce()
+	select {
+	case upd := <-h.policies:
+		t.Errorf("an unchanged policy was pushed again: %+v", upd)
+	case <-time.After(100 * time.Millisecond):
 	}
 }

@@ -134,6 +134,21 @@ func (b *Broker) OnlineNames() map[string]bool {
 	return out
 }
 
+// Each calls fn for every live agent connection. The slice is a snapshot, so fn
+// may take its time (writing a frame, say) without holding the broker's lock or
+// racing a concurrent disconnect.
+func (b *Broker) Each(fn func(*AgentConn)) {
+	b.mu.RLock()
+	conns := make([]*AgentConn, 0, len(b.agents))
+	for _, a := range b.agents {
+		conns = append(conns, a)
+	}
+	b.mu.RUnlock()
+	for _, a := range conns {
+		fn(a)
+	}
+}
+
 // ---- streaming session binding (console ↔ agent relay) ----
 
 // BindStream registers a console session's delivery channel against the
