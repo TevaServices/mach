@@ -228,11 +228,10 @@ only covered at the SQL-translation level.
   its propagation, the block gates on both dispatch paths, the web UI's
   fail-closed routing and CSRF layers), agent (policy — including fleet rules
   binding a sealed command — shells, streaming writers, confinement, the
-  supervisor directives), console
-  (the E2E signal, key pinning, trust)
-  (output-is-data, lost-stream, obeying/refusing the E2E signal), policy,
-  protocol, oidcauth (a fake issuer, one broken check per test), release and
-  in-toto all have coverage; keep it that way for touched code.
+  supervisor directives), console (output-is-data, lost-stream, obeying the E2E
+  signal, key pinning and trust), policy, protocol, oidcauth (a fake issuer, one
+  broken check per test), release and in-toto all have coverage; keep it that
+  way for touched code.
 - `mise run e2e` — full end-to-end (builds binaries, spins up the control
   plane on 127.0.0.1:8099 with a fleet-wide policy installed, enrolls via API
   key + QR, exercises exec in both modes, the console relay, output-is-data,
@@ -406,14 +405,18 @@ rule that would have prevented it.
   `t.Setenv("MACH_STATE_DIR", t.TempDir())` writes real pin files into the
   developer's home directory — which is how that was noticed. Use `pinState(t)`
   or an equivalent temp state dir.
-- **Server goroutines outlive tests.** `server.New` starts a cleanup ticker, and
-  nothing ever closes `cleanupStop` (there is no `Close()`), so it keeps running
-  for the life of the process — including in every test that builds a server. It
-  will therefore read anything you make mutable. A
-  package-level `var` for the policy poll interval was a data race between one
-  test's cleanup and another test's running server. Hence: keep such knobs
-  `const` and expose the tick's body as a function (`pollPolicyOnce`) that a test
-  can call directly. That is also faster and less flaky than shrinking a timer.
+- **`Server` owns background work, so a test that builds one must close it.**
+  `New` starts the housekeeping goroutine (pairing cleanup, the exec-policy file
+  poll). `(*Server).Close()` stops it and *waits* for it, so "Close returned"
+  means nothing of the server's is still running; without that call the goroutine
+  outlives the test and reads whatever the next one mutates. Test helpers do
+  `t.Cleanup(s.Close)` (`newTestServer`, `newAuthTestServer`); a new one should
+  too. Anything you add to the background work goes in the WaitGroup and is
+  stopped by `Close`, or the leak comes back in a form nobody is looking for.
+  Two related habits from before `Close` existed and still worth keeping: a
+  package-level `var` read by a live goroutine is a data race (a policy poll
+  interval used to be one), and a tick's body is better as a function a test can
+  call (`pollPolicyOnce`) than as a timer a test has to wait out.
 - **What the server writes into an agent's log becomes greppable test data.** The
   fleet rules are mirrored onto agents and logged there, so the e2e check "the
   blocked marker never appears in the agent's log" started matching the *rule*
@@ -427,9 +430,9 @@ rule that would have prevented it.
   which mode is in force — and only a *sealed* command proves anything about what
   reached the machine, because a plaintext one is judged by the control plane.
   That distinction is the whole reason the mirroring tests look the way they do.
-- **`gofmt -l .` should be empty before you commit** (there is no mise task for
-  it). Files merged in from another branch arrived without trailing newlines, and
-  the diff noise from fixing that later is avoidable.
+- **`gofmt -l .` should be empty before you commit.** Files merged in from another
+  branch have arrived without trailing newlines, and the diff noise from fixing
+  that later is avoidable.
 - **Read the merge commit's message before "fixing" something that looks
   redundant.** Two independent implementations of the same four limitations were
   reconciled in `c620a16`; the decisions that look odd in isolation (one-shot exec

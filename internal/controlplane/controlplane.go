@@ -97,7 +97,13 @@ func Serve() {
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	if err := srvHTTP.ListenAndServe(); err != nil {
+	// The server owns background work (the housekeeping goroutine), so stopping it
+	// is part of shutting down rather than something to leave to process exit.
+	// Closed explicitly rather than by defer: this blocks for the process's
+	// lifetime, and log.Fatal below exits without running deferred calls.
+	err = srvHTTP.ListenAndServe()
+	srv.Close()
+	if err != nil {
 		log.Fatal(err)
 	}
 }

@@ -63,8 +63,14 @@ type Server struct {
 	// not configured, in which case none of its routes are registered at all.
 	ui *uiConfig
 
-	// cleanup ticker stop
+	// cleanupStop stops the housekeeping goroutine; closeOnce makes Close
+	// idempotent, because closing a closed channel panics and a double Close is
+	// the normal outcome of a caller deferring it and a test cleaning up after it.
 	cleanupStop chan struct{}
+	closeOnce   sync.Once
+	// bg counts the background goroutines this Server started, so Close can wait
+	// for them rather than merely asking them to stop.
+	bg sync.WaitGroup
 }
 
 // initUI loads the web UI's configuration from the environment. With no OIDC
@@ -146,7 +152,9 @@ func New(st *store.Store, br *broker.Broker, org, keyPath string) *Server {
 	}
 	// Housekeeping: purge terminal pairings hourly (keep 24h for forensics),
 	// and pick up global exec-policy edits without a restart.
+	s.bg.Add(1)
 	go func() {
+		defer s.bg.Done()
 		t := time.NewTicker(time.Hour)
 		pt := time.NewTicker(execPolicyPollInterval)
 		defer t.Stop()
@@ -168,6 +176,31 @@ func New(st *store.Store, br *broker.Broker, org, keyPath string) *Server {
 		}
 	}()
 	return s
+}
+
+// Close stops the background work this Server owns. It is safe to call more
+// than once, and it does not close the store — the caller owns that, and a
+// server can be closed while its store is still in use (a test that closes the
+// server and then reads the audit log it wrote).
+//
+// Right now that background work is the housekeeping goroutine (pairing cleanup
+// and the exec-policy file poll). It exists because that goroutine holds a
+// reference to this Server for the lifetime of the process, so without a way to
+// stop it, "the server is finished with" and "the process is about to exit" are
+// the same statement — which is true for `mach-server serve` and false for
+// everything else that builds one, tests included. Anything added here later
+// (a sweeper, a watcher) must be added to the WaitGroup and stopped here too, or
+// the same leak returns in a form nobody is looking for.
+//
+// Close waits for that work to finish before returning, so a caller can treat
+// "Close returned" as "nothing of mine is still running" — which is what makes it
+// usable as a test cleanup, where the alternative is a goroutine that outlives
+// the test and reads whatever the next one mutates.
+func (s *Server) Close() {
+	s.closeOnce.Do(func() {
+		close(s.cleanupStop)
+		s.bg.Wait()
+	})
 }
 
 // logExecPolicy prints the active global policy at startup (and on reload).
