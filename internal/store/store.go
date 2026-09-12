@@ -23,6 +23,11 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// ErrOrgExists is returned by CreateOrg when the prefix is already configured.
+// A sentinel rather than the driver's duplicate-key error, which is spelled
+// differently by the two engines.
+var ErrOrgExists = errors.New("org already exists")
+
 type Store struct {
 	db    *sql.DB
 	known string // "sqlite" or "postgres" — feature gating is driver-neutral
@@ -103,7 +108,8 @@ const schemaSQL = `CREATE TABLE IF NOT EXISTS machines (
 	agent_version TEXT DEFAULT '',
 	created_at TEXT NOT NULL,
 	revoked INTEGER DEFAULT 0,
-	pub_e2e TEXT DEFAULT ''
+	pub_e2e TEXT DEFAULT '',
+	blocked INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS api_keys (
 	id {{ID}},
@@ -156,6 +162,11 @@ CREATE TABLE IF NOT EXISTS settings (
 	key TEXT PRIMARY KEY,
 	value TEXT NOT NULL,
 	updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS orgs (
+	name TEXT PRIMARY KEY,
+	created_at TEXT NOT NULL,
+	created_by TEXT DEFAULT ''
 );
 `
 
@@ -255,6 +266,18 @@ func (s *Store) verifySchema() error {
 	}
 	if !cols["code_salt"] {
 		return errors.New("database predates the current schema (pairings.code_salt missing); delete it and re-enroll — pre-1.0, no migration path")
+	}
+	// machines.blocked carries the operator's soft block. The check is here
+	// rather than left to a runtime error because CREATE TABLE IF NOT EXISTS
+	// cannot add a column to a table that already exists: without this, an
+	// older database fails on the first machineCols query with a raw
+	// "no such column" instead of a message naming the column and the remedy.
+	cols, err = s.tableColumns("machines")
+	if err != nil {
+		return err
+	}
+	if !cols["blocked"] {
+		return errors.New("database predates the current schema (machines.blocked missing); run `ALTER TABLE machines ADD COLUMN blocked INTEGER DEFAULT 0` to keep this fleet, or delete the database and re-enroll — pre-1.0, no automatic migration")
 	}
 	return nil
 }
@@ -395,6 +418,11 @@ type Machine struct {
 	CreatedAt string
 	Revoked   bool
 	PubE2E    string // X25519 public key (hex) for E2E exec encryption
+	// Blocked is the operator's soft block: the agent stays connected and
+	// keeps answering keepalives, but the control plane sends it no commands
+	// and services no requests for it. Independent of Revoked — see
+	// SetMachineBlocked.
+	Blocked bool
 }
 
 func (s *Store) CreateMachine(name, pubkey, hostname, os, arch, agentVer, pubE2E string) error {
@@ -403,12 +431,12 @@ func (s *Store) CreateMachine(name, pubkey, hostname, os, arch, agentVer, pubE2E
 	return err
 }
 
-const machineCols = `id, name, pubkey, hostname, os, arch, agent_version, created_at, revoked, pub_e2e`
+const machineCols = `id, name, pubkey, hostname, os, arch, agent_version, created_at, revoked, pub_e2e, blocked`
 
 func scanMachine(row interface{ Scan(...any) error }) (*Machine, error) {
 	m := &Machine{}
-	var revoked int
-	err := row.Scan(&m.ID, &m.Name, &m.PubKey, &m.Hostname, &m.OS, &m.Arch, &m.AgentVer, &m.CreatedAt, &revoked, &m.PubE2E)
+	var revoked, blocked int
+	err := row.Scan(&m.ID, &m.Name, &m.PubKey, &m.Hostname, &m.OS, &m.Arch, &m.AgentVer, &m.CreatedAt, &revoked, &m.PubE2E, &blocked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -416,6 +444,7 @@ func scanMachine(row interface{ Scan(...any) error }) (*Machine, error) {
 		return nil, err
 	}
 	m.Revoked = revoked != 0
+	m.Blocked = blocked != 0
 	return m, nil
 }
 
@@ -461,6 +490,42 @@ func (s *Store) RemoveMachine(name string) error {
 func (s *Store) RevokeMachine(name string) error {
 	_, err := s.exec(`UPDATE machines SET revoked=1 WHERE name=?`, name)
 	return err
+}
+
+// SetMachineBlocked sets or clears the operator's soft block on a machine.
+// ok is false when no such machine exists, so callers report a 404 rather than
+// a silent success.
+//
+// A block is a soft stop, not a retirement: the agent stays connected and keeps
+// answering keepalives — it is simply sent no commands, and live console
+// sessions for it are torn down. It is deliberately stored here rather than in
+// the broker because it is operator-set state that has to survive a restart,
+// and the broker survives nothing.
+//
+// revoked is left untouched in both directions: blocking a revoked machine, or
+// clearing the block on one, must never change whether it is revoked. The two
+// are independent axes — revoke is a permanent tombstone that keeps the name
+// and key reserved, block is a reversible freeze on command dispatch.
+//
+// Note the two INSERTs into this table (CreateMachine, and the one inside
+// ConsumePairing) deliberately do not name this column: DEFAULT 0 means a newly
+// enrolled machine is never born blocked.
+func (s *Store) SetMachineBlocked(name string, blocked bool) (ok bool, err error) {
+	v := 0
+	if blocked {
+		v = 1
+	}
+	res, err := s.exec(`UPDATE machines SET blocked=? WHERE name=?`, v, name)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		// A driver that cannot report affected rows still wrote the value; the
+		// caller's subsequent read is what decides, so report success.
+		return true, nil
+	}
+	return n > 0, nil
 }
 
 // DeleteMachine removes a machine outright, freeing its name and its agent
@@ -526,6 +591,116 @@ func (s *Store) APIKeyExists(key string) (ok bool, keyName, scopes string, err e
 	}
 	return true, name, scopesCol, nil
 }
+
+// APIKeyInfo is a key as an operator may see it: enough to recognise and reason
+// about one, and nothing that helps guess or forge it.
+//
+// There is deliberately no field for salt, key_lookup or key_hash. key_lookup is
+// the deterministic hash the bearer-key probe is indexed on — exposing it hands
+// an attacker the value the server compares against — and key_hash is the
+// stretched secret for offline cracking. The absence of the fields, rather than
+// a promise not to fill them, is what keeps a future caller from leaking one.
+type APIKeyInfo struct {
+	Name      string
+	Scopes    string
+	CreatedAt string
+	Revoked   bool
+}
+
+// ListAPIKeys returns every key's display metadata, ordered by name. It never
+// selects a hash column.
+func (s *Store) ListAPIKeys() ([]APIKeyInfo, error) {
+	rows, err := s.query(`SELECT name, scopes, created_at, revoked FROM api_keys ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []APIKeyInfo
+	for rows.Next() {
+		var k APIKeyInfo
+		var revoked int
+		if err := rows.Scan(&k.Name, &k.Scopes, &k.CreatedAt, &revoked); err != nil {
+			return nil, err
+		}
+		k.Revoked = revoked != 0
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// ---- orgs ----
+
+// Org is a configured org prefix. Pinned means it came from the environment
+// (MACH_ORG / MACH_ORGS) and therefore cannot be removed from the UI — the same
+// relationship MACH_E2E has to the stored E2E setting.
+type Org struct {
+	Name      string
+	CreatedAt string
+	CreatedBy string
+	Pinned    bool
+}
+
+func (s *Store) CreateOrg(name, createdBy string) error {
+	// Check first so the ordinary case gets a clean sentinel. The two engines
+	// spell duplicate-key errors differently, and string-matching them would be
+	// a Postgres bug waiting to happen. A genuine race between the check and the
+	// insert still surfaces the driver's own error, which is the honest outcome
+	// for an operator-driven action.
+	exists, err := s.OrgExists(name)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return ErrOrgExists
+	}
+	_, err = s.exec(`INSERT INTO orgs (name, created_at, created_by) VALUES (?,?,?)`,
+		name, now(), createdBy)
+	return err
+}
+
+func (s *Store) DeleteOrg(name string) error {
+	_, err := s.exec(`DELETE FROM orgs WHERE name=?`, name)
+	return err
+}
+
+func (s *Store) OrgExists(name string) (bool, error) {
+	var one int
+	err := s.queryRow(`SELECT 1 FROM orgs WHERE name=?`, name).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ListOrgsDB returns the orgs stored in the database, ordered by name. Pinned is
+// never set here: the caller merges the environment in and marks those.
+func (s *Store) ListOrgsDB() ([]Org, error) {
+	rows, err := s.query(`SELECT name, created_at, created_by FROM orgs ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Org
+	for rows.Next() {
+		var o Org
+		if err := rows.Scan(&o.Name, &o.CreatedAt, &o.CreatedBy); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// ValidOrgLabel reports whether s is usable as an org prefix: 2-20 characters of
+// letters, digits and hyphen.
+//
+// This is the org half of ValidOrgName, exported so the admin surfaces (the web
+// UI's add-org form, the CLI) validate against the same rule the naming
+// invariant uses rather than keeping their own copies that can drift.
+func ValidOrgLabel(s string) bool { return validLabel(s, 2, 20) }
 
 // ---- pairings ----
 
@@ -869,9 +1044,21 @@ func (s *Store) QueueUpdate(machine, version, sha256Hex, url, dataB64, sigB64 st
 	return err
 }
 
-// PendingUpdate returns and clears the queued update for a machine.
+// PopPendingUpdate returns and clears the queued update for a machine.
+//
+// One statement, deliberately: this used to be a SELECT followed by a separate
+// DELETE, which was safe only while it had a single caller (the connect path).
+// Delivering a held update on unblock is a second caller, and two concurrent
+// pops of the same row would each have handed out the same signed manifest and
+// then both reported success — the agent would apply one update twice. RETURNING
+// collapses the read-and-clear into the statement that owns the row.
+//
+// It must go through queryRow (not exec, which discards rows) so that "nothing
+// queued" stays the clean ErrNoRows -> ok=false, err=nil contract the callers
+// depend on.
 func (s *Store) PopPendingUpdate(machine string) (version, sha256Hex, url, dataB64, sigB64 string, ok bool, err error) {
-	row := s.queryRow(`SELECT version, sha256, url, data_b64, sig_b64 FROM pending_updates WHERE machine=?`, machine)
+	row := s.queryRow(`DELETE FROM pending_updates WHERE machine=?
+		RETURNING version, sha256, url, data_b64, sig_b64`, machine)
 	err = row.Scan(&version, &sha256Hex, &url, &dataB64, &sigB64)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", "", "", "", "", false, nil
@@ -879,8 +1066,20 @@ func (s *Store) PopPendingUpdate(machine string) (version, sha256Hex, url, dataB
 	if err != nil {
 		return "", "", "", "", "", false, err
 	}
-	// Clear after successful handoff (agent acks by reconnecting with the
-	// new version; a failed apply re-pushes on next admin command).
-	_, err = s.exec(`DELETE FROM pending_updates WHERE machine=?`, machine)
-	return version, sha256Hex, url, dataB64, sigB64, err == nil, err
+	return version, sha256Hex, url, dataB64, sigB64, true, nil
+}
+
+// HasPendingUpdate reports whether an update is queued for a machine, without
+// consuming it. Read-only counterpart to PopPendingUpdate, for callers that need
+// to observe the queue rather than drain it.
+func (s *Store) HasPendingUpdate(machine string) (bool, error) {
+	var one int
+	err := s.queryRow(`SELECT 1 FROM pending_updates WHERE machine=?`, machine).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
