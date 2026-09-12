@@ -48,11 +48,13 @@ Explicit subcommands:
 
 | Command | Purpose |
 |---|---|
-| `mach list` | enrolled machines + online state |
-| `mach exec <m> <cmd...>` | run remotely, streaming output as it is produced; local exit code = remote exit code |
+| `mach list` | enrolled machines, online state, and per-org E2E state (`e2e=on|off`) |
+| `mach exec <m> <cmd...>` | run remotely; output buffered and printed at exit; local exit code = remote exit code |
 | `mach exec <m> -- <argv>` | **no-shell mode**: args pass through byte-exact (no quoting issues) |
-| `mach exec --json <m> <cmd...>` | emit the stream as labeled NDJSON frames — for programs (output is data, exit status is a field) |
-| `mach console <m>` | interactive line-based remote shell (`:!` runs locally) |
+| `mach exec --json <m> <cmd...>` | print one JSON object instead of raw output — for programs (output and exit status are fields) |
+| `mach exec --e2e <m> <cmd...>` | require end-to-end encryption: fail rather than send the command in plaintext |
+| `mach exec --no-e2e <m> <cmd...>` | never encrypt: keep the command readable to the fleet-wide block list and the audit log |
+| `mach console <m>` | interactive remote shell: output streams live, stdin and Ctrl-C reach the machine (`:!` runs locally) |
 | `mach audit [m] [n]` | recent command audit log |
 
 A machine's output goes to stdout verbatim; mach's own messages go to stderr
@@ -95,12 +97,17 @@ docker compose exec mach-server mach-server add-api-key hermes-console 'exec:*'
 # (also settable as MACH_EXEC_POLICY_FILE, re-read on change without a restart)
 MACH_EXEC_POLICY="deny:rm -rf /
 deny:mkfs" docker compose up -d
+
+# optional: turn end-to-end encryption off for one org, so its commands are
+# readable by the block list above (no restart; agents are unaffected)
+docker compose exec mach-server mach-server e2e off --org acme
 ```
 
 The image also ships prebuilt agent binaries for all six OS/arch targets
 (`/opt/mach-agents/`) — copy one to a target machine; it never needs Go.
 State lives in `./data/mach.db` (SQLite: machines, keys, pairings, full
-command audit log). Put Caddy/nginx in front for TLS (agents speak wss://).
+command audit log) — or in Postgres, if `MACH_DB` is a `postgres://` DSN.
+Put Caddy/nginx in front for TLS (agents speak wss://).
 
 ## Security posture (v1)
 
@@ -114,34 +121,80 @@ command audit log). Put Caddy/nginx in front for TLS (agents speak wss://).
 - **Command policy, in two layers:** each agent can hold its own block list
   (`MACH_POLICY`) that nothing upstream can override, and the control plane
   can hold a fleet-wide one (`MACH_EXEC_POLICY` / `MACH_EXEC_POLICY_FILE`)
-  applied to every key, scope and machine before a command is dispatched.
-  Both are foot-guards against mistakes, not sandboxes — see
-  `SECURITY-NOTES.md` for exactly what they can promise.
+  applied to every key, scope and machine before a command is dispatched —
+  on `mach console` as well as `mach exec`, so typing a blocked command into
+  the console is refused like any other. Both layers match text, so neither can
+  read a sealed command: with E2E on, the block list governs the commands it can
+  see (every plaintext one, on both paths), and an operator who needs it over
+  the *one-shot* path turns E2E off. Both layers are foot-guards against
+  mistakes, not sandboxes — see `SECURITY-NOTES.md` for exactly what they can
+  promise.
 - Output streams to the console as it is produced. It is carried as typed,
   base64-framed chunks, so what a command prints can never be mistaken for a
   control fact: a program that prints an exit record gets its text shown, and
   the exit status the caller sees is still the process's real one.
-- Every command is audit-logged (machine, timestamp, command/argv, source
-  key, exit code, output snippets) in the control plane's SQLite — including
-  commands the policy refused.
+- Every dispatched command is audit-logged (machine, timestamp, command/argv,
+  source key, exit code, output snippets) in the control plane's database —
+  including streamed commands, and including the ones the policy refused.
 - Released agent binaries can carry a signed **in-toto attestation** recording
   the toolchain, build flags, module graph and source revision; `push-update
   --attestation` refuses to ship a binary its attestation does not describe.
 - Control plane binds to loopback by default; expose only via your TLS proxy.
 
+### Features (post-limitations, v0.3)
+
+- **E2E encryption, optional and per org**: exec commands and results are
+  sealed with X25519 + ChaCha20-Poly1305 between console and agent; the control
+  plane relays ciphertext and audits a `[E2E sealed command]` placeholder
+  (metadata only: machine, timestamp, source key, exit code). It is a
+  server-side setting per org — `mach-server e2e on|off --org X`, default on,
+  `MACH_E2E=on|off` pinning every org — and every client is told what the
+  server accepts (`mach list` shows it per machine) and obeys it: with sealing
+  off, commands run in plaintext where the block list can read them. Agents
+  register an X25519 key at enrollment and keep it whichever way the setting
+  is, so flipping it needs no re-enrollment. A machine enrolled before this
+  feature has no key, and `mach exec` says so rather than pretending.
+- **Confinement**: every remote command runs in its own process group
+  (unix) and is SIGKILL-killed as a tree on timeout — detached
+  grandchildren no longer outlive commands. (Windows: timeout + output
+  caps only.)
+- **Streaming console**: `mach console` runs each command over the
+  streaming endpoint — output arrives live (32 KiB chunks) instead of
+  buffered-at-end; Ctrl-C kills the remote session. Falls back to
+  buffered exec automatically.
+- **Postgres backing (optional)**: `MACH_DB=postgres://…` swaps SQLite
+  for Postgres (same schema), removing the single-writer constraint for
+  larger fleets. SQLite stays the default (WAL + capped connections).
+
 ### Known limitations (pre-1.0, honest list)
 
-- The control plane reads command content — with no application-layer
-  encryption, and none planned: it is a broker that has to see what it
-  brokers, and an audit log that records nothing would be worse than none.
-  Treat the control plane host as trusted and high-value.
-- The command policy matches text, so it is a foot-guard, not a sandbox. Use
-  OS-level confinement when the threat is a determined attacker.
-- `mach exec` streams output but has no stdin channel, so interactive and TUI
-  programs do not work; `mach console` is line-based.
-- Output is capped at 8 MiB per stream; the tail past the cap is replaced by a
-  visible truncation marker.
-- SQLite = single-writer; fine for a household fleet, not a datacenter.
+- **The control plane is a trusted, high-value host.** One-shot `mach exec`
+  can be end-to-end sealed (X25519 + ChaCha20-Poly1305) so it learns nothing
+  but metadata, but the streaming console cannot be: it is a long-lived relay
+  of many small frames, and the relay has to read the command to enforce the
+  fleet-wide policy at all. If your threat model says the control plane host
+  must never see a command, do not use `mach console`, and accept that while a
+  fleet-wide policy is configured sealing is off (the server refuses sealed
+  commands rather than relaying them unchecked).
+- The command policy (`deny:`/`allowonly`) matches text on the command, so it
+  is a foot-guard, not a sandbox — and on a streaming session it cannot judge
+  what is typed into a running command's stdin. OS confinement (process group,
+  rlimit) bounds damage, but no seccomp/Seatbelt profile exists yet.
+- `mach console` has stdin and Ctrl-C but is not a kernel PTY: no echo/line
+  discipline, so full-screen TUI apps (vim, htop) still need a real PTY.
+  `mach exec` remains output-only.
+- Output caps are per path: the buffered path truncates at 8 MiB with a
+  visible marker; a streamed session is uncapped, and a console that stops
+  reading loses frames rather than stalling the agent. Neither is recoverable.
+- SQLite is the default and is single-writer; fine for a household fleet, not
+  a datacenter. `MACH_DB=postgres://…` swaps in Postgres (same schema,
+  translated at the driver layer) when you outgrow it.
+- Release attestations cover binaries pushed at runtime through
+  `push-update --attestation`; the copies baked into the container image are
+  not attested by that path yet.
+
+Follow-up work tracks in GitHub issues (#2 sandboxing, #3 PTY, #4 signed
+manifests, #5 multi-server) — not in this file.
 
 ## Build
 

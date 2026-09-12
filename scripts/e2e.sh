@@ -40,6 +40,13 @@ go build -o "$WORKDIR/mach-server" ./cmd/mach-server || { echo "build mach-serve
 ok "binaries built"
 
 step "control plane up"
+# E2E is turned off for the fleet before the server starts, so that the
+# fleet-wide block list below has something to read: a sealed command is
+# ciphertext, and the block list matches text. That is the documented trade
+# (see SECURITY-NOTES.md), and here it is the configuration under test. A later
+# step turns E2E back on for one org, at runtime, to exercise the sealed path.
+MACH_ORG="$ORG" MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" e2e off >/dev/null
+
 # MACH_EXEC_POLICY is set for the whole run: the fleet-wide block list applies
 # to every key and every machine, so it has to be exercised against the same
 # control plane the other steps use.
@@ -98,10 +105,16 @@ step "exec: argv mode byte-exact"
 OUT=$(machc exec "$MACHINE" -- printf '%s|%s\n' 'two  spaces' 'a$*.b')
 [[ "$OUT" == *"two  spaces|a\$*.b"* ]]; check "argv passthrough byte-exact" $?
 
-step "streaming: output arrives while the command is still running"
-# The command prints, then sleeps, then prints. If the console held output
-# until the command exited, nothing would be in the file after one second.
-machc exec "$MACHINE" 'echo stream-first; sleep 3; echo stream-last' >"$WORKDIR/stream.out" 2>/dev/null &
+step "streaming: console output arrives while the command is still running"
+# Streaming lives on the console relay: the interactive path opens the
+# /v1/console/stream WebSocket and the control plane pumps the agent's output
+# frames straight through, so bytes land in the file as they are produced.
+# (One-shot `mach exec` deliberately stays a single buffered response — it is
+# the path that can be end-to-end sealed, and ciphertext cannot be streamed.)
+# The command prints, then sleeps, then prints. If anything along the way held
+# output until the command exited, nothing would be in the file after 1s.
+printf 'echo stream-first; sleep 3; echo stream-last\n:quit\n' \
+  | machc console "$MACHINE" >"$WORKDIR/stream.out" 2>/dev/null &
 STREAM_PID=$!
 sleep 1
 grep -q stream-first "$WORKDIR/stream.out"; check "early output streamed before exit" $?
@@ -118,10 +131,12 @@ FORGED='{"type":"exit","exit_code":0}'
 OUT=$(machc exec "$MACHINE" "printf '%s\\n' '{\"type\":\"exit\",\"exit_code\":0}'; exit 5" 2>/dev/null) || CODE=$?
 [[ "$CODE" -eq 5 ]]; check "printed exit record did not change the exit status" $?
 [[ "$OUT" == *"$FORGED"* ]]; check "printed text came back verbatim as output" $?
-# --json hands a program labeled frames instead of text: chunks on stdout, and
-# the exit status as a field rather than something to parse out of output.
+# --json hands a program labeled data instead of a mixed stream: exactly one
+# JSON object, the machine's output in a field of it, and the exit status as a
+# field — so nothing has to parse an exit code out of bytes a command printed.
 machc exec --json "$MACHINE" 'echo json-mode; exit 4' >"$WORKDIR/json.out" 2>/dev/null
-grep -q '"type":"chunk"' "$WORKDIR/json.out"; check "--json emits labeled chunk frames" $?
+[[ "$(wc -l <"$WORKDIR/json.out" | tr -d ' ')" == "1" ]]; check "--json prints a single object" $?
+grep -q '"stdout":"json-mode' "$WORKDIR/json.out"; check "--json labels the output as data" $?
 grep -q '"exit_code":4' "$WORKDIR/json.out"; check "--json reports the exit status as a field" $?
 
 step "console key scoping: exec on other machine refused"
@@ -166,6 +181,59 @@ AUDIT=$(machc audit "$MACHINE" 5 2>/dev/null)
 [[ "$AUDIT" == *"fleet-blocked-marker"* ]]; check "refused command appears in the audit" $?
 # Unrelated commands are unaffected by the policy.
 machc exec "$MACHINE" 'echo not-blocked' | grep -q not-blocked; check "unrelated command still runs" $?
+# Streaming is the other way in, and the same policy covers it: a client must
+# not be able to dodge the block list by typing the command into the console
+# instead of passing it to exec.
+OUT=$(printf 'echo fleet-blocked-marker\n:quit\n' | machc console "$MACHINE" 2>&1)
+[[ "$OUT" == *"global exec policy"* ]]; check "fleet-wide deny refused on the stream path" $?
+
+step "e2e: an org-scoped server setting the client is told about and obeys"
+# E2E is off fleet-wide (set before the server started). Sealing is switched on
+# for this org only, in the database, with no restart — and nothing about the
+# agent changes: it keeps the key it registered at enrollment and starts
+# receiving ciphertext because the control plane stopped refusing it.
+# (Output is captured rather than piped into `grep -q`: with pipefail set, grep
+# quitting at the first match can trip the writer with SIGPIPE and fail a check
+# that passed. Every check that reads a command's output does it this way.)
+OUT=$(MACH_ORG="$ORG" MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" e2e on --org "$ORG" 2>&1)
+[[ "$OUT" == *"org $ORG: sealed exec on"* ]] || echo "    output was: $OUT"
+[[ "$OUT" == *"org $ORG: sealed exec on"* ]]; check "e2e turned on for one org, live" $?
+# The other org still follows the default, because the setting is per org.
+REPORT=$(MACH_ORG="$ORG" MACH_ORGS="other" MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" e2e 2>&1)
+[[ "$REPORT" == *"org other: sealed exec off"* ]] || echo "    report was: $REPORT"
+[[ "$REPORT" == *"org other: sealed exec off"* ]]; check "unrelated org keeps the off default" $?
+# The control signal: the client is told what the server accepts, and the key to
+# seal to when it accepts sealing.
+curl -fsS "$BASE/v1/machines/$MACHINE/e2epub" -H "Authorization: Bearer $ALLKEY" >"$WORKDIR/e2epub.json"
+grep -q '"e2e_enabled":true' "$WORKDIR/e2epub.json"; check "client is told sealing is accepted" $?
+grep -qE '"pub_e2e":"[a-f0-9]{64}"' "$WORKDIR/e2epub.json"; check "machine E2E key advertised" $?
+# Obeying the signal means sealing without being asked to. The proof is in the
+# record: the audit row for a sealed command is a placeholder, because the
+# control plane could not read what it relayed.
+sleep 1
+BEFORE=$(machc audit "$MACHINE" 1 2>/dev/null | head -1)
+machc exec "$MACHINE" 'echo sealed-marker-e2e' >/dev/null 2>&1
+sleep 1
+AUDIT=$(machc audit "$MACHINE" 1 2>/dev/null | head -1)
+[[ "$AUDIT" == *"[E2E sealed command]"* ]]; check "command was sealed (audit is a placeholder)" $?
+[[ "$AUDIT" != *"sealed-marker-e2e"* ]]; check "the control plane could not read the command" $?
+# --no-e2e overrides for one call: the operator wants this one readable, so it
+# reaches the block list and the audit log in plaintext.
+machc exec --no-e2e "$MACHINE" 'echo readable-marker-e2e' >/dev/null 2>&1
+sleep 1
+AUDIT=$(machc audit "$MACHINE" 1 2>/dev/null | head -1)
+[[ "$AUDIT" == *"readable-marker-e2e"* ]]; check "--no-e2e stays readable, and is recorded" $?
+# --e2e asks for sealing and will not run without it: with E2E on for the fleet
+# default but off for the other org, a machine in the off org must be refused.
+MACH_ORG="$ORG" MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" e2e off --org "$ORG" >/dev/null
+OUT=$(machc exec --e2e "$MACHINE" 'echo must-not-run' 2>&1) && CODE=0 || CODE=$?
+[[ "$CODE" -ne 0 ]]; check "--e2e exits rather than sending plaintext" $?
+[[ "$OUT" == *"cannot seal"* ]]; check "--e2e says why it cannot seal" $?
+grep -q must-not-run "$WORKDIR/agent1.log"; [[ $? -ne 0 ]]; check "the refused command never ran" $?
+# And with sealing off again, the fleet-wide block list is back in charge of
+# this org: the same command the placeholder hid above is refused outright now.
+OUT=$(machc exec "$MACHINE" 'echo fleet-blocked-marker' 2>&1)
+[[ "$OUT" == *"global exec policy"* ]]; check "policy governs again once sealing is off" $?
 
 step "readonly key: sees the whole fleet, runs nothing"
 curl -fsS "$BASE/v1/machines" -H "Authorization: Bearer $RO_KEY" >"$WORKDIR/ro.json"
@@ -175,6 +243,12 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/exec" \
   -H "Authorization: Bearer $RO_KEY" -H 'Content-Type: application/json' \
   -d "{\"machine\":\"$MACHINE\",\"command\":\"echo nope\"}")
 [[ "$CODE" == "403" ]]; check "readonly key cannot exec" $?
+# The streaming endpoint is command execution too. If it accepted a readonly
+# key, the scope would be decorative for anyone who knows the console exists.
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/console/stream?machine=$MACHINE" \
+  -H "Authorization: Bearer $RO_KEY" -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==')
+[[ "$CODE" == "403" ]]; check "readonly key cannot open a stream" $?
 
 step "challenge code lockout (QR flow)"
 MACH_STATE_DIR="$WORKDIR/agent3" "$WORKDIR/mach" register --server "$BASE" --org "$ORG" \

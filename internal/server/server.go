@@ -82,7 +82,13 @@ func New(st *store.Store, br *broker.Broker, org, keyPath string) *Server {
 		// volume was not mounted yet is a silent loss of a security control.
 		panic("server: " + execPolicyFileEnv + ": " + err.Error())
 	}
+	if err := validateE2EEnv(); err != nil {
+		// Same reasoning as the policy file: an unusable value must not be
+		// ignored, or the operator cannot tell an honoured setting from a typo.
+		panic("server: " + err.Error())
+	}
 	s.logExecPolicy()
+	s.logE2E()
 	// Housekeeping: purge terminal pairings hourly (keep 24h for forensics),
 	// and pick up global exec-policy edits without a restart.
 	go func() {
@@ -125,6 +131,25 @@ func (s *Server) logExecPolicy() {
 	log.Printf("server: global exec policy from %s: %s", s.execPolicy.Source(), strings.Join(rules, " "))
 }
 
+// logE2E prints the E2E posture at startup: the default, then any org that
+// differs from it, with where each came from. Logged in both states for the
+// same reason the policy is: "this control plane will refuse sealed commands"
+// is operational information, and the absence of a line saying so is how an
+// operator ends up believing the wrong thing about it.
+func (s *Server) logE2E() {
+	defMode, defSource := E2EMode(s.st, "")
+	log.Printf("server: e2e: sealed exec %s by default (%s)", defMode, defSource)
+	for _, org := range s.ListOrgs() {
+		mode, source := E2EMode(s.st, org)
+		if mode != defMode {
+			log.Printf("server: e2e: org %s: sealed exec %s (%s)", org, mode, source)
+			continue
+		}
+		// Matching the default: say so, without repeating where it came from.
+		log.Printf("server: e2e: org %s: sealed exec %s (follows the default)", org, mode)
+	}
+}
+
 // SetExecPolicy installs global exec rules at runtime and reports what is
 // active. Rules replace (never append to) the previous set.
 func (s *Server) SetExecPolicy(spec string) {
@@ -152,6 +177,9 @@ func (s *Server) Routes() http.Handler {
 
 	// Console API (mach CLI, bearer key)
 	mux.HandleFunc("GET /v1/machines", s.authConsole(s.handleMachines))
+	// E2E key distribution: consoles fetch the target machine's X25519
+	// public key (public information; still auth-scoped).
+	mux.HandleFunc("GET /v1/machines/{name}/e2epub", s.authConsole(s.handleE2EPub))
 	mux.HandleFunc("POST /v1/exec", s.authConsole(s.handleExec))
 	mux.HandleFunc("GET /v1/audit", s.authConsole(s.handleAudit))
 
@@ -161,6 +189,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok\n"))
 	})
+	// Streaming console: live output relay. authConsole
+	// works for WS too (bearer header on the upgrade request).
+	mux.HandleFunc("GET /v1/console/stream", s.authConsole(func(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
+		s.handleConsoleStreamWS(w, r, keyName, scopes)
+	}))
 	// Enrollment landing page: OS-detected agent downloads.
 	mux.HandleFunc("GET /{$}", s.handleEnrollRoot)
 	mux.HandleFunc("GET /download/{file}", s.handleAgentDownload)

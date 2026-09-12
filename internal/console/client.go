@@ -6,9 +6,10 @@ package console
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,7 +21,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bcross/mach/internal/protocol"
+	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/curve25519"
 )
 
 // Config is the console client's local config (~/.mach/console.json).
@@ -144,6 +146,16 @@ type MachineInfo struct {
 	Online    bool   `json:"online"`
 	AgentVer  string `json:"agent_version"`
 	CreatedAt string `json:"created_at"`
+	// E2E is this machine's org's E2E setting ("on"/"off"): whether the control
+	// plane will accept a sealed command for it.
+	E2E string `json:"e2e"`
+}
+
+type ExecResult struct {
+	ExitCode int    `json:"exit_code"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+	Error    string `json:"error"`
 }
 
 type auditEntry struct {
@@ -164,215 +176,333 @@ func (c *client) Machines() ([]MachineInfo, error) {
 
 // runExec is the shared one-shot path; exactly one of command/argv is set.
 //
-// The response is streamed, not buffered: the control plane relays the
-// command's output as the agent produces it, so output appears live and a
-// long-running command is watchable. The stream ends with an exit record.
-//
-// When asJSON is set, the frames are re-emitted on stdout verbatim instead of
-// being decoded into this process's output streams. See Exec for why.
-func (c *client) runExec(machine, command string, argv []string, timeout int, asJSON bool) int {
-	body := map[string]any{"machine": machine}
-	if command != "" {
-		body["command"] = command
-	} else {
-		body["argv"] = argv
+// E2E is the control plane's setting, and the console's job is to obey it:
+// /e2epub reports whether this control plane accepts sealed commands and, if
+// so, which key to seal to. The console seals when it can, and when the
+// operator explicitly asked for sealing and the server will not do it, it
+// exits with a message instead of quietly sending the command in the clear.
+// Nothing here downgrades silently — a client that thinks it is encrypting and
+// is not, is worse off than one that refuses.
+func (c *client) runExec(machine, command string, argv []string, timeout int, asJSON bool, mode E2EMode) int {
+	buildBody := func() map[string]any {
+		body := map[string]any{"machine": machine}
+		if command != "" {
+			body["command"] = command
+		} else {
+			body["argv"] = argv
+		}
+		if timeout > 0 {
+			body["timeout"] = timeout
+		}
+		return body
+	}
+
+	// E2EForbid never asks. The server's setting is irrelevant: the operator
+	// wants this command readable (by the block list, by the audit log), and
+	// plaintext is always something the server accepts.
+	if mode != E2EForbid {
+		info, err := c.machineE2EPub(machine)
+		switch {
+		case err != nil:
+			// An older control plane without the signal, or a transient failure.
+			// Sealing is not mandatory, so fall through to plaintext — unless
+			// sealing was required, in which case say why not.
+			if mode == E2ERequire {
+				fmt.Fprintln(os.Stderr, "mach: cannot seal: could not read the control plane's E2E setting ("+err.Error()+")")
+				return 3
+			}
+		case !info.Enabled:
+			if mode == E2ERequire {
+				fmt.Fprintln(os.Stderr, "mach: cannot seal: "+info.Reason)
+				return 3
+			}
+		case info.PubE2E == "":
+			// The server accepts sealed commands, but this machine never
+			// registered a key — it enrolled before E2E existed. Say so rather
+			// than letting the operator believe the command was sealed.
+			if mode == E2ERequire {
+				fmt.Fprintln(os.Stderr, "mach: cannot seal: "+machine+" has no E2E key — re-enroll it to enable E2E")
+				return 3
+			}
+			fmt.Fprintf(os.Stderr, "mach: %s has no E2E key — running in plaintext (re-enroll to enable E2E)\n", machine)
+		default:
+			if code, done := c.sealedExec(machine, command, argv, timeout, asJSON, info.PubE2E, mode); done {
+				return code
+			}
+		}
+	}
+
+	// Plaintext: what the server can read, refuse, and record in full.
+	var res ExecResult
+	if err := c.do("POST", "/v1/exec", buildBody(), &res); err != nil {
+		fmt.Fprintln(os.Stderr, "mach: "+err.Error())
+		return 3
+	}
+	return printExecResult(&res, asJSON)
+}
+
+// sealedExec sends one command as ciphertext. done is false when the caller
+// should fall back to plaintext (the server refused sealing outright and the
+// operator did not ask for sealing specifically); a command the server refused
+// before dispatch has not run anywhere, so that fallback cannot execute
+// anything twice.
+func (c *client) sealedExec(machine, command string, argv []string, timeout int, asJSON bool, e2ePub string, mode E2EMode) (code int, done bool) {
+	inner, _ := json.Marshal(map[string]any{
+		"command": command, "argv": argv,
+		"timeout": mapDefaultTimeout(timeout),
+	})
+	var consoleE2E E2EKeyPair
+	if err := consoleE2E.Generate(); err != nil {
+		fmt.Fprintln(os.Stderr, "mach: e2e: "+err.Error())
+		return 3, true
+	}
+	sealed, err := consoleE2E.Seal(e2ePub, inner)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "mach: e2e: "+err.Error())
+		return 3, true
+	}
+	body := map[string]any{
+		"machine": machine, "sealed": sealed,
+		"e2e_pub": consoleE2E.PublicKeyHex(),
 	}
 	if timeout > 0 {
 		body["timeout"] = timeout
 	}
-	raw, err := json.Marshal(body)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "mach: "+err.Error())
-		return 3
+	var wire struct {
+		ExitCode  int    `json:"exit_code"`
+		SealedB64 string `json:"sealed_b64"`
 	}
-	req, err := http.NewRequest("POST", strings.TrimRight(c.cfg.Server, "/")+"/v1/exec", bytes.NewReader(raw))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "mach: "+err.Error())
-		return 3
+	if werr := c.do("POST", "/v1/exec", body, &wire); werr != nil {
+		if mode == E2ERequire {
+			// Asked for sealing and did not get it: the command did not run
+			// (the refusal is before dispatch), so say so and stop.
+			fmt.Fprintln(os.Stderr, "mach: cannot seal: "+werr.Error())
+			return 3, true
+		}
+		// The control plane refused the sealed form — most likely the setting
+		// changed between reading it and sending. Obey the refusal (it did not
+		// dispatch anything) and retry in plaintext, saying so rather than
+		// making the downgrade invisible.
+		fmt.Fprintf(os.Stderr, "mach: sealed exec refused (%s); retrying in plaintext\n", werr.Error())
+		return 0, false
 	}
-	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/x-ndjson")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "mach: "+err.Error())
-		return 3
+	if wire.SealedB64 == "" {
+		// Output would be missing: a sealed reply is the only way this command's
+		// output comes back, so this is a failure, not a fallback.
+		fmt.Fprintln(os.Stderr, "mach: e2e: server returned no sealed reply")
+		return 3, true
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		// Failures before the command was dispatched are still plain HTTP
-		// errors with a JSON body (bad request, not scoped, blocked by
-		// policy, machine offline) — only the stream itself is NDJSON.
-		return reportHTTPError(resp)
+	opened, oerr := consoleE2E.OpenB64(wire.SealedB64)
+	if oerr != nil {
+		fmt.Fprintln(os.Stderr, "mach: e2e: failed to open sealed result ("+oerr.Error()+")")
+		return 3, true
 	}
+	var res ExecResult
+	if jerr := json.Unmarshal(opened, &res); jerr != nil {
+		fmt.Fprintln(os.Stderr, "mach: e2e: sealed result undecodable")
+		return 3, true
+	}
+	return printExecResult(&res, asJSON), true
+}
+
+// E2EMode is what the operator asked for on the command line. The default is
+// to obey the control plane's setting; the two explicit modes exist so a
+// caller can require sealing (and fail loudly if it is unavailable) or refuse
+// it (when the command should stay readable to the block list and the audit
+// log).
+type E2EMode int
+
+const (
+	E2EObey    E2EMode = iota // seal when the control plane accepts it (default)
+	E2ERequire                // --e2e: fail rather than send plaintext
+	E2EForbid                 // --no-e2e: always plaintext
+)
+
+func mapDefaultTimeout(timeout int) int {
+	if timeout > 0 {
+		return timeout
+	}
+	return 30
+}
+
+// printExecResult writes the result the way a human reads it, or — with
+// --json — as one JSON object on stdout. In JSON mode every field is labeled
+// data: a program consuming mach reads the exit status from a field rather
+// than having to interpret a mix of a byte stream and a process status.
+func printExecResult(res *ExecResult, asJSON bool) int {
 	if asJSON {
-		return relayFrames(resp.Body)
+		if b, err := json.Marshal(res); err == nil {
+			os.Stdout.Write(append(b, '\n'))
+		}
+		if res.Error != "" {
+			fmt.Fprintln(os.Stderr, "mach: "+res.Error)
+		}
+		return res.ExitCode
 	}
-	return decodeExecStream(resp.Body)
+	fmt.Print(res.Stdout)
+	if res.Stderr != "" {
+		os.Stderr.WriteString(res.Stderr)
+	}
+	if res.Error != "" {
+		fmt.Fprintln(os.Stderr, "mach: "+res.Error)
+	}
+	return res.ExitCode
 }
 
-// relayFrames copies the control plane's frames to stdout as NDJSON, one frame
-// per line, without interpreting them.
-//
-// This is the mode for a programmatic caller — an automated troubleshooter, a
-// pipeline — and it is the reason the mode exists: the frames carry an
-// explicit type and stream label, so a consumer never has to work out which
-// bytes on its stdout came from the machine and which from mach. Nothing the
-// remote command prints can change the exit status the caller reads, because
-// the status is a field on the exit frame rather than a byte offset in a text
-// stream (see decodeExecStream for the guard against forged frames).
-func relayFrames(r io.Reader) int {
-	dec := json.NewDecoder(bufio.NewReaderSize(r, 64<<10))
-	code := 3
-	for {
-		var f protocol.ExecStreamFrame
-		if err := dec.Decode(&f); err != nil {
-			if errors.Is(err, io.EOF) {
-				fmt.Fprintln(os.Stderr, "mach: stream ended without an exit status (command may still be running)")
-				return code
-			}
-			fmt.Fprintln(os.Stderr, "mach: "+err.Error())
-			return code
-		}
-		raw, err := json.Marshal(f)
-		if err != nil {
-			continue
-		}
-		os.Stdout.Write(append(raw, '\n'))
-		if f.Type == protocol.ExecStreamExit {
-			if f.Error != "" {
-				fmt.Fprintln(os.Stderr, "mach: "+f.Error)
-			}
-			if f.ExitCode != nil {
-				return *f.ExitCode
-			}
-			return 0
-		}
+// machineE2EPub reads the control plane's E2E signal for one machine: whether
+// this control plane accepts sealed exec at all, why not when it does not, and
+// the X25519 key to seal to when it does.
+func (c *client) machineE2EPub(machine string) (e2eTarget, error) {
+	var resp e2eTarget
+	if err := c.do("GET", "/v1/machines/"+url.PathEscape(machine)+"/e2epub", nil, &resp); err != nil {
+		return e2eTarget{}, err
 	}
+	return resp, nil
 }
 
-// reportHTTPError prints the control plane's error body and returns the
-// client's "could not run it" status.
-func reportHTTPError(resp *http.Response) int {
-	const maxErr = 64 << 10
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, maxErr))
-	var e struct {
-		Error string `json:"error"`
-	}
-	_ = json.Unmarshal(data, &e)
-	if e.Error != "" {
-		fmt.Fprintln(os.Stderr, "mach: "+e.Error)
-	} else {
-		fmt.Fprintf(os.Stderr, "mach: server returned %d\n", resp.StatusCode)
-	}
-	return 3
+// e2eTarget is the console's view of the same signal the server publishes.
+type e2eTarget struct {
+	Enabled bool   `json:"e2e_enabled"`
+	Mode    string `json:"e2e"`
+	Reason  string `json:"e2e_reason"`
+	Machine string `json:"machine"`
+	PubE2E  string `json:"pub_e2e"`
+	Note    string `json:"note"`
 }
 
-// decodeExecStream prints output chunks as they arrive and returns the
-// command's exit status. The exit record — not the HTTP status — is what says
-// how the command ended: output was already flowing by the time it could fail.
-//
-// Where remote bytes go, and why:
-//
-//   - stdout carries ONLY the machine's stdout, and stderr carries the
-//     machine's stderr followed by mach's own messages, which are always
-//     prefixed "mach: ". A caller that keeps the two apart therefore never
-//     has to guess which text came from the machine.
-//   - Nothing here interprets output. A command that prints a line looking
-//     like a frame, an exit status, or a mach error is relayed byte for byte
-//     and changes nothing: control facts (exit status, error) are read from
-//     typed fields on the exit frame, never from the output stream. Chunk
-//     payloads are also base64 on the wire, so output containing newlines
-//     cannot end a frame or start a new one.
-//
-// Output from a machine is data. Neither this client nor the agent treats it
-// as instructions, and a consumer of this command must not either.
-func decodeExecStream(r io.Reader) int {
-	dec := json.NewDecoder(bufio.NewReaderSize(r, 64<<10))
-	for {
-		var f protocol.ExecStreamFrame
-		err := dec.Decode(&f)
-		if errors.Is(err, io.EOF) {
-			// Ended without an exit record: the connection was cut mid-command
-			// (proxy timeout, control plane restart). The command's fate on
-			// the machine is unknown, so do not report success.
-			fmt.Fprintln(os.Stderr, "mach: stream ended without an exit status (command may still be running)")
-			return 3
-		}
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "mach: "+err.Error())
-			return 3
-		}
-		switch f.Type {
-		case protocol.ExecStreamChunk:
-			data, err := base64.StdEncoding.DecodeString(f.DataB64)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "mach: corrupt stream frame")
-				return 3
-			}
-			if f.Stream == "stderr" {
-				os.Stderr.Write(data)
-			} else {
-				os.Stdout.Write(data)
-			}
-		case protocol.ExecStreamExit:
-			if f.Error != "" {
-				fmt.Fprintln(os.Stderr, "mach: "+f.Error)
-			}
-			if f.ExitCode == nil {
-				return 0
-			}
-			return *f.ExitCode
-		default:
-			// Unknown frame type: skip it, so a newer control plane can add
-			// frames without breaking this client.
-		}
-	}
+// E2EKeyPair is the console-side ephemeral X25519 keypair for one exec.
+type E2EKeyPair struct {
+	Private [32]byte
+	Public  [32]byte
 }
 
-// Exec runs a shell-mode command (parsed once by the remote sh -c). With
-// asJSON, the control plane's stream frames are re-emitted on stdout as NDJSON
-// instead of being decoded into this process's streams.
-//
-// Use asJSON when something other than a person reads the result — an
-// automated troubleshooter, a pipeline. The frames name their type and stream
-// explicitly, so the caller gets the machine's output as labeled data with the
-// exit status as a separate field, and never has to parse a line of text to
-// find out how the command ended or which bytes came from where.
-func (c *client) Exec(machine, command string, timeout int, asJSON bool) int {
-	return c.runExec(machine, command, nil, timeout, asJSON)
+// Generate creates a fresh keypair.
+func (k *E2EKeyPair) Generate() error {
+	if _, err := rand.Read(k.Private[:]); err != nil {
+		return err
+	}
+	pub, err := curve25519.X25519(k.Private[:], curve25519.Basepoint)
+	if err != nil {
+		return err
+	}
+	copy(k.Public[:], pub)
+	return nil
+}
+
+// PublicKeyHex hex-encodes the public half.
+func (k *E2EKeyPair) PublicKeyHex() string {
+	return hex.EncodeToString(k.Public[:])
+}
+
+// Seal encrypts plaintext to a recipient X25519 public key (hex).
+func (k *E2EKeyPair) Seal(recipientPubHex string, plaintext []byte) (sealedB64Payload string, err error) {
+	pub, err := hex.DecodeString(recipientPubHex)
+	if err != nil {
+		return "", err
+	}
+	senderPub, err := curve25519.X25519(k.Private[:], curve25519.Basepoint)
+	if err != nil {
+		return "", err
+	}
+	shared, err := curve25519.X25519(k.Private[:], pub)
+	if err != nil {
+		return "", err
+	}
+	aead, err := chacha20poly1305.New(shared)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+	sealed := aead.Seal(nil, nonce, plaintext, senderPub)
+	msg := e2eWire{V: 1, Eph: base64.StdEncoding.EncodeToString(senderPub), Body: base64.StdEncoding.EncodeToString(append(nonce, sealed...))}
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(raw), nil
+}
+
+// OpenB64 opens a base64(e2e.SealedMessage JSON) with this keypair.
+func (k *E2EKeyPair) OpenB64(b64 string) ([]byte, error) {
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return nil, err
+	}
+	return e2eOpenRaw(&k.Private, raw)
+}
+
+// e2eOpenRaw decrypts a marshaled SealedMessage with the given private key.
+// (Local copy to avoid importing internal/e2e from console — the wire JSON
+// is identical: {"v":1,"eph":...,"body":...}.)
+func e2eOpenRaw(privateKey *[32]byte, sealed []byte) ([]byte, error) {
+	var msg e2eWire
+	if err := json.Unmarshal(sealed, &msg); err != nil {
+		return nil, err
+	}
+	ephPub, err := base64.StdEncoding.DecodeString(msg.Eph)
+	if err != nil || len(ephPub) != 32 {
+		return nil, fmt.Errorf("e2e: bad ephemeral key")
+	}
+	body, err := base64.StdEncoding.DecodeString(msg.Body)
+	if err != nil || len(body) < chacha20poly1305.NonceSize+16 {
+		return nil, fmt.Errorf("e2e: sealed body too short")
+	}
+	nonce, ct := body[:chacha20poly1305.NonceSize], body[chacha20poly1305.NonceSize:]
+	shared, err := curve25519.X25519(privateKey[:], ephPub)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := chacha20poly1305.New(shared)
+	if err != nil {
+		return nil, err
+	}
+	return aead.Open(nil, nonce, ct, ephPub)
+}
+
+// e2eWire mirrors e2e.SealedMessage for the console (kept in sync: v=1).
+type e2eWire struct {
+	V    int    `json:"v"`
+	Eph  string `json:"eph"`
+	Body string `json:"body"`
+}
+
+// Exec runs a shell-mode command (parsed once by the remote sh -c).
+func (c *client) Exec(machine, command string, timeout int, asJSON bool, e2e E2EMode) int {
+	return c.runExec(machine, command, nil, timeout, asJSON, e2e)
 }
 
 // ExecArgv runs in no-shell mode: each argument is delivered as its own
 // JSON string and exec'd directly on the machine — nothing parses anything,
 // so spaces, quotes, $, and newlines inside arguments survive exactly.
-func (c *client) ExecArgv(machine string, argv []string, timeout int, asJSON bool) int {
-	return c.runExec(machine, "", argv, timeout, asJSON)
+func (c *client) ExecArgv(machine string, argv []string, timeout int, asJSON bool, e2e E2EMode) int {
+	return c.runExec(machine, "", argv, timeout, asJSON, e2e)
 }
 
-// Console is the interactive mode: read lines, exec each on the machine.
-// Exit with Ctrl-D or :quit.
+// Console is the interactive mode: streams a persistent shell session
+// live over the streaming endpoint. Falls back to
+// line-based exec when the streaming endpoint is unavailable.
 //
-// Only what the operator types here is ever run. Output returned by a command
-// is printed and nothing else — it is never echoed into the input stream, and
-// no text in it can add, change, or trigger a command. A machine that prints
-// something resembling a prompt, a mach message, or an instruction is just
-// printing text.
+// Every command here goes over the streaming relay, which is plaintext by
+// design (see SECURITY-NOTES.md): the console never seals, whatever the E2E
+// setting is, because a live session is not a shape that can be sealed. A
+// caller who needs sealing needs `mach exec`.
 func (c *client) Console(machine string) int {
-	fmt.Fprintf(os.Stderr, "mach console — %s (commands run remotely; Ctrl-D to exit)\n", machine)
-	fmt.Fprintln(os.Stderr, "output from the machine is data, printed as-is; mach never acts on it")
+	fmt.Printf("mach console — %s (Ctrl-C kills the remote session; Ctrl-D exits)\n", machine)
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 1<<20), 1<<20)
 	for {
-		fmt.Fprint(os.Stderr, "mach> ")
+		fmt.Print("mach> ")
 		if !sc.Scan() {
-			fmt.Fprintln(os.Stderr)
+			fmt.Println()
 			return 0
 		}
 		line := strings.TrimSpace(sc.Text())
 		switch line {
 		case "", "help":
-			fmt.Fprintln(os.Stderr, "type a shell command; :quit or Ctrl-D to exit; :! cmd runs locally")
+			fmt.Println("type a shell command; :quit or Ctrl-D to exit; :! cmd runs locally")
 			continue
 		case ":quit", "exit":
 			return 0
@@ -381,11 +511,18 @@ func (c *client) Console(machine string) int {
 			LocalExec(strings.TrimSpace(strings.TrimPrefix(line, ":!")))
 			continue
 		}
-		code := c.Exec(machine, line, 0, false)
+		// Live streaming path.
+		code := streamConsole(c.cfg.Server, c.cfg.APIKey, machine, line)
+		if code == streamDialFailed {
+			// The stream endpoint could not be reached — an older control
+			// plane, typically. Falling back to buffered exec is safe here
+			// because nothing was dispatched. It is deliberately NOT done for a
+			// stream that died after starting: that command already ran on the
+			// machine, and replaying it would run it a second time.
+			code = c.Exec(machine, line, 0, false, E2EObey)
+		}
 		if code != 0 {
-			// stderr, not stdout: stdout belongs to the machine's output, so a
-			// caller reading stdout alone sees only what the machine printed.
-			fmt.Fprintf(os.Stderr, "[exit %d]\n", code)
+			fmt.Printf("[exit %d]\n", code)
 		}
 	}
 }

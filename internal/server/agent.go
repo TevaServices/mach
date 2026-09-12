@@ -80,12 +80,34 @@ func validPubKey(pk string) error {
 	return err
 }
 
+// validX25519Key checks an E2E public key (64 hex chars; also rejects the
+// all-zero key, which has no DH strength).
+func validX25519Key(pk string) error {
+	if len(pk) != 64 {
+		return errors.New("must be 64 hex chars (x25519)")
+	}
+	b, err := hex.DecodeString(pk)
+	if err != nil {
+		return err
+	}
+	var allZero = true
+	for _, c := range b {
+		if c != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		return errors.New("all-zero key rejected")
+	}
+	return nil
+}
+
 // ---- POST /v1/pair/status  (agent polls while waiting for approval) ----
 
 func (s *Server) handlePairStatus(w http.ResponseWriter, r *http.Request) {
-	// Bounded per IP, and generous: real agents poll every ~2s for the whole
-	// 10-minute pairing window (~300 requests), so the limit has to sit well
-	// above that or legitimate enrollment starves behind its own polling.
+	// Token lookups hash candidates per request; keep the per-IP rate
+	// bounded (generous: real agents poll every ~2s).
 	if s.pairLookups.record(s.clientIP(r)) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many requests"})
 		return
@@ -128,6 +150,14 @@ func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	// Optional E2E key: 64 hex chars when present.
+	pubE2E := strings.TrimSpace(req.PubE2E)
+	if pubE2E != "" {
+		if err := validX25519Key(pubE2E); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "pub_e2e: " + err.Error()})
+			return
+		}
+	}
 	name := strings.TrimSpace(req.Name)
 	if existing, _ := s.st.MachineByPubKey(req.PubKey); existing != nil {
 		if existing.Revoked {
@@ -145,7 +175,7 @@ func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "machine name already taken — pick a new name (e.g. " + name + "-2)"})
 		return
 	}
-	if err := s.st.CreateMachine(name, req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer); err != nil {
+	if err := s.st.CreateMachine(name, req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer, pubE2E); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
 	}
@@ -215,14 +245,9 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	resp := protocol.HelloResponse{OK: true, ServerAuth: "v1 " + base64.StdEncoding.EncodeToString(ed25519.Sign(s.serverPriv, []byte("server|"+nonce)))}
 	_ = conn.WriteEnvelope(protocol.Envelope{Type: "hello_result", Payload: mustJSON(resp)})
 
-	// Authenticated: an agent only ever sends hello, ping, exec_chunk and
-	// exec_result. The largest of those is a chunk — one flush's worth of
-	// output (8 KiB) plus at most one os/exec copy (32 KiB), base64'd to
-	// ~55 KiB — so the cap sits four times above the real maximum. It used to
-	// be 40 MiB, from when exec_result carried a whole command's output;
-	// streaming means that no longer exists, and the cap is what bounds how
-	// much a single agent connection can make this server allocate at once.
-	ws.SetReadLimit(256 << 10)
+	// Authenticated: exec_result frames carry up to 2×8 MiB of output plus
+	// JSON overhead; raise the frame cap accordingly.
+	ws.SetReadLimit(40 << 20)
 
 	ac := &broker.AgentConn{Name: machine.Name, Conn: conn, LastSeen: time.Now(), Hostname: hr.Hostname, OS: hr.OS, Arch: hr.Arch, AgentVer: hr.AgentVer}
 	s.br.Add(ac)
@@ -251,10 +276,19 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		switch env.Type {
-		case "exec_chunk":
-			s.streamChunk(env, machine.Name)
 		case "exec_result":
 			s.completeExec(env, machine.Name)
+		case "stream_out", "stream_end":
+			// A streaming console session's output, tagged with the session ID
+			// the console's handler put on the frame. Routed only when the
+			// session is bound to *this* machine: the session ID is random, but
+			// a machine must not be able to write output into a session it does
+			// not own.
+			if t := s.br.StreamTarget(env.ReqID); t != nil && t.Name == machine.Name {
+				s.br.SendToStream(env.ReqID, env)
+			} else {
+				s.logf("agent %q sent a stream frame for an unbound session", machine.Name)
+			}
 		case "ping":
 			_ = conn.WriteEnvelope(protocol.Envelope{Type: "pong"})
 		default:
@@ -304,6 +338,13 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key does not match pairing"})
 		return
 	}
+	pubE2E := strings.TrimSpace(req.PubE2E)
+	if pubE2E != "" {
+		if err := validX25519Key(pubE2E); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "pub_e2e: " + err.Error()})
+			return
+		}
+	}
 	state := s.st.PairingState(p)
 	if state != "approved" {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "pairing not approved (state: " + state + ")"})
@@ -313,7 +354,7 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": existing.Name, "server_key": s.serverKeyHex})
 		return
 	}
-	ok, err := s.st.ConsumePairing(p)
+	ok, err := s.st.ConsumePairing(p, pubE2E)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
@@ -326,131 +367,67 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": p.Name, "server_key": s.serverKeyHex})
 }
 
-// ---- exec streaming and completion (called from the agent pump above) ----
+// ---- exec completion (called from the agent pump above) ----
 
-const (
-	// execOutChanBuf bounds the chunks buffered for one exec while it waits
-	// for the console to read them. Beyond it chunks are dropped and the
-	// console is told, rather than blocking the agent's frame pump — which
-	// serves every other exec on that machine connection too.
-	execOutChanBuf = 512
-
-	// auditHeadBytes is how much of each output stream is kept for the audit
-	// row (the store trims further, to 4096 bytes, on insert).
-	auditHeadBytes = 8 << 10
-
-	// execWriteTimeout bounds one write of a stream frame to a console.
-	execWriteTimeout = 60 * time.Second
-)
-
-// pendingExec is one in-flight command: the live output channel the console
-// reads, and the head of that output kept for the audit row it will leave.
 type pendingExec struct {
-	ch      chan execOutcome        // terminal result (buffered: never blocks the pump)
-	out     chan protocol.ExecChunk // live output, consumed by the HTTP handler
+	ch      chan execReply
 	machine string
 	command string
 	source  string
-
-	// Owned by the agent pump, read by the HTTP handler once the terminal
-	// result has been delivered (the channel send orders the two).
-	mu        sync.Mutex
-	stdout    []byte
-	stderr    []byte
-	truncated bool // output dropped here: the console was too slow
-}
-
-// execOutcome is the terminal state delivered on pendingExec.ch.
-type execOutcome struct {
-	res       protocol.ExecResult
-	stdout    string
-	stderr    string
-	truncated bool
-}
-
-func (pe *pendingExec) appendOut(stream string, data []byte) {
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-	dst := &pe.stdout
-	if stream == "stderr" {
-		dst = &pe.stderr
-	}
-	if room := auditHeadBytes - len(*dst); room > 0 {
-		if len(data) > room {
-			data = data[:room] // the store trims to a rune boundary on insert
-		}
-		*dst = append(*dst, data...)
-	}
-}
-
-func (pe *pendingExec) markTruncated() {
-	pe.mu.Lock()
-	pe.truncated = true
-	pe.mu.Unlock()
-}
-
-func (pe *pendingExec) outcome(res protocol.ExecResult) execOutcome {
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-	return execOutcome{res: res, stdout: string(pe.stdout), stderr: string(pe.stderr), truncated: pe.truncated}
-}
-
-// pendingFor resolves a frame from a machine to its pending exec. An exec may
-// only be streamed or completed by the machine it was dispatched to: without
-// that check, any other enrolled machine could inject output into (or end) a
-// command it was never sent.
-func (s *Server) pendingFor(reqID, fromMachine string) *pendingExec {
-	s.pendMu.Lock()
-	defer s.pendMu.Unlock()
-	pe, ok := s.pending[reqID]
-	if !ok || pe.machine != fromMachine {
-		return nil
-	}
-	return pe
-}
-
-// streamChunk relays one piece of a running command's output to the console.
-// Called from the agent pump, so it must never block.
-func (s *Server) streamChunk(env protocol.Envelope, fromMachine string) {
-	var ch protocol.ExecChunk
-	if err := json.Unmarshal(env.Payload, &ch); err != nil {
-		return
-	}
-	if ch.Stream != "stdout" && ch.Stream != "stderr" {
-		// Relay only the two streams the console knows. An agent must not be
-		// able to invent a third label and have it echoed to a client.
-		return
-	}
-	data, err := base64.StdEncoding.DecodeString(ch.DataB64)
-	if err != nil {
-		return
-	}
-	pe := s.pendingFor(env.ReqID, fromMachine)
-	if pe == nil {
-		return // unknown exec, or one dispatched to a different machine
-	}
-	pe.appendOut(ch.Stream, data)
-	select {
-	case pe.out <- ch:
-	default:
-		pe.markTruncated()
-	}
 }
 
 func (s *Server) completeExec(env protocol.Envelope, fromMachine string) {
 	var res protocol.ExecResult
-	if err := json.Unmarshal(env.Payload, &res); err != nil {
-		res = protocol.ExecResult{Error: "bad exec_result payload", ExitCode: -1}
-	}
-	pe := s.pendingFor(env.ReqID, fromMachine)
-	if pe == nil {
-		return
+	var sealed string
+	// Sealed reply (E2E): {"sealed_b64": "..."} — plaintext otherwise.
+	var sealedMsg protocol.SealedExecResult
+	if json.Unmarshal(env.Payload, &sealedMsg) == nil && sealedMsg.SealedB64 != "" {
+		sealed = sealedMsg.SealedB64
+	} else if err := json.Unmarshal(env.Payload, &res); err != nil {
+		res = protocol.ExecResult{Error: "bad exec_result payload"}
 	}
 	s.pendMu.Lock()
-	delete(s.pending, env.ReqID)
-	s.pendMu.Unlock()
-	select {
-	case pe.ch <- pe.outcome(res):
-	default:
+	pe, ok := s.pending[env.ReqID]
+	if ok && pe.machine != fromMachine {
+		// Only the machine the exec was dispatched to may complete it.
+		ok = false
 	}
+	if ok {
+		delete(s.pending, env.ReqID)
+	}
+	s.pendMu.Unlock()
+	if ok {
+		select {
+		case pe.ch <- execReply{Result: res, Sealed: sealed}:
+		default:
+		}
+	}
+}
+
+// authFailures tracks failed console-auth attempts per IP for rate limiting.
+type authLimiter struct {
+	mu    sync.Mutex
+	fails map[string][]time.Time
+}
+
+func (a *authLimiter) tooMany(ip string) bool {
+	now := time.Now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.fails == nil {
+		a.fails = map[string][]time.Time{}
+	}
+	times := a.fails[ip][:0]
+	for _, t := range a.fails[ip] {
+		if now.Sub(t) < 10*time.Minute {
+			times = append(times, t)
+		}
+	}
+	if len(times) >= 20 {
+		a.fails[ip] = times
+		return true
+	}
+	times = append(times, now)
+	a.fails[ip] = times
+	return false
 }

@@ -1,6 +1,8 @@
 // Package store implements the control plane's persistence: machines,
-// API keys, pairing sessions, and the command audit log, in SQLite
-// (pure-Go driver, single file, WAL mode).
+// API keys, pairing sessions, and the command audit log. SQLite (pure-Go
+// driver, single file, WAL mode) is the default; a postgres:// DSN swaps in
+// Postgres for fleets that outgrow a single writer. One schema, one set of
+// statements, translated per driver.
 package store
 
 import (
@@ -12,24 +14,54 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
 
 type Store struct {
-	db *sql.DB
+	db    *sql.DB
+	known string // "sqlite" or "postgres" — feature gating is driver-neutral
 }
 
+// Open opens the store. DSN forms:
+//   - filesystem path (e.g. /data/mach.db) → SQLite, WAL, busy_timeout 5s
+//   - postgres:// or postgresql:// URL      → Postgres (multi-writer-ready;
+//     identical schema via the same migration SQL)
+//
+// Postgres support removes the single-writer limitation for larger fleets;
+// the schema is deliberately portable (AUTOINCREMENT-free, TEXT timestamps).
 func Open(path string) (*Store, error) {
+	if strings.HasPrefix(path, "postgres://") || strings.HasPrefix(path, "postgresql://") {
+		db, err := sql.Open("pgx", path)
+		if err != nil {
+			return nil, err
+		}
+		db.SetMaxOpenConns(25)
+		s := &Store{db: db, known: "postgres"}
+		if err := s.migrate(); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("postgres migrate: %w", err)
+		}
+		if err := s.verifySchema(); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("postgres schema: %w", err)
+		}
+		return s, nil
+	}
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{db: db}
+	// WAL allows concurrent readers alongside the single writer; cap
+	// connections so writes serialize predictably in-process.
+	db.SetMaxOpenConns(1)
+	s := &Store{db: db, known: "sqlite"}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -41,12 +73,28 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
+// Known reports the backing driver ("sqlite" or "postgres").
+func (s *Store) Known() string { return s.known }
+
 func (s *Store) Close() error { return s.db.Close() }
 
-func (s *Store) migrate() error {
-	_, err := s.db.Exec(`
-CREATE TABLE IF NOT EXISTS machines (
-	id INTEGER PRIMARY KEY,
+// idColumn is the auto-assigning primary key for each driver. SQLite's
+// INTEGER PRIMARY KEY is a rowid alias that fills itself in; Postgres needs
+// BIGSERIAL for the same behavior. Everything else about the schema is shared,
+// so the statements below are written once.
+func (s *Store) idColumn() string {
+	if s.known == "postgres" {
+		return "BIGSERIAL PRIMARY KEY"
+	}
+	return "INTEGER PRIMARY KEY"
+}
+
+// schemaSQL is the whole schema, written once for both drivers. Every id
+// column is filled in from idColumn(): the two drivers spell "an integer
+// primary key that assigns itself" differently, and that is the only
+// difference between them.
+const schemaSQL = `CREATE TABLE IF NOT EXISTS machines (
+	id {{ID}},
 	name TEXT NOT NULL UNIQUE,
 	pubkey TEXT NOT NULL UNIQUE,
 	hostname TEXT DEFAULT '',
@@ -54,10 +102,11 @@ CREATE TABLE IF NOT EXISTS machines (
 	arch TEXT DEFAULT '',
 	agent_version TEXT DEFAULT '',
 	created_at TEXT NOT NULL,
-	revoked INTEGER DEFAULT 0
+	revoked INTEGER DEFAULT 0,
+	pub_e2e TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS api_keys (
-	id INTEGER PRIMARY KEY,
+	id {{ID}},
 	name TEXT NOT NULL,
 	salt TEXT NOT NULL,
 	key_lookup TEXT NOT NULL UNIQUE,
@@ -84,7 +133,7 @@ CREATE TABLE IF NOT EXISTS pairings (
 	consumed INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS audit (
-	id INTEGER PRIMARY KEY,
+	id {{ID}},
 	ts TEXT NOT NULL,
 	machine TEXT NOT NULL,
 	command TEXT NOT NULL,
@@ -103,8 +152,87 @@ CREATE TABLE IF NOT EXISTS pending_updates (
 	sig_b64 TEXT NOT NULL,
 	created_at TEXT NOT NULL
 );
-`)
+CREATE TABLE IF NOT EXISTS settings (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+`
+
+func (s *Store) migrate() error {
+	_, err := s.exec(strings.ReplaceAll(schemaSQL, "{{ID}}", s.idColumn()))
 	return err
+}
+
+// ---- placeholder and connection plumbing ----
+//
+// Statements are written once in the "?" form and translated for the driver,
+// rather than maintained twice: two copies of every query is how the two
+// dialects drift apart. Postgres (pgx) takes positional parameters, sqlite
+// takes "?".
+
+// rebind rewrites ? placeholders to $1, $2 … for Postgres. A ? inside a quoted
+// literal or identifier is left alone: it is data, not a parameter.
+func (s *Store) rebind(q string) string {
+	if s.known != "postgres" || !strings.ContainsRune(q, '?') {
+		return q
+	}
+	var b strings.Builder
+	b.Grow(len(q) + 8)
+	n := 0
+	var quote byte
+	for i := 0; i < len(q); i++ {
+		c := q[i]
+		switch {
+		case quote != 0:
+			b.WriteByte(c)
+			if c == quote {
+				// '' inside a literal is an escaped quote, not the end of it.
+				if i+1 < len(q) && q[i+1] == quote {
+					b.WriteByte(q[i+1])
+					i++
+					continue
+				}
+				quote = 0
+			}
+		case c == '\'' || c == '"':
+			quote = c
+			b.WriteByte(c)
+		case c == '?':
+			n++
+			b.WriteString("$" + strconv.Itoa(n))
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+func (s *Store) exec(q string, args ...any) (sql.Result, error) {
+	return s.db.Exec(s.rebind(q), args...)
+}
+
+func (s *Store) query(q string, args ...any) (*sql.Rows, error) {
+	return s.db.Query(s.rebind(q), args...)
+}
+
+func (s *Store) queryRow(q string, args ...any) *sql.Row {
+	return s.db.QueryRow(s.rebind(q), args...)
+}
+
+// storeTx is a transaction with the same placeholder translation, so a query
+// written for one driver runs on both inside and outside a transaction.
+type storeTx struct {
+	tx *sql.Tx
+	s  *Store
+}
+
+func (t *storeTx) exec(q string, args ...any) (sql.Result, error) {
+	return t.tx.Exec(t.s.rebind(q), args...)
+}
+
+func (t *storeTx) queryRow(q string, args ...any) *sql.Row {
+	return t.tx.QueryRow(t.s.rebind(q), args...)
 }
 
 // verifySchema refuses to run against a database created by an earlier
@@ -132,7 +260,14 @@ func (s *Store) verifySchema() error {
 }
 
 func (s *Store) tableColumns(table string) (map[string]bool, error) {
-	rows, err := s.db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	// SQLite answers from pragma_table_info; Postgres from information_schema.
+	// Both report on the table the connection would actually use.
+	q := `SELECT name FROM pragma_table_info(?)`
+	if s.known == "postgres" {
+		q = `SELECT column_name FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = ?`
+	}
+	rows, err := s.query(q, table)
 	if err != nil {
 		return nil, err
 	}
@@ -259,20 +394,21 @@ type Machine struct {
 	AgentVer  string
 	CreatedAt string
 	Revoked   bool
+	PubE2E    string // X25519 public key (hex) for E2E exec encryption
 }
 
-func (s *Store) CreateMachine(name, pubkey, hostname, os, arch, agentVer string) error {
-	_, err := s.db.Exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at)
-		VALUES (?,?,?,?,?,?,?)`, name, pubkey, hostname, os, arch, agentVer, now())
+func (s *Store) CreateMachine(name, pubkey, hostname, os, arch, agentVer, pubE2E string) error {
+	_, err := s.exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at, pub_e2e)
+		VALUES (?,?,?,?,?,?,?,?)`, name, pubkey, hostname, os, arch, agentVer, now(), pubE2E)
 	return err
 }
 
-const machineCols = `id, name, pubkey, hostname, os, arch, agent_version, created_at, revoked`
+const machineCols = `id, name, pubkey, hostname, os, arch, agent_version, created_at, revoked, pub_e2e`
 
 func scanMachine(row interface{ Scan(...any) error }) (*Machine, error) {
 	m := &Machine{}
 	var revoked int
-	err := row.Scan(&m.ID, &m.Name, &m.PubKey, &m.Hostname, &m.OS, &m.Arch, &m.AgentVer, &m.CreatedAt, &revoked)
+	err := row.Scan(&m.ID, &m.Name, &m.PubKey, &m.Hostname, &m.OS, &m.Arch, &m.AgentVer, &m.CreatedAt, &revoked, &m.PubE2E)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -284,15 +420,15 @@ func scanMachine(row interface{ Scan(...any) error }) (*Machine, error) {
 }
 
 func (s *Store) MachineByName(name string) (*Machine, error) {
-	return scanMachine(s.db.QueryRow(`SELECT `+machineCols+` FROM machines WHERE name = ?`, name))
+	return scanMachine(s.queryRow(`SELECT `+machineCols+` FROM machines WHERE name = ?`, name))
 }
 
 func (s *Store) MachineByPubKey(pubkey string) (*Machine, error) {
-	return scanMachine(s.db.QueryRow(`SELECT `+machineCols+` FROM machines WHERE pubkey = ?`, pubkey))
+	return scanMachine(s.queryRow(`SELECT `+machineCols+` FROM machines WHERE pubkey = ?`, pubkey))
 }
 
 func (s *Store) ListMachines() ([]Machine, error) {
-	rows, err := s.db.Query(`SELECT ` + machineCols + ` FROM machines ORDER BY name`)
+	rows, err := s.query(`SELECT ` + machineCols + ` FROM machines ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -310,20 +446,20 @@ func (s *Store) ListMachines() ([]Machine, error) {
 
 // UpdateMachineMeta refreshes runtime metadata reported at agent connect.
 func (s *Store) UpdateMachineMeta(id int64, hostname, os, arch, agentVer string) error {
-	_, err := s.db.Exec(`UPDATE machines SET hostname=?, os=?, arch=?, agent_version=? WHERE id=?`,
+	_, err := s.exec(`UPDATE machines SET hostname=?, os=?, arch=?, agent_version=? WHERE id=?`,
 		hostname, os, arch, agentVer, id)
 	return err
 }
 
 // RemoveMachine deletes an enrolled machine row by name.
 func (s *Store) RemoveMachine(name string) error {
-	_, err := s.db.Exec(`DELETE FROM machines WHERE name=?`, name)
+	_, err := s.exec(`DELETE FROM machines WHERE name=?`, name)
 	return err
 }
 
 // RevokeMachine marks a machine revoked; agents self-retire on seeing it.
 func (s *Store) RevokeMachine(name string) error {
-	_, err := s.db.Exec(`UPDATE machines SET revoked=1 WHERE name=?`, name)
+	_, err := s.exec(`UPDATE machines SET revoked=1 WHERE name=?`, name)
 	return err
 }
 
@@ -341,18 +477,19 @@ func (s *Store) RevokeMachine(name string) error {
 // operator's fleet, not a property of the machine row. Purging it is a
 // separate, explicit act (RemoveMachineAudit).
 func (s *Store) DeleteMachine(name string) error {
-	tx, err := s.db.Begin()
+	sqltx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`DELETE FROM pending_updates WHERE machine=?`, name); err != nil {
+	tx := &storeTx{tx: sqltx, s: s}
+	defer sqltx.Rollback()
+	if _, err := tx.exec(`DELETE FROM pending_updates WHERE machine=?`, name); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM machines WHERE name=?`, name); err != nil {
+	if _, err := tx.exec(`DELETE FROM machines WHERE name=?`, name); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return sqltx.Commit()
 }
 
 // ---- API keys ----
@@ -361,7 +498,7 @@ func (s *Store) DeleteMachine(name string) error {
 // "readonly" = machines + audit only; "enroll" = API-key enrollment only.
 func (s *Store) CreateAPIKey(name, key, scopes string) error {
 	salt := randHex(16)
-	_, err := s.db.Exec(`INSERT INTO api_keys (name, salt, key_lookup, key_hash, scopes, created_at) VALUES (?,?,?,?,?,?)`,
+	_, err := s.exec(`INSERT INTO api_keys (name, salt, key_lookup, key_hash, scopes, created_at) VALUES (?,?,?,?,?,?)`,
 		name, salt, LookupHash(key), HashKey(key, salt), scopes, now())
 	return err
 }
@@ -373,7 +510,7 @@ func (s *Store) CreateAPIKey(name, key, scopes string) error {
 func (s *Store) APIKeyExists(key string) (ok bool, keyName, scopes string, err error) {
 	var name, salt, keyHash, scopesCol string
 	var revoked int
-	err = s.db.QueryRow(`SELECT name, salt, key_hash, scopes, revoked FROM api_keys WHERE key_lookup = ?`,
+	err = s.queryRow(`SELECT name, salt, key_hash, scopes, revoked FROM api_keys WHERE key_lookup = ?`,
 		LookupHash(key)).Scan(&name, &salt, &keyHash, &scopesCol, &revoked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, "", "", nil
@@ -429,7 +566,7 @@ func (s *Store) CreatePairing(pubkey, hostname, os, arch, agentVer string, ttl t
 	token = randHex(32) // 256-bit one-time bearer token in the QR URL
 	code = NewChallengeCode()
 	codeSalt := randHex(16)
-	_, err = s.db.Exec(`INSERT INTO pairings (id, token_hash, pubkey, hostname, os, arch, agent_version, code_hash, code_salt, state, created_at, expires_at)
+	_, err = s.exec(`INSERT INTO pairings (id, token_hash, pubkey, hostname, os, arch, agent_version, code_hash, code_salt, state, created_at, expires_at)
 		VALUES (?,?,?,?,?,?,?,?,?,'pending',?,?)`,
 		id, LookupHash(token), pubkey, hostname, os, arch, agentVer,
 		HashSecret(code, codeSalt), codeSalt, now(),
@@ -447,7 +584,7 @@ func (s *Store) CreatePairing(pubkey, hostname, os, arch, agentVer string, ttl t
 // transition (expired/denied/approved), not a blind 404.
 func (s *Store) PairingByToken(token string) (*Pairing, error) {
 	var id string
-	err := s.db.QueryRow(`SELECT id FROM pairings WHERE token_hash = ?`, LookupHash(token)).Scan(&id)
+	err := s.queryRow(`SELECT id FROM pairings WHERE token_hash = ?`, LookupHash(token)).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -458,7 +595,7 @@ func (s *Store) PairingByToken(token string) (*Pairing, error) {
 }
 
 func (s *Store) pairingByID(id string) (*Pairing, error) {
-	return scanPairing(s.db.QueryRow(`SELECT `+pairingCols+` FROM pairings WHERE id = ?`, id))
+	return scanPairing(s.queryRow(`SELECT `+pairingCols+` FROM pairings WHERE id = ?`, id))
 }
 
 // ExpireIfStale marks a pairing expired if past its expiry. Always re-reads
@@ -470,7 +607,7 @@ func (s *Store) PairingState(p *Pairing) string {
 	}
 	if p.State == "pending" {
 		if exp, err := time.Parse(time.RFC3339, p.ExpiresAt); err == nil && time.Now().UTC().After(exp) {
-			s.db.Exec(`UPDATE pairings SET state='expired' WHERE id=? AND state='pending'`, p.ID)
+			s.exec(`UPDATE pairings SET state='expired' WHERE id=? AND state='pending'`, p.ID)
 			p.State = "expired"
 		}
 	}
@@ -480,7 +617,7 @@ func (s *Store) PairingState(p *Pairing) string {
 // RecordPairingAttempt bumps the wrong-code counter. Returns false when the
 // pairing has burned its attempts (auto-expire).
 func (s *Store) RecordPairingAttempt(pairID string, max int) (ok bool, err error) {
-	res, err := s.db.Exec(`UPDATE pairings SET code_attempts = code_attempts + 1 WHERE id=?`, pairID)
+	res, err := s.exec(`UPDATE pairings SET code_attempts = code_attempts + 1 WHERE id=?`, pairID)
 	if err != nil {
 		return false, err
 	}
@@ -489,11 +626,11 @@ func (s *Store) RecordPairingAttempt(pairID string, max int) (ok bool, err error
 		return false, nil
 	}
 	var attempts int
-	if err := s.db.QueryRow(`SELECT code_attempts FROM pairings WHERE id=?`, pairID).Scan(&attempts); err != nil {
+	if err := s.queryRow(`SELECT code_attempts FROM pairings WHERE id=?`, pairID).Scan(&attempts); err != nil {
 		return false, err
 	}
 	if attempts >= max {
-		s.db.Exec(`UPDATE pairings SET state='expired' WHERE id=? AND state='pending'`, pairID)
+		s.exec(`UPDATE pairings SET state='expired' WHERE id=? AND state='pending'`, pairID)
 		return false, nil
 	}
 	return true, nil
@@ -501,7 +638,7 @@ func (s *Store) RecordPairingAttempt(pairID string, max int) (ok bool, err error
 
 func (s *Store) ApprovePairing(pairID, code, name string) (bool, string, error) {
 	var codeHash, codeSalt, state string
-	err := s.db.QueryRow(`SELECT code_hash, code_salt, state FROM pairings WHERE id = ?`, pairID).Scan(&codeHash, &codeSalt, &state)
+	err := s.queryRow(`SELECT code_hash, code_salt, state FROM pairings WHERE id = ?`, pairID).Scan(&codeHash, &codeSalt, &state)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, "not found", nil
 	}
@@ -516,7 +653,7 @@ func (s *Store) ApprovePairing(pairID, code, name string) (bool, string, error) 
 	}
 	// Guard on state: a concurrent DenyPairing must win over this approve —
 	// never resurrect a denied pairing.
-	res, err := s.db.Exec(`UPDATE pairings SET state='approved', name=? WHERE id=? AND state='pending'`, name, pairID)
+	res, err := s.exec(`UPDATE pairings SET state='approved', name=? WHERE id=? AND state='pending'`, name, pairID)
 	if err != nil {
 		return false, "", err
 	}
@@ -530,7 +667,7 @@ func (s *Store) ApprovePairing(pairID, code, name string) (bool, string, error) 
 // DenyPairing transitions pending → denied. changed=false means the pairing
 // was already in another state (the caller should re-read and show it).
 func (s *Store) DenyPairing(pairID string) (changed bool, err error) {
-	res, err := s.db.Exec(`UPDATE pairings SET state='denied' WHERE id=? AND state='pending'`, pairID)
+	res, err := s.exec(`UPDATE pairings SET state='denied' WHERE id=? AND state='pending'`, pairID)
 	if err != nil {
 		return false, err
 	}
@@ -544,13 +681,14 @@ func (s *Store) DenyPairing(pairID string) (changed bool, err error) {
 // the pairing stays un-consumed and claimable/inspectable instead of being
 // permanently burned. Returns ok=false if it was already consumed or is no
 // longer approved.
-func (s *Store) ConsumePairing(p *Pairing) (bool, error) {
-	tx, err := s.db.Begin()
+func (s *Store) ConsumePairing(p *Pairing, pubE2E string) (bool, error) {
+	sqltx, err := s.db.Begin()
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback()
-	res, err := tx.Exec(`UPDATE pairings SET consumed=1 WHERE id=? AND consumed=0 AND state='approved'`, p.ID)
+	tx := &storeTx{tx: sqltx, s: s}
+	defer sqltx.Rollback()
+	res, err := tx.exec(`UPDATE pairings SET consumed=1 WHERE id=? AND consumed=0 AND state='approved'`, p.ID)
 	if err != nil {
 		return false, err
 	}
@@ -561,13 +699,13 @@ func (s *Store) ConsumePairing(p *Pairing) (bool, error) {
 	if n == 0 {
 		return false, nil
 	}
-	if _, err := tx.Exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at)
-		VALUES (?,?,?,?,?,?,?)`, p.Name, p.PubKey, p.Hostname, p.OS, p.Arch, p.AgentVer, now()); err != nil {
+	if _, err := tx.exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at, pub_e2e)
+		VALUES (?,?,?,?,?,?,?,?)`, p.Name, p.PubKey, p.Hostname, p.OS, p.Arch, p.AgentVer, now(), pubE2E); err != nil {
 		// consumed=1 rolls back with the transaction: the pairing survives
 		// and the agent surfaces the error (usually a name conflict).
 		return false, err
 	}
-	return true, tx.Commit()
+	return true, sqltx.Commit()
 }
 
 // CleanupExpiredPairings deletes terminal-state pairings older than maxAge.
@@ -583,7 +721,7 @@ func (s *Store) CleanupExpiredPairings(maxAge time.Duration) (int64, error) {
 	nowT := time.Now().UTC()
 	createdCutoff := nowT.Add(-maxAge).Format(time.RFC3339)
 	expiryCutoff := nowT.Add(-maxAge).Format(time.RFC3339)
-	res, err := s.db.Exec(`DELETE FROM pairings
+	res, err := s.exec(`DELETE FROM pairings
 		WHERE (state IN ('expired','denied','approved') OR consumed=1) AND created_at < ?
 		   OR (state = 'pending' AND expires_at < ?)`,
 		createdCutoff, expiryCutoff)
@@ -632,8 +770,57 @@ func RedactScrubs(s string) string {
 	return secretPattern.ReplaceAllString(s, "$1=[REDACTED]")
 }
 
+// Setting reads a control-plane setting. An absent key is not an error: it
+// means "never set", and the caller's default applies.
+func (s *Store) Setting(key string) (string, error) {
+	var v string
+	err := s.queryRow(`SELECT value FROM settings WHERE key=?`, key).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return v, nil
+}
+
+// SetSetting writes a control-plane setting, replacing any previous value.
+// The upsert is spelled the same way for both drivers (SQLite 3.24+ and
+// Postgres agree on ON CONFLICT ... DO UPDATE).
+func (s *Store) SetSetting(key, value string) error {
+	_, err := s.exec(`INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+		key, value, now())
+	return err
+}
+
+// DeleteSetting removes a setting so the caller's default applies again.
+// Deleting an absent row is not an error: the caller asked for the same thing.
+func (s *Store) DeleteSetting(key string) error {
+	_, err := s.exec(`DELETE FROM settings WHERE key=?`, key)
+	return err
+}
+
+// Settings returns every setting, for an operator-facing dump.
+func (s *Store) Settings() (map[string]string, error) {
+	rows, err := s.query(`SELECT key, value FROM settings`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, err
+		}
+		out[k] = v
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) AuditInsert(ts, machine, command, source string, exitCode sql.NullInt64, stdout, stderr string) error {
-	_, err := s.db.Exec(`INSERT INTO audit (ts, machine, command, source, exit_code, stdout_snip, stderr_snip)
+	_, err := s.exec(`INSERT INTO audit (ts, machine, command, source, exit_code, stdout_snip, stderr_snip)
 		VALUES (?,?,?,?,?,?,?)`, ts, machine, snippet(RedactScrubs(command), 4096), source, exitCode,
 		snippet(RedactScrubs(stdout), 4096), snippet(RedactScrubs(stderr), 4096))
 	return err
@@ -648,7 +835,7 @@ func (s *Store) AuditList(machine string, limit int) ([]AuditEntry, error) {
 	}
 	q += ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limit)
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -666,7 +853,7 @@ func (s *Store) AuditList(machine string, limit int) ([]AuditEntry, error) {
 
 // RemoveMachineAudit purges audit rows for a machine (revocation hygiene).
 func (s *Store) RemoveMachineAudit(machine string) error {
-	_, err := s.db.Exec(`DELETE FROM audit WHERE machine=?`, machine)
+	_, err := s.exec(`DELETE FROM audit WHERE machine=?`, machine)
 	return err
 }
 
@@ -674,7 +861,7 @@ func (s *Store) RemoveMachineAudit(machine string) error {
 
 // QueueUpdate stores a signed update manifest for a machine.
 func (s *Store) QueueUpdate(machine, version, sha256Hex, url, dataB64, sigB64 string) error {
-	_, err := s.db.Exec(`INSERT INTO pending_updates (machine, version, sha256, url, data_b64, sig_b64, created_at)
+	_, err := s.exec(`INSERT INTO pending_updates (machine, version, sha256, url, data_b64, sig_b64, created_at)
 		VALUES (?,?,?,?,?,?,?) ON CONFLICT(machine) DO UPDATE SET
 		version=excluded.version, sha256=excluded.sha256, url=excluded.url,
 		data_b64=excluded.data_b64, sig_b64=excluded.sig_b64, created_at=excluded.created_at`,
@@ -684,7 +871,7 @@ func (s *Store) QueueUpdate(machine, version, sha256Hex, url, dataB64, sigB64 st
 
 // PendingUpdate returns and clears the queued update for a machine.
 func (s *Store) PopPendingUpdate(machine string) (version, sha256Hex, url, dataB64, sigB64 string, ok bool, err error) {
-	row := s.db.QueryRow(`SELECT version, sha256, url, data_b64, sig_b64 FROM pending_updates WHERE machine=?`, machine)
+	row := s.queryRow(`SELECT version, sha256, url, data_b64, sig_b64 FROM pending_updates WHERE machine=?`, machine)
 	err = row.Scan(&version, &sha256Hex, &url, &dataB64, &sigB64)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", "", "", "", "", false, nil
@@ -694,6 +881,6 @@ func (s *Store) PopPendingUpdate(machine string) (version, sha256Hex, url, dataB
 	}
 	// Clear after successful handoff (agent acks by reconnecting with the
 	// new version; a failed apply re-pushes on next admin command).
-	_, err = s.db.Exec(`DELETE FROM pending_updates WHERE machine=?`, machine)
+	_, err = s.exec(`DELETE FROM pending_updates WHERE machine=?`, machine)
 	return version, sha256Hex, url, dataB64, sigB64, err == nil, err
 }

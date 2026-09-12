@@ -135,6 +135,149 @@ func AddAPIKey(name, scopes string) (string, error) {
 	return key, nil
 }
 
+// E2E reports or changes the control plane's end-to-end-encryption setting:
+// whether it accepts sealed (E2E) exec commands, per org.
+//
+//	set is "" (report only), "on", "off", or "inherit" (drop an org's override
+//	so it follows the default again). org is "" for the default row.
+//
+// It writes the same rows the running server reads, and reports the same
+// effective values the server will use, so the command cannot describe a
+// posture the control plane does not actually hold — including when MACH_E2E is
+// set and therefore overrides whatever was just written.
+func E2E(set, org string) error {
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	if org != "" && !validOrgLabel(org) {
+		return fmt.Errorf("%q is not a valid org label", org)
+	}
+	if set != "" && set != "inherit" && org == "" &&
+		(strings.ToLower(strings.TrimSpace(set)) == "on" || strings.ToLower(strings.TrimSpace(set)) == "off") {
+		fmt.Println("note: no --org given: this sets the default for every org without its own setting")
+	}
+
+	switch strings.ToLower(strings.TrimSpace(set)) {
+	case "":
+	case "inherit":
+		if org == "" {
+			return fmt.Errorf("inherit needs --org: there is nothing to inherit from for the default")
+		}
+		if err := server.ClearE2E(st, org); err != nil {
+			return err
+		}
+		fmt.Printf("org %s: override removed; it follows the default again\n", org)
+	case "on", "off":
+		on := strings.ToLower(strings.TrimSpace(set)) == "on"
+		if err := server.SetE2E(st, org, on); err != nil {
+			return err
+		}
+		if org == "" {
+			fmt.Printf("stored: sealed exec %s for every org without its own setting\n", set)
+		} else {
+			fmt.Printf("stored: sealed exec %s for org %s\n", set, org)
+		}
+	default:
+		return fmt.Errorf("usage: mach-server e2e [on|off|inherit] [--org ORG] (got %q)", set)
+	}
+
+	printE2EReport(st, org)
+	return nil
+}
+
+// printE2EReport prints the effective setting and where it came from. With an
+// org, only that org; otherwise the default plus every org this shell knows
+// about (MACH_ORG / MACH_ORGS) and every org with a stored override.
+func printE2EReport(st *store.Store, org string) {
+	if org != "" {
+		mode, source := server.E2EMode(st, org)
+		fmt.Printf("org %s: sealed exec %s (%s)\n", org, mode, source)
+		explainE2E(mode)
+		warnE2EOverride()
+		return
+	}
+
+	defMode, defSource := server.E2EMode(st, "")
+	fmt.Printf("default: sealed exec %s (%s)\n", defMode, defSource)
+
+	// Configured orgs first, then any org with a stored override that this
+	// shell's MACH_ORG/MACH_ORGS does not mention (the server may run with a
+	// different environment than this command).
+	seen := map[string]bool{}
+	for _, o := range Orgs() {
+		seen[o] = true
+		mode, source := server.E2EMode(st, o)
+		note := ""
+		if mode == defMode {
+			note = " (follows the default)"
+		}
+		fmt.Printf("org %s: sealed exec %s%s [%s]\n", o, mode, note, source)
+	}
+	if stored, err := server.StoredE2EOrgs(st); err == nil {
+		for _, o := range stored {
+			if seen[o] {
+				continue
+			}
+			mode, _ := server.E2EMode(st, o)
+			fmt.Printf("org %s: sealed exec %s (stored override; not in this shell's MACH_ORG/MACH_ORGS)\n", o, mode)
+		}
+	}
+	explainE2E(defMode)
+	warnE2EOverride()
+}
+
+func explainE2E(mode string) {
+	if mode == "off" {
+		fmt.Println("  sealed exec is refused (403, audited); commands run in plaintext, where")
+		fmt.Println("  the fleet-wide block list can read them. Agent E2E keys are untouched, so")
+		fmt.Println("  turning it back on restores sealing with no re-enrollment.")
+		return
+	}
+	fmt.Println("  sealed exec is accepted; commands may be ciphertext the fleet-wide block")
+	fmt.Println("  list cannot inspect. Turning it off stops sealing immediately.")
+}
+
+func warnE2EOverride() {
+	if override := strings.TrimSpace(os.Getenv("MACH_E2E")); override != "" {
+		fmt.Printf("  note: MACH_E2E=%s is set in this environment and overrides every org\n", override)
+	}
+}
+
+// validOrgLabel mirrors the org half of store.ValidOrgName (2-20 label chars):
+// the CLI should reject a typo before it writes a row nothing will ever read.
+func validOrgLabel(org string) bool {
+	if len(org) < 2 || len(org) > 20 {
+		return false
+	}
+	for _, c := range org {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// Orgs returns the org prefixes this environment configures: MACH_ORG first,
+// then the comma-separated MACH_ORGS.
+func Orgs() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, v := range []string{Org(), os.Getenv("MACH_ORGS")} {
+		for _, o := range strings.Split(v, ",") {
+			o = strings.ToLower(strings.TrimSpace(o))
+			if o == "" || seen[o] {
+				continue
+			}
+			seen[o] = true
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
 // RevokeMachine marks a machine revoked so its agent self-retires.
 func RevokeMachine(name string, purgeAudit bool) error {
 	st, err := openStore()

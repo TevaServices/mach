@@ -13,20 +13,64 @@ console (mach) ──┘ (TLS, bearer key)
 
 - The control plane is the **only public component** and the **single
   point of command authority**: it brokers exec, holds the audit log, and
-  can read command content. Treat its host as high-value; access to its
-  DB = control of every machine.
+  can read command content on the streaming path (sealed one-shot execs are
+  opaque to it — see below). Treat its host as high-value; access to its
+  DB = control of every machine, and the ability to push a signed update.
 - Agents trust exactly: (a) their pinned control-plane identity key
   (`server_key` in config.json), (b) TLS to the enrolled URL.
 - The phone/admin is trusted only after presenting the challenge code
   that was printed on the agent's console (12 chars, ~60 bits) — the QR
   token alone grants nothing.
 
-There is no application-layer end-to-end encryption between the console and
-the agent, and none is planned. The control plane is a broker that must see
-what it brokers (that is what the audit log is), so encrypting content past it
-would mean either a second key distribution problem or an audit trail that
-records nothing. The honest statement is the one above: the control plane is
-trusted, and TLS protects the wire.
+**End-to-end encryption exists, on one of the two command paths, and it is
+optional per org.** A one-shot `mach exec` can be sealed with X25519 +
+ChaCha20-Poly1305 between the console and the agent: the control plane relays a
+ciphertext blob in each direction and learns only metadata (machine, timing,
+size, source key, exit status) — command and output content stay opaque to it,
+and the audit row records `[E2E sealed command]`. Machines advertise an X25519
+key (`pub_e2e`) at enrollment.
+
+It is a server-side setting, per org — `mach-server e2e on|off|inherit --org X`,
+with a default for orgs that have no setting of their own, and `MACH_E2E` as a
+deployment-wide pin that overrides every org. The control plane is the authority
+because it is the party that cannot read ciphertext, and clients never decide on
+their own: they read the signal (`GET /v1/machines/{name}/e2epub`, and a
+per-machine field in the fleet listing) and either obey it or exit with a
+message saying they cannot do what they were asked to.
+
+**What the setting means, in both directions:**
+
+- **On** (the default): the control plane relays sealed commands and hands out
+  the machine's key. The block list cannot inspect what it relays.
+- **Off**: sealed exec is refused before dispatch (`403`, audited, with the
+  reason in the response) and no key is advertised, so an obeying console never
+  tries. Every command for that org runs in plaintext, where the block list can
+  read it. This is how an operator who needs the fleet-wide block list over the
+  one-shot path gets it.
+
+**Nothing on any agent changes in either direction.** An agent keeps its
+`e2e.key`, keeps registering the public half at enrollment, and keeps opening
+whatever sealed frame reaches it. With the setting off no sealed frame ever
+does, because the refusal happens at the control plane, before dispatch — the
+agent is never told which way the setting is set and has no reason to care. So
+turning it back on restores sealing immediately: no re-enrollment, no agent
+restart, no key rotation. An agent enrolled while the setting was off still has
+a key registered, and one enrolled before the feature existed simply has none —
+`mach exec` says so on stderr rather than letting you believe a command was
+sealed, and re-enrolling that machine is what fixes it.
+
+The **streaming console cannot be sealed**, and this is a design limit rather
+than an unfinished feature: a live session is a long-lived relay of many small
+frames, and a per-frame seal would still let the control plane see frame
+boundaries and timing while costing a key exchange per chunk. That same relay
+is why the fleet-wide policy can be enforced on the server side at all — it can
+read the command. So the two paths trade off honestly: on `mach exec` the
+server can protect content but cannot inspect it, and on `mach console` it can
+inspect the command but not protect it.
+
+Absent a seal, the control plane is a broker that must see what it brokers, and
+it is trusted accordingly. TLS protects the wire; the seal protects content
+from the broker; nothing protects content from the machine's own operator.
 
 ## Controls implemented
 
@@ -40,11 +84,16 @@ trusted, and TLS protects the wire.
 | Org-prefixed machine names, no hostname-derived suggestions, conflicts error | store.ValidOrgName, server/orgs.go, pairpages.go |
 | Scoped API keys (enroll / readonly / exec:* / exec:m1\|m2), server-generated 192-bit secrets, stretched salted hashes | controlplane.AddAPIKey, store |
 | Read-only keys see the whole fleet and the whole audit trail, and nothing else | server/consoleapi.go canRead/readScope |
-| **Fleet-wide command block list** (`MACH_EXEC_POLICY` / `MACH_EXEC_POLICY_FILE`), enforced for every key, scope and machine before dispatch | server/policy.go, consoleapi.go handleExec |
-| Per-machine command policy on the agent itself (`MACH_POLICY` / `policy.txt`), evaluated where no upstream can override it | agent/policy.go, internal/policy |
-| Streaming output with per-stream caps (8 MiB) and visible truncation markers | agent/stream.go, protocol.ExecStreamFrame |
-| Machine output is data, never input: the agent decides nothing from it, and the console labels it rather than parsing it | agent/run.go, console/client.go |
-| Audit log with secret-value redaction; refusal of a blocked command is audited too; optional purge on revoke | store.RedactScrubs/AuditInsert/RemoveMachineAudit |
+| **Fleet-wide command block list** (`MACH_EXEC_POLICY` / `MACH_EXEC_POLICY_FILE`), enforced for every key, scope and machine before dispatch — on `mach exec` **and** on the streaming console | server/policy.go, consoleapi.go handleExec, stream.go handleConsoleStreamWS |
+| **E2E as a per-org server setting** (`mach-server e2e on\|off\|inherit --org X`, stored in `settings`; `MACH_E2E` pins every org), with the control signal clients obey or refuse on | server/e2eflag.go, consoleapi.go handleExec/handleE2EPub |
+| Sealed exec refused while the setting is off, before dispatch, and no key advertised — so a client cannot believe it sealed | consoleapi.go handleExec, handleE2EPub |
+| Per-machine command policy on the agent itself (`MACH_POLICY` / `policy.txt`), evaluated where no upstream can override it, on both paths | agent/policy.go, internal/policy |
+| E2E sealing of one-shot exec (X25519 + ChaCha20-Poly1305, ephemeral-per-command, AAD = sender's ephemeral pubkey) | internal/e2e, agent/e2eexec.go |
+| `readonly` keys refused on the streaming endpoint (it is command execution, not observation) | stream.go handleConsoleStreamWS |
+| Confinement of remote commands: own process group (unix), SIGKILL as a tree on timeout (Windows: timeout + caps only) | agent/confine*.go |
+| Output caps per path, with visible truncation markers; streamed frames dropped rather than stalling an agent whose console stopped reading | agent/run.go, agent/streamexec.go |
+| Machine output is data, never input: nothing in the agent reads it back, and the console labels it rather than parsing a control fact out of text | agent/run.go, console/client.go, console/stream.go |
+| Audit log with secret-value redaction; every dispatched command recorded on both paths; refusals audited too; a stream that dies without an exit status recorded as `-1`; optional purge on revoke | store.RedactScrubs/AuditInsert/RemoveMachineAudit, server/stream.go |
 | Signed in-toto attestations for released agent binaries, verified before an update can be queued | internal/release, controlplane/attest.go |
 | Revocation: self-retiring agents, revoked keys can't re-enroll, names stay reserved | store.RevokeMachine, agent errRevoked |
 | Agent privilege drop on linux root (MACH_USER, default nobody) | agent/droppriv_linux.go |
@@ -55,19 +104,25 @@ trusted, and TLS protects the wire.
 ## Command policy: where it is enforced, and what it can promise
 
 Two layers, one grammar (`internal/policy`), so a rule means the same thing
-wherever it is written.
+wherever it is written. Both layers are evaluated on **both** command paths —
+one-shot `exec` and the streaming console — because a block list that only
+covers one of them is a suggestion.
 
 1. **On the machine** — `MACH_POLICY` or `<state>/policy.txt`, read by the
    agent process. Nothing upstream can override it: not a compromised control
    plane, not a stolen API key, not a bad console. This is the layer that
-   protects the machine from the people who control the fleet.
+   protects the machine from the people who control the fleet. It is the only
+   layer that survives a sealed command, since it runs where the command is
+   decrypted.
 2. **On the control plane** — `MACH_EXEC_POLICY` (inline) or
    `MACH_EXEC_POLICY_FILE` (a file, re-read on mtime change every 15s, so
-   editing it does not need a restart). Enforced in `handleExec` after the
-   caller is authorized and before anything is dispatched, for every key,
-   every scope, and every machine. This is the layer that answers "block this
-   command across the whole fleet". A blocked attempt is audited with exit
-   code 126 rather than silently dropped.
+   editing it does not need a restart). Enforced in `handleExec` and in the
+   relay's `exec_stream` path, after the caller is authorized and before
+   anything is dispatched, for every key, every scope, and every machine. This
+   is the layer that answers "block this command across the whole fleet". A
+   blocked attempt is audited with exit code 126 rather than silently dropped.
+   Because it matches text, it cannot judge a sealed command — which is why
+   sealing is refused while this layer is configured (see "Trust model").
 
 Grammar: `deny:<substring>`, `allowonly`, `allow:<prefix>`, matched against
 whitespace-normalized text so `r''m` and `r${IFS}m` do not slip past a
@@ -92,43 +147,74 @@ difference. A file that becomes unreadable later keeps the last good rules.
 
 ## Streaming, and what a machine's output can and cannot do
 
-Commands stream: output is chunked to the console as the process writes it
-(8 KiB or 100 ms, whichever comes first), one JSON object per line over
-chunked HTTP, ending with an exit record. The response status is committed at
-200 as soon as output starts, so failures after dispatch — the agent's error,
-a timeout — are reported *inside* the stream; a client learns how the command
-ended from the exit record, never from the status line.
+Two command paths, and they are different on purpose.
 
-Two properties follow from how the bytes are carried, and both are load
-bearing:
+**One-shot (`mach exec`)**: the agent runs the command, buffers the output, and
+returns a single `ExecResult` — exit code, stdout, stderr. Being one object in
+each direction is what makes it sealable, and it is the path that carries the
+8 MiB cap. The console prints the machine's bytes to stdout and its own
+diagnostics to stderr with a `mach: ` prefix; `--json` prints that one result
+object instead, so a program reads the exit status as a field rather than
+parsing it out of bytes a command printed.
 
-- **Output cannot forge a control fact.** Chunks travel as base64 inside a
-  typed frame (`stream`, `data_b64`). A command that prints an entire exit
-  record, a `mach: ` line, a fake prompt, or a chunk frame of its own gets
-  those characters copied to the console as output and nothing else happens:
-  the exit status is a typed field on its own frame, set from the process's
-  real exit code. This is tested directly
-  (`internal/console/client_test.go TestOutputCannotForgeControlFacts`).
+**Streaming (`mach console`)**: the console opens
+`/v1/console/stream` WebSocket, the control plane binds it to the target
+machine's agent connection, and frames relay in both directions —
+`exec_stream` in, `stream_out` (agent output, chunked at 32 KiB) back,
+`stream_stdin` and `stream_kill` for input and Ctrl-C, and a terminal
+`stream_end` carrying the exit status. Failures after dispatch (the agent's
+error, a timeout, an agent connection lost) are reported *inside* the stream as
+that terminal record, never as an HTTP status: after the socket upgrade there
+is no status line left to use. The relay keeps an audit row per command, so
+streaming is not a hole in the record.
+
+Three properties follow from how the frames are carried, and all three are
+load bearing:
+
+- **Output cannot forge a control fact.** Output travels as base64 inside a
+  typed frame (`stream`, `b64`). A command that prints an entire exit record, a
+  `mach: ` line, a fake prompt, or a frame of its own gets those characters
+  copied to the console as output and nothing else happens: the exit status is
+  a typed field on the terminal record, set from the process's real exit code.
+  Tested directly (`internal/console/client_test.go
+  TestOutputCannotForgeControlFacts`).
+- **A stream that dies is not success.** If the relay disappears without a
+  terminal record, the console does not report 0 and does not replay the
+  command: it prints that the command may still be running and exits with a
+  distinct status. Only a stream that was never reached is retryable. The
+  command already ran on the machine; re-running it because the *relay* failed
+  would be a second execution nobody asked for.
 - **Nothing in the agent reads output back.** The agent executes; it does not
   interpret. The only things it acts on are frames from the control plane, and
   a frame is only accepted after the pinned-key check in `dialAndServe`. A
   command whose output mimics a mach message, a protocol frame, or a new
   command is a command that printed text — it is not prompt injection and it
   is not a command channel, because there is no path from output back into
-  anything the agent does.
+  anything the agent does. The console applies the same rule in the other
+  direction: it prints whatever arrives and takes its own view of the outcome
+  from typed fields only.
 
-On the console side, `mach`'s own diagnostics go to **stderr** with a `mach: `
-prefix, and machine output goes to **stdout** unmodified. `mach exec --json`
-emits the labeled frames unchanged for programs, so a script reads the exit
-status as a field rather than parsing it out of text. Note that a machine can
-still print `mach: something` to its stdout — the prefix distinguishes mach's
-own messages from the machine's, but only on the stream, not by content alone.
+**Stdin is a second input path, and that is a deliberate trade.** A streaming
+session can feed a running command (`stream_stdin`, used by `mach console`) and
+kill it (Ctrl-C → `stream_kill`). Stdin only reaches a machine through a
+command the control plane already asked for, but it does mean the text-matching
+policy judges the command as launched and cannot judge what is typed into it
+afterwards. There is no honest way to match a byte stream against a block list;
+a rule that appeared to would be worse than saying so. If that matters, keep
+`mach console` out of the fleet's hands: `exec:*` scoping and the `readonly`
+refusal are the levers, and the agent's own `MACH_POLICY` still governs the
+command itself.
 
-Limits: 8 MiB per stream, after which output is truncated and a marker is
-appended. If the console stops reading, the server's buffer (512 chunks, ~4 MiB)
-fills and further chunks are dropped rather than blocking the agent's frame
-pump — that pump serves every other command on the connection — and the
-console is told the output was dropped.
+Note that a machine can print `mach: something` to its stdout. The prefix
+distinguishes mach's own diagnostics from the machine's output on the stream,
+but a human reading a terminal cannot tell them apart by content alone — that
+ambiguity is inherent to showing a remote machine's bytes to a person.
+
+Limits: the buffered path truncates at 8 MiB with a visible marker. A streamed
+session is uncapped; the relay drops frames rather than stalling an agent whose
+console has stopped reading, because that frame pump serves every other command
+on the connection. Neither truncation nor a drop is recoverable, and both are
+visible rather than silent.
 
 ## Updates and release attestations
 
@@ -155,23 +241,34 @@ signature protects delivery, the attestation records provenance.
 ## Known gaps (pre-1.0 — do not treat as closed)
 
 1. **The command policy is a string guard, not a sandbox** — see the section
-   above for exactly what it can and cannot promise. Use OS-level confinement
-   for real isolation.
+   above for exactly what it can and cannot promise, including its blindness to
+   what is typed into a streaming session's stdin. Use OS-level confinement for
+   real isolation.
 2. **Single control plane** = availability + integrity SPOF. Signed updates
    prevent code injection, but a malicious DB can still push any correctly
-   signed binary, and an operator with DB access can read the audit log.
-3. **No stdin, no PTY.** `mach exec` streams output but cannot feed input, so
-   interactive and TUI programs do not work; `mach console` is line-based.
-   Streaming is one-directional by design — a stdin channel would add a second
-   way for input to reach a machine, and the current model has exactly one:
-   a command the control plane asked for.
-4. **Output caps are per-stream and lossy at the edges**: a command producing
-   more than 8 MiB loses the tail, and a slow console can cause drops. Both
-   are marked visibly, but they are not recoverable.
+   signed binary, and an operator with DB access can read the audit log. There
+   is no multi-server or HA story yet (issue #5).
+3. **Streaming is plaintext, and there is no PTY.** `mach console` has stdin
+   and Ctrl-C but no echo/line discipline, so full-screen TUI programs still
+   need a real PTY (issue #3). `mach exec` can be sealed but cannot feed input.
+   The two properties are in tension by construction: sealing needs the whole
+   command and result at once, a live session is neither.
+4. **Output caps are per-path and lossy at the edges**: a buffered command
+   producing more than 8 MiB loses the tail; a slow console loses streamed
+   frames. Both are marked visibly, but they are not recoverable.
 5. **Rate limiting is per-IP and in-memory**: a restart clears the counters,
    and a distributed source is not one IP. The pairing and enrollment paths
    are single indexed lookups, so the amplification that would have justified
    tighter limits is gone; the limits that remain are there to slow scanning.
+6. **The fleet-wide block list cannot inspect a sealed command**, and no
+   normalizer will change that — it needs text, and a seal exists to deny text.
+   With E2E on, the one-shot path is therefore outside the block list's reach by
+   the operator's own choice; turn E2E off for the org to bring it back inside,
+   or keep the guarantee on the machine with `MACH_POLICY`, which runs where the
+   command is decrypted and no upstream can override it.
+7. **The copies of the agent binaries baked into the container image are not
+   attested** by `push-update --attestation`, which covers runtime pushes only
+   (issue #4).
 
 ## Deployment checklist
 
@@ -179,6 +276,11 @@ signature protects delivery, the attestation records provenance.
 - [ ] `MACH_ORG` set to your org; `MACH_ORGS` lists every approvable org.
 - [ ] `MACH_EXEC_POLICY` (or `_FILE`) set to the fleet-wide block list, and
       each agent's own `MACH_POLICY` set for what that machine must never run.
+- [ ] Decide the E2E setting per org (`mach-server e2e`), with the trade in
+      mind: sealing off means the block list can read commands; sealing on means
+      the one-shot path is opaque to the control plane, and the block list
+      governs only plaintext. `MACH_E2E` pins it deployment-wide if a container
+      spec should win over a runtime change.
 - API keys minted per consumer with least scope (enroll keys only where
   enrollment happens; per-machine allowlists for consoles; `readonly` for
   dashboards and monitoring).
