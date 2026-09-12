@@ -1,5 +1,5 @@
-# mise.toml — dependencies, build, test, e2e for the mach repo.
-# Usage: mise run build | mise run test | mise run e2e | mise run all
+# mise.toml — dependencies, build, fmt, test, e2e for the mach repo.
+# Usage: mise run build | mise run fmt | mise run lint | mise run test | mise run e2e | mise run all
 # Requires mise: https://mise.jdx.dev (curl https://mise.run | sh)
 
 [tools]
@@ -36,8 +36,26 @@ ls bin/cross
 description = "Run unit tests (all packages, race + cover)"
 run = "go test ./... -v -race -coverprofile=coverage.out"
 
+[tasks.fmt]
+description = "Format every Go file in the tree (writes them)"
+run = "gofmt -w ."
+
+[tasks.fmt-check]
+description = "Fail if any Go file is not gofmt-clean (read-only; use 'mise run fmt' to fix)"
+run = '''
+out=$(gofmt -l .)
+if [ -n "$out" ]; then
+  echo "gofmt found files that need formatting:"
+  echo "$out"
+  echo "run: mise run fmt"
+  exit 1
+fi
+echo "gofmt: clean"
+'''
+
 [tasks.lint]
-description = "go vet across the tree"
+description = "gofmt check plus go vet across the tree (read-only: never rewrites files)"
+depends = ["fmt-check"]
 run = "go vet ./..."
 
 [tasks.e2e]
@@ -68,5 +86,5 @@ MACH_ORG=${MACH_ORG:-mach} ./bin/mach-server serve
 '''
 
 [tasks.all]
-description = "deps, lint, build, cross-compile, unit tests, e2e"
+description = "deps, lint (incl. the gofmt check), build, cross-compile, unit tests, e2e"
 depends = ["deps", "lint", "build", "build-all", "test", "e2e"]
