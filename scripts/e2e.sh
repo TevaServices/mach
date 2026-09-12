@@ -107,7 +107,8 @@ MACH_POLICY="deny:secret-marker" MACH_STATE_DIR="$WORKDIR/agent2" \
 POLICY_PID=$!
 sleep 2
 OUT=$(machc exec "$ORG-test-02" 'echo secret-marker-value' 2>&1)
-[[ "$OUT" == *"denied by policy"* ]]; check "policy deny enforced" $?
+[[ "$OUT" == *"denied by command policy"* && "$OUT" == *"deny:secret-marker"* ]]
+check "policy deny enforced, with the rule named" $?
 sleep 1
 machc exec "$MACHINE" "echo still-here" >/dev/null; check "primary agent unaffected" $?
 
