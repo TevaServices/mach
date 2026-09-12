@@ -2,6 +2,7 @@ package server
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -153,7 +154,8 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 
 	reqID := store.RandToken(8)
 	pe := &pendingExec{
-		ch:      make(chan protocol.ExecResult, 1),
+		ch:      make(chan execOutcome, 1),
+		out:     make(chan protocol.ExecChunk, execOutChanBuf),
 		machine: req.Machine,
 		command: display,
 		source:  "console:" + keyName,
@@ -173,15 +175,111 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 		return
 	}
 
-	grace := time.Duration(req.Timeout)*time.Second + 10*time.Second
-	select {
-	case res := <-pe.ch:
-		s.auditExec(pe, res.ExitCode, res.Stdout, res.Stderr)
-		writeJSON(w, http.StatusOK, res)
-	case <-time.After(grace):
-		res := protocol.ExecResult{Error: "timed out waiting for agent result"}
-		s.auditExec(pe, -1, "", res.Error)
-		writeJSON(w, http.StatusGatewayTimeout, res)
+	s.relayExec(w, pe, req)
+}
+
+// relayExec streams one command's output to the console as NDJSON: one JSON
+// object per line, flushed as it arrives, ending with an "exit" record.
+//
+// Everything that can fail before this point has already been answered with an
+// HTTP status. From the moment the response is committed the status is 200, so
+// failures that happen after dispatch — including the agent's own error and
+// this server's timeout — are reported inside the stream instead. A client
+// must therefore read the exit record, not the status line, to learn how the
+// command ended.
+func (s *Server) relayExec(w http.ResponseWriter, pe *pendingExec, req protocol.ExecRequest) {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-store")
+	// Ask reverse proxies not to buffer. A buffering proxy would hold the
+	// command's whole output and hand it over at the end, which is exactly
+	// the behavior streaming exists to remove.
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	rc := http.NewResponseController(w)
+	enc := json.NewEncoder(w)
+	send := func(f protocol.ExecStreamFrame) bool {
+		// Per-write deadline: a console that stops reading must not pin this
+		// goroutine, the pending exec, or the connection's resources. Reset on
+		// every frame, so a slow-but-alive client can stream indefinitely.
+		_ = rc.SetWriteDeadline(time.Now().Add(execWriteTimeout))
+		if err := enc.Encode(f); err != nil {
+			return false
+		}
+		return rc.Flush() == nil
+	}
+	sendExit := func(code int, errMsg string) bool {
+		return send(protocol.ExecStreamFrame{Type: protocol.ExecStreamExit, ExitCode: &code, Error: errMsg})
+	}
+
+	timer := time.NewTimer(time.Duration(req.Timeout)*time.Second + 10*time.Second)
+	defer timer.Stop()
+
+	for {
+		select {
+		case chunk := <-pe.out:
+			if !send(chunkFrame(chunk)) {
+				return
+			}
+		case out := <-pe.ch:
+			// The agent sends every chunk of a command's output before its
+			// terminal result, but pe.out is buffered, so frames still queued
+			// must be drained before the exit record — otherwise output would
+			// appear after the command was reported finished.
+			for drained := false; !drained; {
+				select {
+				case chunk := <-pe.out:
+					if !send(chunkFrame(chunk)) {
+						return
+					}
+				default:
+					drained = true
+				}
+			}
+			if out.truncated {
+				if !send(protocol.ExecStreamFrame{
+					Type:    protocol.ExecStreamChunk,
+					Stream:  "stderr",
+					DataB64: base64.StdEncoding.EncodeToString([]byte("[mach: output dropped — the console was not reading fast enough]\n")),
+				}) {
+					return
+				}
+			}
+			if !sendExit(out.res.ExitCode, out.res.Error) {
+				return
+			}
+			s.auditExec(pe, out.res.ExitCode, out.stdout, auditStderr(out))
+			return
+		case <-timer.C:
+			// The agent is responsible for enforcing the timeout it was
+			// given; reaching this means it never answered (died mid-command,
+			// or the connection stalled). Either way the command's fate on the
+			// machine is unknown — it is not cancelled, only this caller's
+			// wait ends.
+			msg := "timed out waiting for agent result"
+			_ = sendExit(-1, msg)
+			s.auditExec(pe, -1, "", msg)
+			return
+		}
+	}
+}
+
+// chunkFrame wraps an agent chunk for the console. The base64 payload is
+// passed through untouched — re-encoding it would only risk corrupting bytes.
+func chunkFrame(chunk protocol.ExecChunk) protocol.ExecStreamFrame {
+	return protocol.ExecStreamFrame{Type: protocol.ExecStreamChunk, Stream: chunk.Stream, DataB64: chunk.DataB64}
+}
+
+// auditStderr is what the audit row records for stderr: what the command wrote
+// plus, when it failed to run or was killed, why.
+func auditStderr(out execOutcome) string {
+	switch {
+	case out.res.Error == "":
+		return out.stderr
+	case out.stderr == "":
+		return out.res.Error
+	default:
+		return out.stderr + "\n[mach: " + out.res.Error + "]"
 	}
 }
 
@@ -276,7 +374,9 @@ func (s *Server) handleRevokeMachine(w http.ResponseWriter, r *http.Request, key
 	if req.PurgeAudit {
 		_ = s.st.RemoveMachineAudit(req.Machine)
 	}
-	s.logf("machine revoked: %s (by %s)", req.Machine, keyName)
+	// %q, not %s: both values reach the log from outside, and a machine name
+	// or key name containing newlines could forge log lines.
+	s.logf("machine revoked: %q (by %q)", req.Machine, keyName)
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "revoked", "machine": req.Machine})
 }
 

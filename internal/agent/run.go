@@ -4,7 +4,6 @@
 package agent
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -27,40 +26,6 @@ import (
 	"github.com/bcross/mach/internal/protocol"
 	"github.com/gorilla/websocket"
 )
-
-// Exec limits: no single command may produce more than this much output.
-const (
-	maxOutputBytes = 8 << 20 // 8 MiB per stream, then truncated with a marker
-)
-
-// cappedBuffer enforces a hard cap; the process keeps running but further
-// output is discarded (and the tail is marked). Prevents OOM from
-// `cat /dev/urandom` style commands.
-type cappedBuffer struct {
-	buf     bytes.Buffer
-	max     int
-	dropped bool
-}
-
-func (c *cappedBuffer) Write(p []byte) (int, error) {
-	if c.buf.Len()+len(p) > c.max {
-		room := c.max - c.buf.Len()
-		if room > 0 {
-			c.buf.Write(p[:room])
-		}
-		c.dropped = true
-		return len(p), nil // pretend success; runner adds the truncation marker
-	}
-	return c.buf.Write(p)
-}
-
-func (c *cappedBuffer) String() string {
-	s := c.buf.String()
-	if c.dropped {
-		s += "\n[mach: output truncated at cap]"
-	}
-	return s
-}
 
 // Run is the daemon main loop: dial the control plane over an outbound
 // connection, sign in (challenge-bound), execute commands, reconnect with
@@ -93,7 +58,9 @@ func Run(stateDir string) error {
 			log.Printf("agent: machine %q was revoked by the operator — retiring (state files kept for forensics)", cfg.Name)
 			return nil
 		}
-		log.Printf("agent: disconnected: %v — reconnecting in %s", err, backoff)
+		// %q: the error can embed text the control plane supplied, and a newline in
+		// it must not be able to forge an agent log line.
+		log.Printf("agent: disconnected: %q — reconnecting in %s", err.Error(), backoff)
 		// Reset the backoff only after a genuinely long-lived session; a
 		// fast-failing error (bad frame, rejected hello) must not hard-reset
 		// the loop to 2s forever.
@@ -284,12 +251,21 @@ func handleExec(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{})
 		}
 		c = exec.CommandContext(ctx, sh.path, sh.args(cmd.Command)...)
 	}
-	var stdout, stderr cappedBuffer
-	stdout.max = maxOutputBytes
-	stderr.max = maxOutputBytes
-	c.Stdout = &stdout
-	c.Stderr = &stderr
-	// Stdout/stderr are buffers (not files), so os/exec copies through a
+	// Output is streamed to the control plane as it is produced; see
+	// stream.go for the chunking and per-stream cap.
+	//
+	// What the command prints is data and stays data: it is copied to the
+	// control plane and nowhere else. Nothing in this function — and nothing
+	// in the agent — reads output back to decide what to run next. The only
+	// things the agent acts on are frames from the control plane, and a frame
+	// is only accepted after the pinned-key check in dialAndServe. A command
+	// whose output mimics a protocol frame, a mach message, or a new command
+	// is a command that printed text.
+	stdout := newChunkWriter(conn, env.ReqID, "stdout")
+	stderr := newChunkWriter(conn, env.ReqID, "stderr")
+	c.Stdout = stdout
+	c.Stderr = stderr
+	// Stdout/stderr are writers (not files), so os/exec copies through a
 	// pipe: if a command backgrounds a grandchild that inherits the pipe,
 	// the copy goroutine outlives the direct child. WaitDelay bounds that
 	// wait — without it, `sleep 3600 &` style commands hang Wait() forever
@@ -298,9 +274,34 @@ func handleExec(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{})
 	// Do not leak the agent's own environment (MACH_USER, MACH_POLICY, ...)
 	// into every command the control plane runs.
 	c.Env = filteredEnv()
-	runErr := c.Run()
 
-	res := protocol.ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
+	// Flush ticks so the last of a trickle of output is not held until the
+	// command exits. Stopped and drained before the writers are closed, so no
+	// chunk can be sent after the terminal exec_result.
+	flushDone := make(chan struct{})
+	flusherStopped := make(chan struct{})
+	go func() {
+		defer close(flusherStopped)
+		t := time.NewTicker(chunkFlushInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-flushDone:
+				return
+			case <-t.C:
+				stdout.Flush()
+				stderr.Flush()
+			}
+		}
+	}()
+
+	runErr := c.Run()
+	close(flushDone)
+	<-flusherStopped
+	stdout.Close()
+	stderr.Close()
+
+	res := protocol.ExecResult{}
 	switch {
 	case runErr == nil:
 		res.ExitCode = 0

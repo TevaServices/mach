@@ -28,12 +28,40 @@ type HelloResponse struct {
 	ServerAuth string `json:"server_auth,omitempty"` // "v1 <base64 ed25519 sig>" by the server's identity key over "server|<challenge>"
 }
 
+// ExecChunk is one incremental piece of a running command's output, sent by
+// the agent as it is produced (envelope ReqID identifies the exec).
+//
+// DataB64 is base64 rather than a JSON string on purpose: process output is
+// arbitrary bytes, and a JSON string cannot carry invalid UTF-8 without
+// silently replacing it with U+FFFD.
+type ExecChunk struct {
+	Stream  string `json:"stream"` // "stdout" | "stderr"
+	DataB64 string `json:"data_b64"`
+}
+
+// ExecResult is the terminal frame for a command: exit status and, on
+// failure to run it at all, why. Output has already arrived as ExecChunk
+// frames by the time this is sent.
 type ExecResult struct {
 	ExitCode int    `json:"exit_code"`
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
 	Error    string `json:"error,omitempty"`
 }
+
+// ExecStreamFrame is one line of the console API's streamed NDJSON response
+// to POST /v1/exec: either a chunk of output or the terminal exit record.
+type ExecStreamFrame struct {
+	Type     string `json:"type"` // "chunk" | "exit"
+	Stream   string `json:"stream,omitempty"`
+	DataB64  string `json:"data_b64,omitempty"`
+	ExitCode *int   `json:"exit_code,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
+// Frame type tags for ExecStreamFrame.
+const (
+	ExecStreamChunk = "chunk"
+	ExecStreamExit  = "exit"
+)
 
 // ---- console/authenticated-clients -> control plane ----
 

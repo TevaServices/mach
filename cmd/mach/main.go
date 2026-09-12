@@ -144,19 +144,27 @@ func consoleMain(args []string) {
 		}
 
 	case "exec":
-		if len(args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: mach exec <machine> <command...>\n       mach exec <machine> -- <argv...>   (no-shell mode: args pass through byte-exact)")
+		// mach exec [--json] <machine> <command...>
+		// mach exec [--json] <machine> -- <argv...>
+		rest := args[1:]
+		asJSON := false
+		if len(rest) > 0 && rest[0] == "--json" {
+			asJSON = true
+			rest = rest[1:]
+		}
+		if len(rest) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: mach exec [--json] <machine> <command...>\n       mach exec [--json] <machine> -- <argv...>   (no-shell mode: args pass through byte-exact)\n\n  --json   emit the control plane's stream frames as NDJSON on stdout\n           (for programs: output is labeled data, exit status is a field)")
 			os.Exit(2)
 		}
-		rest := args[2:]
-		if rest[0] == "--" {
+		machine, cmdArgs := rest[0], rest[1:]
+		if cmdArgs[0] == "--" {
 			// No-shell mode: every argument after -- is delivered as its
 			// own JSON string and exec'd directly on the machine. Your
 			// local shell does the only quoting pass; the remote side
 			// never splits or re-parses anything.
-			os.Exit(c.ExecArgv(args[1], rest[1:], 0))
+			os.Exit(c.ExecArgv(machine, cmdArgs[1:], 0, asJSON))
 		}
-		os.Exit(c.Exec(args[1], strings.Join(rest, " "), 0))
+		os.Exit(c.Exec(machine, strings.Join(cmdArgs, " "), 0, asJSON))
 
 	case "console":
 		if len(args) < 2 {
