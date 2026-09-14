@@ -427,23 +427,50 @@ func TestRebindTranslatesPlaceholdersForPostgres(t *testing.T) {
 // Every query the package issues must be translatable: a stray "?" that means
 // something else, or a query already written with $1, would break on one driver
 // or the other. This walks the statements this package actually runs.
+//
+// Migration DDL is stricter: it carries no parameters at all, so it is
+// rebind-safe for both drivers by construction, and no migration may leave a
+// {{ID}} marker behind after substitution.
 func TestSchemaAndQueriesTranslate(t *testing.T) {
-	st := &Store{known: "postgres"}
-	if got := st.idColumn(); got != "BIGSERIAL PRIMARY KEY" {
+	pg := &Store{known: "postgres"}
+	sq := &Store{known: "sqlite"}
+	if got := pg.idColumn(); got != "BIGSERIAL PRIMARY KEY" {
 		t.Errorf("postgres id column = %q", got)
 	}
-	if got := (&Store{known: "sqlite"}).idColumn(); got != "INTEGER PRIMARY KEY" {
+	if got := sq.idColumn(); got != "INTEGER PRIMARY KEY" {
 		t.Errorf("sqlite id column = %q", got)
 	}
-	// The migrated schema must carry the translated id column and no leftover
-	// placeholder marker.
-	sq := &Store{known: "postgres"}
-	sql := strings.ReplaceAll(schemaSQL, "{{ID}}", sq.idColumn())
-	if strings.Contains(sq.rebind(sql), "{{ID}}") {
-		t.Error("schema still carries its placeholder")
+	if len(migrationSet) == 0 {
+		t.Fatal("no migrations embedded")
+	}
+	for _, m := range migrationSet {
+		if got := sq.rebind(m.sql); got != m.sql {
+			t.Errorf("sqlite rebind alters migration %s: %q", m.version, got)
+		}
+		sql := strings.ReplaceAll(m.sql, "{{ID}}", pg.idColumn())
+		if strings.Contains(sql, "{{") {
+			t.Errorf("migration %s still carries a placeholder after substitution", m.version)
+		}
+		if strings.Contains(sql, "?") {
+			t.Errorf("migration %s carries a '?' character: migration DDL must be parameter-free to translate for both drivers", m.version)
+		}
+		if got := pg.rebind(sql); got != sql {
+			t.Errorf("postgres rebind alters migration %s DDL: %q", m.version, got)
+		}
+	}
+	// The baseline DDL must carry the translated id column and the indexed
+	// lookup column the unauthenticated bearer-key probe depends on.
+	var baseline string
+	for _, m := range migrationSet {
+		if m.version == "0001_baseline" {
+			baseline = strings.ReplaceAll(m.sql, "{{ID}}", pg.idColumn())
+		}
+	}
+	if baseline == "" {
+		t.Fatal("no 0001_baseline migration in the embedded set")
 	}
 	for _, want := range []string{"BIGSERIAL PRIMARY KEY", "key_lookup TEXT NOT NULL UNIQUE"} {
-		if !strings.Contains(sql, want) {
+		if !strings.Contains(baseline, want) {
 			t.Errorf("schema is missing %q", want)
 		}
 	}
