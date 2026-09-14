@@ -364,6 +364,19 @@ only covered at the SQL-translation level.
 Not opinions — each of these is something that went wrong in this repo, with the
 rule that would have prevented it.
 
+- **Schema changes are migrations, not edits.** The store's DDL lives in
+  `internal/store/migrations/*.sql` (embedded, applied by `migrate()` at
+  every open). Adding a column or table = write ONE new numbered migration
+  file (`NNNN_name.sql`, 4-digit sequence + lowercase name, `{{ID}}`-style
+  but parameter-free DDL — it must contain no `?` at all, so it rebind-safes
+  for both drivers by construction) and extend `verifySchema` + its tests.
+  Never edit an applied migration: its sha256 is stamped into
+  `schema_migrations` and re-verified on every open, so an edit refuses
+  startup by design. There are no down-migrations; startup auto-applies
+  pending ones. A pre-migration database is adopted at the baseline when
+  `verifySchema` accepts it and refused with verifySchema's own message
+  otherwise — so a stale-schema refusal keeps its exact wording.
+
 - **A rule written in two places drifts, and the tests can each be happy.** Two
   real bugs here were the same shape, and both survived a green suite:
   (1) the challenge code was hashed in its dashed display form but compared in
