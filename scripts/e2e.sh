@@ -711,9 +711,12 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$UI_BASE/ui/logout" -b "$
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" "$UI_BASE/ui"); [[ "$CODE" == "303" ]]
 check "the signed-out session no longer reaches the fleet" $?
 
-step "cleanup job smoke: pairings purge"
+step "cleanup job wired"
+# This asserts only that the subcommand runs and the DB opens; it does NOT
+# exercise the hourly pairing purge, and it never did. Naming it "pairings
+# purge" claimed coverage this line does not provide.
 MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" version >/dev/null
-ok "cleanup job wired (hourly, 24h retention)"
+ok "server subcommand runs against the run's database"
 
 printf '\n===== e2e: %d passed, %d failed =====\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
