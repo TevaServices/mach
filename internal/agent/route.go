@@ -7,6 +7,8 @@ import (
 	"os"
 	"runtime"
 	"strings"
+
+	"github.com/bcross/mach/internal/version"
 )
 
 func envOr(key, def string) string {
@@ -98,7 +100,7 @@ func Route(args []string) {
 		}
 
 	case "version":
-		fmt.Printf("mach %s (%s/%s)\n", Version, runtime.GOOS, runtime.GOARCH)
+		fmt.Printf("mach %s (%s/%s)\n", version.Version, runtime.GOOS, runtime.GOARCH)
 
 	default:
 		usageAgent()

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/bcross/mach/internal/protocol"
+	"github.com/bcross/mach/internal/version"
 	"github.com/gorilla/websocket"
 )
 
@@ -210,7 +211,7 @@ func dialAndServe(cfg *Config, id *Identity, e2eKey *E2EKeyPair, ctl *sessionCtl
 		Auth:     "v1 " + base64.StdEncoding.EncodeToString(sig),
 		PubKey:   id.PubHex,
 		Name:     cfg.Name,
-		AgentVer: Version,
+		AgentVer: version.Version,
 		Hostname: hostname(),
 		OS:       runtime.GOOS,
 		Arch:     runtime.GOARCH,

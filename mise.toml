@@ -17,17 +17,33 @@ description = "Verify toolchain and download Go modules"
 run = "go mod download"
 
 [tasks.build]
-description = "Build mach and mach-server into bin/"
-run = "mkdir -p bin && CGO_ENABLED=0 go build -o bin/mach ./cmd/mach && CGO_ENABLED=0 go build -o bin/mach-server ./cmd/mach-server && echo built: bin/mach bin/mach-server"
+description = "Build mach and mach-server into bin/ (stamp a release with MACH_VERSION=0.3.0)"
+run = '''
+mkdir -p bin
+# Unset means no -X at all, never an empty one: an empty stamp would make every
+# binary report nothing, and would make every agent look skewed in the fleet
+# view. `go build -ldflags ""` is a legal no-op, so the flag is passed either way.
+X=""
+if [ -n "${MACH_VERSION:-}" ]; then
+  X="-X github.com/bcross/mach/internal/version.Version=$MACH_VERSION"
+fi
+CGO_ENABLED=0 go build -ldflags "$X" -o bin/mach ./cmd/mach
+CGO_ENABLED=0 go build -ldflags "$X" -o bin/mach-server ./cmd/mach-server
+echo "built: bin/mach bin/mach-server"
+'''
 
 [tasks.build-all]
 description = "Cross-compile all supported OS/arch targets into bin/cross/"
 run = '''
 mkdir -p bin/cross
+X=""
+if [ -n "${MACH_VERSION:-}" ]; then
+  X="-X github.com/bcross/mach/internal/version.Version=$MACH_VERSION"
+fi
 for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
   os=${t%/*}; arch=${t#*/}; ext=""
   [ "$os" = windows ] && ext=.exe
-  CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -o bin/cross/mach-$os-$arch$ext ./cmd/mach
+  CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -ldflags "$X" -o bin/cross/mach-$os-$arch$ext ./cmd/mach
 done
 ls bin/cross
 '''
@@ -66,13 +82,20 @@ run = "bash scripts/e2e.sh"
 description = "Cross-compile the agents and write a signed in-toto attestation for each (uses the control plane's identity key: MACH_DB/MACH_SERVER_KEY)"
 run = '''
 set -e
+# One variable drives both the stamp and the attestation argument, so the
+# version a binary reports and the version its attestation claims can never
+# drift apart. This task builds release artifacts, which is why its default is
+# release-shaped rather than the compiled-in "devel"; a real release sets
+# MACH_VERSION from the tag.
+VER="${MACH_VERSION:-0.2.0}"
 mkdir -p bin/cross bin/attestations
 for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
   os=${t%/*}; arch=${t#*/}; ext=""
   [ "$os" = windows ] && ext=.exe
   out="bin/cross/mach-$os-$arch$ext"
-  CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags="-s -w" -o "$out" ./cmd/mach
-  ./bin/mach-server attest "$out" "${MACH_VERSION:-0.2.0}" --out "bin/attestations/mach-$os-$arch$ext.intoto.jsonl"
+  CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
+    -ldflags="-s -w -X github.com/bcross/mach/internal/version.Version=$VER" -o "$out" ./cmd/mach
+  ./bin/mach-server attest "$out" "$VER" --out "bin/attestations/mach-$os-$arch$ext.intoto.jsonl"
 done
 ls bin/attestations
 '''

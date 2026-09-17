@@ -14,7 +14,7 @@ This is `mach`: remote CLI access to registered machines, outbound-only
 - `mach-server` (cmd/mach-server) — the control plane; the ONLY publicly
   reachable component. Ships as a Docker container. Also serves admin
   commands: `add-api-key`, `revoke-machine`, `delete-machine`, `e2e`,
-  `attest`, `verify-attestation`, `push-update`.
+  `attest`, `verify-attestation`, `push-update`, `version`.
 
 ## Ground rules
 
@@ -36,6 +36,18 @@ This is `mach`: remote CLI access to registered machines, outbound-only
 - `internal/policy` is shared by the agent and the control plane: one grammar,
   two enforcement points. Change it once and both sides change together —
   never fork the matching rules.
+- **One version string.** `internal/version.Version` is the only software
+  version in the tree. Builds stamp it with
+  `-ldflags "-X github.com/bcross/mach/internal/version.Version=…"`, and an
+  unset version means **no** `-X` rather than an empty one — an empty stamp
+  makes every binary report nothing and every agent look skewed. Do not add a
+  per-package version constant, and do not conflate it with
+  `agent.fleetPolicy.Version` / `server.execPolicy.Version` (ruleset
+  fingerprints) or `e2e.sealedVersion` (a message-format version): those answer
+  "do these two agree on the wire", never "what was this built as". It must stay
+  genuinely **read** by all four binaries — `-X` silently does nothing to an
+  unreachable symbol, and silently nothing if the symbol path is misspelled, so
+  `scripts/e2e.sh` asserts a stamp actually took.
 
 ## Security invariants (do not regress)
 
@@ -214,6 +226,14 @@ This is `mach`: remote CLI access to registered machines, outbound-only
 
 Agent side: `MACH_SERVER`, `MACH_ORG`, `MACH_STATE_DIR`, `MACH_POLICY`,
 `MACH_USER`, `MACH_KEEP_PRIVILEGES`.
+
+`MACH_VERSION` is **not** a runtime variable and is deliberately absent from the
+table above: no process reads a version from the environment, because a version
+an env var could change is one no bug report and no attestation can pin. It is a
+**build-time** knob only — `MACH_VERSION=0.3.0 mise run build|build-all|attest`,
+the Dockerfile's `MACH_VERSION` build arg (which the compose file and the release
+workflow both pass), and the tag the release workflow derives. A plain build
+reports `devel`.
 
 `MACH_TEST_POSTGRES` (test-only): a Postgres DSN for `internal/store`'s
 end-to-end test. Without it that test skips, so the Postgres path is otherwise
