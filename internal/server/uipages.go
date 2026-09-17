@@ -26,6 +26,77 @@ import (
 	"github.com/bcross/mach/internal/version"
 )
 
+// uiBaseCSS is the visual language every page this control plane serves shares:
+// the signed-in UI, the public enrollment page (which renders through the same
+// shell), and the phone-facing pair page. The pair page cannot use the shell —
+// it is reached from a QR code by an anonymous visitor and keeps its strict
+// `default-src 'none'`, so it must not load htmx or app.js — so the styling
+// lives here and both embed it. That is what stops the two from looking like
+// different products, which is how they looked when each carried its own
+// hardcoded colours.
+//
+// Colour goes through custom properties rather than literals because every page
+// honours the viewer's light/dark preference (`color-scheme: light dark`) and a
+// hardcoded #111 background is unreadable in one of the two — which is exactly
+// how the enrollment page's download button and command block read on a dark
+// screen before this.
+const uiBaseCSS = `
+:root {
+  color-scheme: light dark;
+  --fg: #16181d; --bg: #ffffff;
+  --muted: #6b7280; --line: #8883; --panel: #8881;
+  --accent-bg: #16181d; --accent-fg: #ffffff;
+  --ok: #1a7f37; --warn: #a06000; --bad: #b3261e;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e6e8ec; --bg: #14161a;
+    --muted: #9aa1ab; --line: #8884; --panel: #8882;
+    --accent-bg: #e6e8ec; --accent-fg: #14161a;
+    --ok: #4ac26b; --warn: #d29922; --bad: #f85149;
+  }
+}
+* { box-sizing: border-box; }
+body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 0 1rem 3rem;
+       max-width: 64rem; margin-inline: auto; line-height: 1.45;
+       background: var(--bg); color: var(--fg); }
+nav { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center;
+      padding: 1rem 0; border-bottom: 1px solid var(--line); margin-bottom: 1.5rem; }
+nav a { text-decoration: none; color: inherit; font-weight: 600; }
+nav a[aria-current] { text-decoration: underline; }
+nav .who { margin-left: auto; font-size: .85rem; color: var(--muted); }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid var(--line);
+         vertical-align: top; }
+th { font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.badge { display: inline-block; font-size: .75rem; padding: .05rem .4rem;
+         border: 1px solid currentColor; border-radius: .6rem; margin-right: .25rem; }
+.online { color: var(--ok); } .offline { color: var(--muted); }
+.blocked { color: var(--warn); } .revoked { color: var(--bad); }
+.pinned { color: var(--muted); }
+.error { color: var(--bad); font-weight: 600; }
+button { font: inherit; padding: .3rem .7rem; cursor: pointer; border-radius: .3rem;
+         border: 1px solid var(--line); background: transparent; color: inherit; }
+form.inline { display: inline; }
+.notice { padding: .6rem .8rem; border: 1px solid var(--line); border-radius: .3rem;
+          margin-bottom: 1rem; }
+.muted { color: var(--muted); font-size: .85rem; }
+code { background: var(--panel); padding: .05rem .3rem; border-radius: .2rem; }
+input[type=text], select { font: inherit; padding: .3rem .4rem; }
+.row-actions { display: flex; flex-wrap: wrap; gap: .3rem; }
+.panel { border: 1px solid var(--line); border-radius: .4rem; padding: .9rem 1.1rem;
+         margin: 1rem 0; background: var(--panel); }
+.btn-primary { display: inline-block; font-size: 1.05rem; font-weight: 600;
+               padding: .6rem 1.2rem; border: 0; border-radius: .3rem;
+               background: var(--accent-bg); color: var(--accent-fg);
+               text-decoration: none; cursor: pointer; }
+.seg { display: inline-flex; vertical-align: middle; border: 1px solid var(--line);
+       border-radius: .3rem; overflow: hidden; }
+.seg button { border: 0; border-radius: 0; padding: .35rem .95rem; background: transparent; }
+.seg button.active { background: var(--accent-bg); color: var(--accent-fg); font-weight: 600; }
+.e2e-row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
+`
+
 // View models. The row types live next to the code that assembles them
 // (fleetRow in machineadmin.go, orgRow in orgadmin.go); these wrap them with the
 // per-session values a template needs.
@@ -71,33 +142,7 @@ const shellSource = `<!doctype html>
 <title>{{.Title}}</title>
 <script src="/static/htmx.min.js" defer></script>
 <script src="/static/app.js" defer></script>
-<style>
-:root { color-scheme: light dark; }
-body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 0 1rem 3rem;
-       max-width: 64rem; margin-inline: auto; line-height: 1.45; }
-nav { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center;
-      padding: 1rem 0; border-bottom: 1px solid #8884; margin-bottom: 1.5rem; }
-nav a { text-decoration: none; color: inherit; font-weight: 600; }
-nav a[aria-current] { text-decoration: underline; }
-nav .who { margin-left: auto; font-size: .85rem; color: #8888; }
-table { border-collapse: collapse; width: 100%; }
-th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid #8883;
-         vertical-align: top; }
-th { font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; color: #8888; }
-.badge { display: inline-block; font-size: .75rem; padding: .05rem .4rem;
-         border: 1px solid currentColor; border-radius: .6rem; margin-right: .25rem; }
-.online { color: #1a7f37; } .offline { color: #8888; }
-.blocked { color: #b07000; } .revoked { color: #b3261e; }
-.pinned { color: #8888; }
-button { font: inherit; padding: .25rem .6rem; cursor: pointer; }
-form.inline { display: inline; }
-.notice { padding: .6rem .8rem; border: 1px solid #8884; border-radius: .3rem;
-          margin-bottom: 1rem; }
-.muted { color: #8888; font-size: .85rem; }
-code { background: #8882; padding: .05rem .3rem; border-radius: .2rem; }
-input[type=text] { font: inherit; padding: .3rem .4rem; }
-.row-actions { display: flex; flex-wrap: wrap; gap: .3rem; }
-</style>
+<style>` + uiBaseCSS + `</style>
 </head><body hx-headers='{"X-CSRF-Token":"{{.CSRF}}"}'>
 {{if not .Public}}<nav>
   <a href="/ui" {{if eq .Title "Fleet"}}aria-current="page"{{end}}>Fleet</a>
