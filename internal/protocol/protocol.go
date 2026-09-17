@@ -1,6 +1,11 @@
 package protocol
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"unicode/utf8"
+)
 
 // Envelope is the only frame on the wire.
 type Envelope struct {
@@ -28,11 +33,110 @@ type HelloResponse struct {
 	ServerAuth string `json:"server_auth,omitempty"` // "v1 <base64 ed25519 sig>" by the server's identity key over "server|<challenge>"
 }
 
+// Output caps, and why they are two numbers rather than one.
+//
+// MaxOutputBytes bounds the *raw output* one stream may carry back: past it the
+// agent truncates and marks the stream. MaxExecReplyBytes bounds the *encoded
+// reply* a client will read for one command, and it is much larger on purpose.
+// They used to be the same 8 MiB, which made the agent's own documented
+// behaviour unreachable: a result at the agent's limit could not fit in the
+// reply that had to carry it, so instead of arriving truncated with a marker it
+// arrived as an error — and, on the sealed path, as a refusal that made the
+// console run the whole command again.
+//
+// The inflation between the two is real and multiplicative: a stream crosses as
+// a JSON string (where Go's encoder replaces each invalid UTF-8 byte with the
+// 3-byte replacement rune), as base64 when the text form would be lossy (4/3×),
+// on two streams at once, and then — for a sealed command — through the sealed
+// envelope's base64 twice more (16/9×).
+const (
+	// MaxOutputBytes is the most output the agent carries back for one stream
+	// (stdout or stderr) before truncating it and appending a visible marker.
+	MaxOutputBytes = 8 << 20
+
+	// MaxExecReplyBytes is what a client will read for one exec reply: 16 ×
+	// MaxOutputBytes, which covers a full-cap result on both streams, carried in
+	// both the text and the exact-bytes forms, through the sealed envelope.
+	//
+	// It is not the pathological maximum — 8 MiB of NUL bytes on both streams,
+	// where JSON escaping alone is 6× — and it does not need to be. Past it the
+	// client reports that the reply was too large to read and does not re-send
+	// the command, which is honest and costs nothing: the command already ran.
+	MaxExecReplyBytes = 16 * MaxOutputBytes
+)
+
 type ExecResult struct {
 	ExitCode int    `json:"exit_code"`
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
 	Error    string `json:"error,omitempty"`
+	// StdoutB64/StderrB64 carry a stream's exact bytes, and are set only when
+	// Stdout/Stderr would be lossy.
+	//
+	// Stdout and Stderr are JSON strings, and a JSON string must be valid UTF-8:
+	// Go's encoder silently replaces every invalid byte with U+FFFD, so a command
+	// that prints binary — a tarball, a PNG, latin-1 text — came back both
+	// mangled and longer than it was. The exact bytes ride alongside for that
+	// case, and only that case, so an ordinary text result is byte-for-byte the
+	// frame it always was and an older console (which does not know these fields)
+	// still shows the lossy text rather than nothing.
+	StdoutB64 string `json:"stdout_b64,omitempty"`
+	StderrB64 string `json:"stderr_b64,omitempty"`
+}
+
+// SetOutput records a command's output exactly as the machine produced it,
+// filling in both the text form (lossy for binary) and, when that form would
+// lose something, the exact bytes.
+func (r *ExecResult) SetOutput(stdout, stderr []byte) {
+	r.Stdout, r.Stderr = string(stdout), string(stderr)
+	if !utf8.Valid(stdout) {
+		r.StdoutB64 = base64.StdEncoding.EncodeToString(stdout)
+	}
+	if !utf8.Valid(stderr) {
+		r.StderrB64 = base64.StdEncoding.EncodeToString(stderr)
+	}
+}
+
+// Output returns each stream as the machine produced it, preferring the exact
+// bytes and falling back to the text form — which is all a result from an agent
+// built before these fields existed can offer, and is also exactly right for
+// every result whose output is text.
+//
+// A base64 field that will not decode is reported as no output rather than as a
+// mangled guess: the text form beside it is known-lossy for this stream, so
+// printing it would present corruption as the command's output.
+func (r ExecResult) Output() (stdout, stderr []byte) {
+	return streamBytes(r.StdoutB64, r.Stdout), streamBytes(r.StderrB64, r.Stderr)
+}
+
+func streamBytes(b64Form, textForm string) []byte {
+	if b64Form == "" {
+		return []byte(textForm)
+	}
+	b, err := base64.StdEncoding.DecodeString(b64Form)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// MarshalResult encodes an ExecResult for the wire without HTML escaping.
+//
+// encoding/json escapes <, > and & by default, which is right when JSON is going
+// into a <script> block and wrong for every hop this one takes — agent to
+// control plane to console to a terminal. It also inflates: a command that cats
+// an HTML or XML file would have every angle bracket tripled, which is a large
+// part of how a result at the agent's own cap came to exceed the reply that
+// carried it. Output is bytes, not markup.
+func MarshalResult(res ExecResult) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(res); err != nil {
+		return nil, err
+	}
+	// Encode appends a newline; the payload keeps the shape json.Marshal gave it.
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 // ---- console/authenticated-clients -> control plane ----

@@ -29,10 +29,12 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Exec limits: no single command may produce more than this much output.
-const (
-	maxOutputBytes = 8 << 20 // 8 MiB per stream, then truncated with a marker
-)
+// Exec limits: no single command may produce more than this much output, per
+// stream, before it is truncated and marked. The constant lives in protocol
+// because the *client* has to reason about it too — the reply that carries a
+// result is larger than the result, and a client cap equal to this one is what
+// made the truncation marker unreachable.
+const maxOutputBytes = protocol.MaxOutputBytes
 
 // cappedBuffer enforces a hard cap; the process keeps running but further
 // output is discarded (and the tail is marked). Prevents OOM from
@@ -61,6 +63,17 @@ func (c *cappedBuffer) String() string {
 		s += "\n[mach: output truncated at cap]"
 	}
 	return s
+}
+
+// Bytes is String's exact-bytes twin, and has to stay one: the marker is part of
+// the output a reader sees, so it must be present in both forms or the text and
+// the bytes we hand the wire would disagree about where the stream ended.
+func (c *cappedBuffer) Bytes() []byte {
+	out := append([]byte(nil), c.buf.Bytes()...)
+	if c.dropped {
+		out = append(out, "\n[mach: output truncated at cap]"...)
+	}
+	return out
 }
 
 // Run is the daemon main loop: dial the control plane over an outbound
@@ -398,7 +411,10 @@ func runCommandResult(cmdPayload []byte, sem chan struct{}) protocol.ExecResult 
 	c.Env = filteredEnv()
 	runErr := c.Run()
 
-	res := protocol.ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
+	// SetOutput, not a struct literal: the output is bytes, and only SetOutput
+	// knows to carry the exact ones when the text form would be lossy.
+	var res protocol.ExecResult
+	res.SetOutput(stdout.Bytes(), stderr.Bytes())
 	switch {
 	case runErr == nil:
 		res.ExitCode = 0
@@ -583,7 +599,14 @@ func wsURL(server string) string {
 }
 
 func replyExec(conn *protocol.WSConn, reqID string, res protocol.ExecResult) {
-	payload, _ := json.Marshal(res)
+	// protocol.MarshalResult, not json.Marshal: the same encoding has to be used
+	// where the result is sealed (handleSealedExec), and encoding/json's HTML
+	// escaping would inflate the output on both paths.
+	payload, err := protocol.MarshalResult(res)
+	if err != nil {
+		log.Printf("agent: failed to encode exec_result: %v", err)
+		return
+	}
 	if err := conn.WriteEnvelope(protocol.Envelope{Type: "exec_result", ReqID: reqID, Payload: payload}); err != nil {
 		log.Printf("agent: failed to send exec_result: %v", err)
 	}

@@ -64,7 +64,13 @@ func handleSealedExec(conn *protocol.WSConn, env protocol.Envelope, sealed proto
 	res := runCommandResult(cmdPayload, sem)
 	ctl.announce("exec (sealed): exit %d", res.ExitCode)
 
-	resPayload, _ := json.Marshal(res)
+	// The same encoding the plaintext path uses, so a sealed result and an
+	// unsealed one describe the output identically.
+	resPayload, err := protocol.MarshalResult(res)
+	if err != nil {
+		replyExec(conn, env.ReqID, protocol.ExecResult{Error: "e2e: failed to encode result", ExitCode: 126})
+		return
+	}
 	sealedRes, err := e2e.Seal(replyKey, resPayload)
 	if err != nil {
 		log.Printf("agent: e2e seal failed: %v", err)
