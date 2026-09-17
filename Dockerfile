@@ -22,17 +22,27 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+# The release workflow passes the tag in (v0.3.0 becomes 0.3.0). A plain
+# `docker build` leaves this empty, and empty has to mean "no override" rather
+# than an empty version — hence the guard below, which never emits -X without a
+# value. The version literal itself lives in exactly one file
+# (internal/version/version.go) and is deliberately not repeated here.
+ARG MACH_VERSION=
 RUN <<EOF
 set -e
 export CGO_ENABLED=0
-go build -trimpath -ldflags="-s -w" -o /out/mach-server ./cmd/mach-server
+LDFLAGS="-s -w"
+if [ -n "$MACH_VERSION" ]; then
+  LDFLAGS="$LDFLAGS -X github.com/bcross/mach/internal/version.Version=$MACH_VERSION"
+fi
+go build -trimpath -ldflags "$LDFLAGS" -o /out/mach-server ./cmd/mach-server
 mkdir -p /out/agents
-GOOS=darwin  GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/agents/mach-darwin-amd64       ./cmd/mach
-GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o /out/agents/mach-darwin-arm64      ./cmd/mach
-GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/agents/mach-linux-amd64       ./cmd/mach
-GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o /out/agents/mach-linux-arm64       ./cmd/mach
-GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/agents/mach-windows-amd64.exe ./cmd/mach
-GOOS=windows GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o /out/agents/mach-windows-arm64.exe ./cmd/mach
+GOOS=darwin  GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/mach-darwin-amd64       ./cmd/mach
+GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/mach-darwin-arm64      ./cmd/mach
+GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/mach-linux-amd64       ./cmd/mach
+GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/mach-linux-arm64       ./cmd/mach
+GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/mach-windows-amd64.exe ./cmd/mach
+GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/mach-windows-arm64.exe ./cmd/mach
 EOF
 
 FROM alpine:3.20

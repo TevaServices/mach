@@ -3,7 +3,13 @@
 
 services:
   mach-server:
-    build: .
+    build:
+      context: .
+      # Stamps mach-server and all six baked agents with the release version:
+      #   MACH_VERSION=0.3.0 docker compose up -d --build
+      # Left unset (the default), the image reports the compiled-in "devel".
+      args:
+        MACH_VERSION: ${MACH_VERSION:-}
     image: mach-controlplane:latest
     container_name: mach-server
     restart: unless-stopped

@@ -22,9 +22,6 @@ import (
 	"github.com/bcross/mach/internal/store"
 )
 
-// Version matches the agent's version string for now.
-var Version = "0.2.0"
-
 func dbPath() string {
 	if v := os.Getenv("MACH_DB"); v != "" {
 		return v

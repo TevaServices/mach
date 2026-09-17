@@ -46,6 +46,26 @@ go build -o "$WORKDIR/mach" ./cmd/mach || { echo "build mach failed"; exit 1; }
 go build -o "$WORKDIR/mach-server" ./cmd/mach-server || { echo "build mach-server failed"; exit 1; }
 ok "binaries built"
 
+# The version is compiled in and overridden at link time with -X. This is the
+# only check that can prove that path, and it is not optional: -X sets a string
+# symbol only if the linker still has a use for it, and a misspelled symbol path
+# does nothing at all rather than failing — a stamp that silently does not take
+# would leave every release reporting the development default.
+step "version: compiled-in default, and -X overriding it"
+go build -ldflags "-X github.com/bcross/mach/internal/version.Version=9.9.9-test" \
+  -o "$WORKDIR/mach-server-stamped" ./cmd/mach-server || { echo "stamped build failed"; exit 1; }
+OUT=$("$WORKDIR/mach-server-stamped" version); [[ "$OUT" == "mach-server 9.9.9-test "* ]]
+check "an -X build reports the stamped version" $?
+OUT=$("$WORKDIR/mach-server" version); [[ "$OUT" != *"9.9.9-test"* ]]
+check "a plain build reports the compiled-in default, not the injected one" $?
+# Both binaries share one string: the agent and the control plane used to carry
+# separate constants that disagreed, so `mach version` and `mach-server version`
+# answered differently for the same checkout.
+OUT=$("$WORKDIR/mach" version); [[ "$OUT" == "mach "* ]]
+check "the agent binary reports a version too" $?
+[[ "${OUT#mach }" == "$("$WORKDIR/mach-server" version | sed 's/^mach-server //')" ]]
+check "both binaries report the same version" $?
+
 step "control plane up"
 # E2E is turned off for the fleet before the server starts, so that the
 # fleet-wide block list below has something to read: a sealed command is

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/bcross/mach/internal/controlplane"
+	"github.com/bcross/mach/internal/version"
 )
 
 func main() {
@@ -123,7 +124,7 @@ func main() {
 			os.Exit(1)
 		}
 	case "version":
-		fmt.Printf("mach-server %s (%s/%s)\n", controlplane.Version, runtime.GOOS, runtime.GOARCH)
+		fmt.Printf("mach-server %s (%s/%s)\n", version.Version, runtime.GOOS, runtime.GOARCH)
 	default:
 		usage()
 		os.Exit(2)

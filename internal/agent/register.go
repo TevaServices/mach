@@ -13,10 +13,9 @@ import (
 	"time"
 
 	"github.com/bcross/mach/internal/protocol"
+	"github.com/bcross/mach/internal/version"
 	"github.com/skip2/go-qrcode"
 )
-
-var Version = "0.1.0-dev"
 
 // postJSON is the tiny HTTP helper for the enrollment endpoints.
 func postJSON(server, path string, body any, out any) error {
@@ -106,7 +105,7 @@ func registerQRCore(server, org string, id *Identity, e2eKey *E2EKeyPair, tempor
 	warnInsecureServer(server)
 	start, err := postJSON2[protocol.PairStartResponse](server, "/v1/pair/start", protocol.PairStartReq{
 		PubKey: id.PubHex, PubE2E: e2eKey.PublicKeyHex(),
-		Hostname: hostname(), OS: runtime.GOOS, Arch: runtime.GOARCH, AgentVer: Version,
+		Hostname: hostname(), OS: runtime.GOOS, Arch: runtime.GOARCH, AgentVer: version.Version,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("pair start: %w", err)
@@ -121,7 +120,7 @@ func registerQRCore(server, org string, id *Identity, e2eKey *E2EKeyPair, tempor
 	fmt.Println("==========================================================")
 	fmt.Println("mach agent enrollment")
 	fmt.Printf("  server:   %s\n", server)
-	fmt.Printf("  hostname: %s (%s/%s)  agent %s\n", hostname(), runtime.GOOS, runtime.GOARCH, Version)
+	fmt.Printf("  hostname: %s (%s/%s)  agent %s\n", hostname(), runtime.GOOS, runtime.GOARCH, version.Version)
 	fmt.Println()
 	fmt.Println("  1. Scan this QR with your phone (or open the URL):")
 	fmt.Println()
@@ -202,7 +201,7 @@ func registerAPIKeyCore(server, apiKey, name, org string, id *Identity, e2eKey *
 		ServerKey string `json:"server_key"`
 	}](server, "/v1/register/apikey", protocol.RegisterAPIKeyReq{
 		APIKey: apiKey, PubKey: id.PubHex, PubE2E: e2eKey.PublicKeyHex(), Name: name,
-		Hostname: hostname(), OS: runtime.GOOS, Arch: runtime.GOARCH, AgentVer: Version,
+		Hostname: hostname(), OS: runtime.GOOS, Arch: runtime.GOARCH, AgentVer: version.Version,
 		Temporary: temporary,
 	})
 	if err != nil {

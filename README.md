@@ -67,6 +67,7 @@ Explicit subcommands:
 | `mach console <m>` | interactive remote shell: output streams live, stdin and Ctrl-C reach the machine (`:!` runs locally) |
 | `mach audit [m] [n]` | recent command audit log |
 | `mach trust [m]` | pinned E2E keys per machine; `mach trust <m>` accepts a changed key, `--forget` drops the pin |
+| `mach version` | this binary's version and platform (the control plane's own: `mach-server version`) |
 
 A machine's output goes to stdout verbatim; mach's own messages go to stderr
 with a `mach: ` prefix, so a script never has to guess which is which.
@@ -268,3 +269,15 @@ manifests, #5 multi-server) — not in this file.
 Any host with Docker (no Go needed): `docker compose build` builds the
 control plane plus all cross-targets. Local dev with a Go toolchain:
 `go build ./cmd/mach`.
+
+Builds are unstamped by default and report `devel`. Stamp a version with
+`MACH_VERSION=0.3.0 mise run build`, or straight through the linker:
+
+```
+go build -ldflags "-X github.com/bcross/mach/internal/version.Version=0.3.0" ./cmd/mach
+```
+
+One string serves everything: both binaries, and the six agent binaries baked
+into the container image. Signed-in operators see the control plane's version in
+the web UI nav, and any machine whose agent reports a different version is
+marked `differs` in the fleet table.
