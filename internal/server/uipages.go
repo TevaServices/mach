@@ -22,6 +22,8 @@ import (
 	"bytes"
 	"html/template"
 	"net/http"
+
+	"github.com/bcross/mach/internal/version"
 )
 
 // View models. The row types live next to the code that assembles them
@@ -51,6 +53,12 @@ type uiShellData struct {
 	// both advertise an admin surface and offer links that only bounce to a
 	// sign-in that visitor cannot complete.
 	Public bool
+	// Version is the control plane's own version, rendered next to the signed-in
+	// operator. It is set only for a page rendered for a live session: the
+	// enrollment page is anonymous, and so are the sign-in message pages (which
+	// render through this same shell with Public false), and neither has any
+	// reason to tell a visitor which build to look up advisories for.
+	Version string
 	// Content is pre-rendered markup. See shellTemplate's comment: it is the
 	// output of an html/template execution, which is why it may be trusted.
 	Content template.HTML
@@ -102,6 +110,12 @@ input[type=text] { font: inherit; padding: .3rem .4rem; }
     </form>
   </span>
   {{end}}
+  {{/* Deliberately a sibling of the CSRF block above, not a child of it, so the
+       session check in renderPage is the single gate that withholds this.
+       Nesting it inside that block would look right and be wrong: a second,
+       implicit gate would hide the first from any test, so a later refactor
+       could move this span and leak the version with the tests still green. */}}
+  {{if .Version}}<span class="muted" title="the control plane build managing this fleet">mach-server {{.Version}}</span>{{end}}
 </nav>{{end}}
 {{if .Notice}}<p class="notice">{{.Notice}}</p>{{end}}
 {{.Content}}
@@ -134,7 +148,7 @@ const fleetSource = `
         {{else}}<span class="badge offline">offline</span>{{end}}
       </td>
       <td class="muted">{{.OS}}/{{.Arch}}</td>
-      <td class="muted">{{.AgentVer}}</td>
+      <td class="muted">{{.AgentVer}}{{if .AgentSkew}} <span class="badge" title="this agent reports a different version than this control plane">differs</span>{{end}}</td>
       <td>
         <div class="row-actions">
         {{if not .Revoked}}
@@ -328,10 +342,20 @@ var (
 // renderPage executes a content template and wraps it in the shared shell.
 func (s *Server) renderPage(w http.ResponseWriter, status int, sess uiSession, notice, title string,
 	tmpl *template.Template, define string, data any) {
-	s.renderIntoShell(w, status, uiShellData{
+	shell := uiShellData{
 		Title: title, CSRF: sess.CSRF, Email: sess.Ident.Email,
 		Subject: sess.Ident.Subject, Notice: notice,
-	}, tmpl, define, data)
+	}
+	// Only a page rendered for a verified identity carries the version — and the
+	// test is the session, not Public: renderSignInMessage renders this same
+	// shell with Public false and an empty uiSession (a callback that arrived
+	// without its state, an unreachable provider), and that visitor is anonymous.
+	// oidcauth refuses an identity with no subject, so a non-empty one is proof
+	// of a completed sign-in.
+	if sess.Ident.Subject != "" {
+		shell.Version = version.Version
+	}
+	s.renderIntoShell(w, status, shell, tmpl, define, data)
 }
 
 // renderPublicPage renders through the same shell with no operator chrome, for

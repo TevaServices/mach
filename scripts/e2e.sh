@@ -598,6 +598,22 @@ check "signed-in page lists the machine" $?
 CSRF=$(python3 -c "import re,sys; h=open('$WORKDIR/ui-fleet.html').read(); m=re.search(r'X-CSRF-Token\":\"([a-f0-9]+)\"',h); print(m.group(1) if m else '')")
 [[ -n "$CSRF" ]]; check "page carries a per-session CSRF token" $?
 
+# The control plane's own version, taken from the binary serving this page rather
+# than hardcoded, so this does not have to be updated when the version changes.
+UI_VER=$("$WORKDIR/mach-server" version | awk '{print $2}')
+OUT=$(grep -c "mach-server $UI_VER" "$WORKDIR/ui-fleet.html"); [[ "$OUT" -ge 1 ]]
+check "the signed-in page carries the control plane's version" $?
+# And is withheld from someone who is not signed in. The enrollment page is the
+# anonymous case here; the sign-in message pages (which render the same shell
+# without a session) are covered by unit tests, since they need no live server.
+curl -sS -o "$WORKDIR/ui-enroll.html" "$UI_BASE/"
+OUT=$(grep -c "mach-server $UI_VER" "$WORKDIR/ui-enroll.html"); [[ "$OUT" -eq 0 ]]
+check "the public enrollment page withholds the version" $?
+# The enrolled agent is this same build, so nothing is flagged. This is the
+# false-positive guard: comparing the string against itself must not mark skew.
+OUT=$(grep -c "differs" "$WORKDIR/ui-fleet.html"); [[ "$OUT" -eq 0 ]]
+check "no skew badge when the agent matches the control plane" $?
+
 # A cross-site post and a token-less post must both be refused, and must leave
 # the machine alone.
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$UI_BASE/ui/block" -b "$JAR" \

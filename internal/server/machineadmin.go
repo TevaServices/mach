@@ -22,6 +22,7 @@ import (
 	"net/http"
 
 	"github.com/bcross/mach/internal/protocol"
+	"github.com/bcross/mach/internal/version"
 )
 
 // errNoSuchMachine distinguishes "that machine does not exist" from a store
@@ -244,9 +245,16 @@ type fleetRow struct {
 	OS       string
 	Arch     string
 	AgentVer string
-	Online   bool
-	Blocked  bool
-	Revoked  bool
+	// AgentSkew marks a machine whose agent reports a version other than this
+	// control plane's own. It is a hint, not a fault: a machine mid-update, or an
+	// agent binary baked into an older image, is meant to differ for a while —
+	// which is why the template styles it neutrally. Only set for a reported
+	// version: a machine that enrolled but has never sent a hello has nothing to
+	// compare, and flagging it would be an assertion about a value we do not have.
+	AgentSkew bool
+	Online    bool
+	Blocked   bool
+	Revoked   bool
 	// Temporary marks an enrollment that belongs to a session rather than to a
 	// machine (plain `mach` on a target). Shown so an operator can tell a
 	// throwaway row from a real one, and so a session that never got to retire
@@ -265,8 +273,10 @@ func (s *Server) fleetRows() ([]fleetRow, error) {
 	for _, m := range machines {
 		rows = append(rows, fleetRow{
 			Name: m.Name, Hostname: m.Hostname, OS: m.OS, Arch: m.Arch,
-			AgentVer: m.AgentVer, Online: online[m.Name],
-			Blocked: m.Blocked, Revoked: m.Revoked, Temporary: m.Temporary,
+			AgentVer:  m.AgentVer,
+			AgentSkew: m.AgentVer != "" && m.AgentVer != version.Version,
+			Online:    online[m.Name],
+			Blocked:   m.Blocked, Revoked: m.Revoked, Temporary: m.Temporary,
 		})
 	}
 	return rows, nil
