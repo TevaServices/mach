@@ -444,6 +444,35 @@ TMP_CODE=$(grep -oE '[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}' "$WORKDIR/agent-tmp.lo
 [[ -n "$TMP_CODE" ]]; check "temporary session printed its challenge code" $?
 OUT=$(cat "$WORKDIR/agent-tmp.log" 2>&1)
 [[ "$OUT" == *"TEMPORARY session"* ]]; check "plain mach announces that it is temporary" $?
+
+# The QR carries the org and a machine name suggested from this host's hostname,
+# so the phone has only the challenge code left to type. The URL is checked as
+# *printed*, which is also the text an operator reads off the console.
+ORG_LC=$(printf '%s' "$ORG" | tr '[:upper:]' '[:lower:]')
+QR_URL=$(grep -oE '/pair/[a-f0-9]{64}\?[^ "]*' "$WORKDIR/agent-tmp.log" | head -1)
+# Both parameters, in whatever order url.Values.Encode() sorted them.
+[[ "$QR_URL" == *"org=$ORG_LC"* && "$QR_URL" == *"name="* ]]
+check "the QR URL carries the pre-filled org and machine name" $?
+# The code must NOT be in it: it is the one thing that keeps a photograph of the
+# QR useless, and the whole pre-fill feature is downstream of that staying true.
+[[ -n "$QR_URL" && "$QR_URL" != *"$TMP_CODE"* ]]
+check "the QR URL does not carry the challenge code" $?
+# The page that URL opens really is pre-filled, and this is the SEAM worth
+# covering: the agent folds a hostname into a name and the control plane decides
+# whether to show it, and the two have their own rules. Each side's unit tests can
+# agree with the rule and still disagree with each other, so what is asserted here
+# is that the name the QR carries comes back out of the page unchanged.
+QR_NAME=$(printf '%s' "$QR_URL" | sed -n 's/.*[?&]name=\([^&]*\).*/\1/p')
+[[ -n "$QR_NAME" ]]; check "the QR suggests a usable machine name" $?
+OUT=$(curl -sS "$BASE$QR_URL" 2>&1)
+[[ "$OUT" == *"value=\"$QR_NAME\""* ]]; check "the pair page shows the agent's own suggestion unchanged" $?
+[[ "$OUT" == *"<option value=\"$ORG_LC\" selected>"* ]]; check "the pair page pre-fills the org in a dropdown" $?
+[[ "$OUT" == *"suggested by the"* ]]; check "and says where the suggestion came from" $?
+# An unconfigured org in the query string is dropped rather than pre-selected:
+# the dropdown only offers orgs that exist, so showing one it cannot offer would
+# leave the operator looking at a different org than the one they were told.
+OUT=$(curl -sS "$BASE/pair/$TMP_TOKEN?org=notaconfiguredorg&name=x" 2>&1)
+[[ "$OUT" != *"notaconfiguredorg"* ]]; check "an unconfigured org is not pre-selected" $?
 curl -s -o /dev/null -X POST "$BASE/pair/$TMP_TOKEN" \
   --data "code=$TMP_CODE&org=$ORG&name=$TMP_PART&approve=1"
 sleep 3
