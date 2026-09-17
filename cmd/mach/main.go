@@ -187,6 +187,12 @@ func consoleMain(args []string) {
 			fmt.Println("no machines enrolled")
 			return
 		}
+		// A header row, matching the columns printed below. The interactive
+		// table in defaultui.go has one and this did not, which left the AGENT
+		// column reading as a bare version string with no label. Note the two
+		// tables are not the same shape: this one carries the E2E column and
+		// that one does not, so the header cannot simply be copied from it.
+		fmt.Printf("%-20s %-8s %-10s %-18s %-8s %s\n", "NAME", "STATE", "OS/ARCH", "HOSTNAME", "E2E", "AGENT")
 		for _, m := range machines {
 			status := "offline"
 			if m.Online {
