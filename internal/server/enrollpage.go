@@ -97,14 +97,20 @@ var platformRows = []platformRow{
 // It is also the copy-paste block: choosing the wrong architecture is the most
 // common way to get a binary that will not run, and the tabs are how an operator
 // corrects the guess the user agent made.
+// The download button and the command block used to carry their own hardcoded
+// colours (#111 background, #555 text), which is unreadable on a dark screen:
+// the page declares `color-scheme: light dark` and so renders dark by default
+// for a viewer who prefers it. They now take their colours from the shared
+// styling (uiBaseCSS) like every other page, which is also what makes this page
+// and the phone-facing pair page look like the same product.
 const enrollPickSource = `{{define "enrollpick"}}
 <div id="enroll-pick">
 {{if .HasDL}}
 <p>Recommended for <b>{{.PrimaryOS}}</b>{{if .Detected}} (detected from your browser){{end}}:</p>
-<p><a href="{{.PrimaryDL}}" style="display:inline-block;font-size:1.1rem;padding:0.7rem 1.4rem;background:#111;color:#fff;text-decoration:none;">Download for {{.PrimaryOS}}</a>
-<code style="color:#555;">{{.PrimaryFN}}</code></p>
-<pre id="cmds" style="background:#8882;padding:.8rem;overflow-x:auto;">chmod +x {{.RunAs}}
-{{.RunAs}}   <span style="color:#555;"># then scan the QR it prints</span></pre>
+<p><a class="btn-primary" href="{{.PrimaryDL}}">Download for {{.PrimaryOS}}</a>
+<code class="muted">{{.PrimaryFN}}</code></p>
+<pre id="cmds" class="panel" style="overflow-x:auto;">chmod +x {{.RunAs}}
+{{.RunAs}}   <span class="muted"># then scan the QR it prints</span></pre>
 <p><button type="button" data-copy="#cmds">Copy commands</button></p>
 {{else}}
 <p>No build is available for that platform on this control plane.</p>
