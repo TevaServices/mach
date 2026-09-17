@@ -45,7 +45,7 @@ func sealedExecForTest(t *testing.T, command string) protocol.ExecResult {
 	// without writing one. This test still loads it from a state dir, so the
 	// file-backed path stays exercised.
 	handleSealedExec(conn, protocol.Envelope{Type: "exec", ReqID: "sealed-1", Payload: payload},
-		req, machine, make(chan struct{}, 1))
+		req, machine, make(chan struct{}, 1), nil)
 
 	env := readEnvelope(t, peer)
 	if env.Type != "exec_result" {

@@ -304,9 +304,9 @@ func dialAndServe(cfg *Config, id *Identity, e2eKey *E2EKeyPair, ctl *sessionCtl
 		}
 		switch env.Type {
 		case "exec":
-			go handleExecFrame(conn, env, execSem, e2eKey)
+			go handleExecFrame(conn, env, execSem, e2eKey, ctl)
 		case "exec_stream":
-			go handleStream(conn, env, execSem)
+			go handleStream(conn, env, execSem, ctl)
 		case "stream_stdin", "stream_kill":
 			// Routed to a live session via the stream registry (server
 			// relays by session ID). Sessions not found are ignored —
@@ -420,9 +420,32 @@ func runCommandResult(cmdPayload []byte, sem chan struct{}) protocol.ExecResult 
 	return res
 }
 
-func handleExec(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{}) {
+func handleExec(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{}, ctl *sessionCtl) {
+	ctl.announce("exec: %q", describePayloadCommand(env.Payload))
 	res := runCommandResult(env.Payload, sem)
+	ctl.announce("exec: exit %d", res.ExitCode)
 	replyExec(conn, env.ReqID, res)
+}
+
+// describeCommandText renders a command for the temporary session's console.
+// Display only — the caller quotes it, and nothing in the agent reads it back:
+// what runs is decided by the payload and the two policy layers, not by this.
+func describeCommandText(command string, argv []string) string {
+	if len(argv) > 0 {
+		return strings.Join(argv, " ")
+	}
+	return command
+}
+
+// describePayloadCommand is a lenient parse purely for the console trace. A
+// payload that will not parse is named as such here and refused by
+// runCommandResult, so the two cannot appear to disagree about what happened.
+func describePayloadCommand(payload []byte) string {
+	var cmd protocol.ExecCommand
+	if err := json.Unmarshal(payload, &cmd); err != nil {
+		return "(unparseable exec payload)"
+	}
+	return describeCommandText(cmd.Command, cmd.Argv)
 }
 
 // handleUpdate verifies and applies a pushed update, then execs the new

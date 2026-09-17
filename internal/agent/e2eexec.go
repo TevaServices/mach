@@ -16,16 +16,16 @@ import (
 // agent opens it with its X25519 key, executes, and seals the ExecResult
 // back to the console's ephemeral reply key. The control plane relays
 // ciphertext only.
-func handleExecFrame(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{}, e2eKey *E2EKeyPair) {
+func handleExecFrame(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{}, e2eKey *E2EKeyPair, ctl *sessionCtl) {
 	var sealed protocol.SealedExecCommand
 	if err := json.Unmarshal(env.Payload, &sealed); err == nil && sealed.SealedB64 != "" {
-		handleSealedExec(conn, env, sealed, e2eKey, sem)
+		handleSealedExec(conn, env, sealed, e2eKey, sem, ctl)
 		return
 	}
-	handleExec(conn, env, sem)
+	handleExec(conn, env, sem, ctl)
 }
 
-func handleSealedExec(conn *protocol.WSConn, env protocol.Envelope, sealed protocol.SealedExecCommand, e2eKey *E2EKeyPair, sem chan struct{}) {
+func handleSealedExec(conn *protocol.WSConn, env protocol.Envelope, sealed protocol.SealedExecCommand, e2eKey *E2EKeyPair, sem chan struct{}, ctl *sessionCtl) {
 	inner, err := openSealedCommand(e2eKey, sealed)
 	if err != nil {
 		// Cannot read the command; tell the console in the clear only that
@@ -54,8 +54,15 @@ func handleSealedExec(conn *protocol.WSConn, env protocol.Envelope, sealed proto
 	}
 	cmdPayload, _ := json.Marshal(cmd)
 
+	// Announced after opening, never before: the console trace is the *point* of
+	// the temporary session, and a sealed command's text exists here and nowhere
+	// else on this machine — the control plane relayed ciphertext it could not
+	// read. So the operator watching their own box sees what was run on it.
+	ctl.announce("exec (sealed): %q", describeCommandText(cmd.Command, cmd.Argv))
+
 	// Execute with the standard path but capture the result for sealing.
 	res := runCommandResult(cmdPayload, sem)
+	ctl.announce("exec (sealed): exit %d", res.ExitCode)
 
 	resPayload, _ := json.Marshal(res)
 	sealedRes, err := e2e.Seal(replyKey, resPayload)
