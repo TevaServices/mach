@@ -219,7 +219,7 @@ func (s *Server) refreshOrgs(w http.ResponseWriter, r *http.Request, sess uiSess
 			http.Error(w, "store error", http.StatusInternalServerError)
 			return
 		}
-		s.renderFragment(w, sess, orgsTemplate, "orgs", orgsData{Rows: rows, CSRF: sess.CSRF})
+		s.renderFragment(w, sess, uiTmpl, "orgs", orgsData{Rows: rows, CSRF: sess.CSRF})
 		return
 	}
 	http.Redirect(w, r, "/ui/orgs?n="+noticeCode, http.StatusSeeOther)

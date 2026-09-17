@@ -11,6 +11,7 @@ package server
 // those are about the crypto.
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -745,4 +746,72 @@ func TestUIStaticAllowlist(t *testing.T) {
 			t.Fatalf("%s was served, want 404", bad)
 		}
 	}
+}
+
+// The fleet page polls, and the poll target is the table — not the whole block.
+//
+// This is a regression test for a real annoyance: polling used to replace the
+// container, so a Delete confirmation opened from a row (and the machine name
+// half-typed into it) was discarded by the next five-second tick. The panel has
+// to be a sibling of the polled element for that to stop happening, which is a
+// structural property of the markup and not something a behavioural assertion
+// below the page can see.
+func TestUIFleetPollTargetLeavesTheConfirmPanelAlone(t *testing.T) {
+	s, st, _ := newUITestServer(t)
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	page := renderTemplate(t, "fleet", fleetData{Rows: mustFleetRows(t, s), CSRF: "tok"})
+	poll := renderTemplate(t, "fleettable", fleetData{Rows: mustFleetRows(t, s), CSRF: "tok"})
+
+	// The container polls into #fleet-table...
+	if !strings.Contains(page, `hx-target="#fleet-table"`) {
+		t.Errorf("the fleet block does not poll into #fleet-table:\n%s", page)
+	}
+	// ...and the panel the confirmation is written into is outside that target,
+	// so a tick cannot reach it.
+	if !strings.Contains(poll, `id="fleet-table"`) {
+		t.Errorf("the polled fragment has no #fleet-table root:\n%s", poll)
+	}
+	if strings.Contains(poll, `id="confirm"`) {
+		t.Errorf("the polled fragment contains the confirmation panel — a tick would wipe it:\n%s", poll)
+	}
+	if !strings.Contains(page, `id="confirm"`) {
+		t.Errorf("the fleet block has nowhere to put a confirmation:\n%s", page)
+	}
+	// The row's Delete button opens the panel rather than replacing the row,
+	// which is the other half of "the table refreshing must not disturb it".
+	if !strings.Contains(page, `hx-target="#confirm"`) {
+		t.Errorf("the Delete button does not target the confirmation panel:\n%s", page)
+	}
+	// And the polled fragment always carries its id, even with no machines: a
+	// response without it would leave every later tick with nothing to swap into,
+	// so the table could never come back once the fleet emptied.
+	empty := renderTemplate(t, "fleettable", fleetData{CSRF: "tok"})
+	if !strings.Contains(empty, `id="fleet-table"`) {
+		t.Errorf("the empty fleet fragment has no #fleet-table root:\n%s", empty)
+	}
+}
+
+// mustFleetRows is fleetRows with the error turned into a test failure, so the
+// markup assertions below stay about markup.
+func mustFleetRows(t *testing.T, s *Server) []fleetRow {
+	t.Helper()
+	rows, err := s.fleetRows()
+	if err != nil {
+		t.Fatalf("fleetRows: %v", err)
+	}
+	return rows
+}
+
+// renderTemplate executes one UI define the way the handlers do, for tests that
+// are about the shape of the markup rather than about a request.
+func renderTemplate(t *testing.T, define string, data any) string {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := uiTmpl.ExecuteTemplate(&buf, define, data); err != nil {
+		t.Fatalf("template %s: %v", define, err)
+	}
+	return buf.String()
 }

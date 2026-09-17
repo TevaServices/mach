@@ -172,8 +172,16 @@ const shellSource = `<!doctype html>
 // composition mechanism, not an escaping bypass.
 var shellTemplate = template.Must(template.New("shell").Parse(shellSource))
 
-const fleetSource = `
-<div id="fleet" hx-get="/ui/machines" hx-trigger="every 5s" hx-swap="outerHTML">
+// fleetInnerSource is the polled region: the table (or the empty-state note),
+// and nothing else. It is a separate define from the block that contains it
+// because the two live in different swap targets — see fleetSource.
+//
+// It always renders an element with id="fleet-table", including when there are
+// no machines. That is not cosmetic: the poll swaps into #fleet-table by id, and
+// a response that omitted the id would leave every later poll with nothing to
+// target, so the table would never come back once the fleet emptied.
+const fleetInnerSource = `{{define "fleettable"}}
+<div id="fleet-table">
 {{if not .Rows}}
   <p class="muted">No machines enrolled yet. <a href="/">Enrollment page</a></p>
 {{else}}
@@ -217,10 +225,10 @@ const fleetSource = `
             <button type="submit">Revoke</button>
           </form>
         {{end}}
-        <form class="inline" method="post" action="/ui/delete" hx-post="/ui/delete" hx-target="#m-{{.Name}}" hx-swap="outerHTML">
+        <form class="inline" method="post" action="/ui/delete" hx-post="/ui/delete" hx-target="#confirm" hx-swap="innerHTML">
           <input type="hidden" name="machine" value="{{.Name}}">
           <input type="hidden" name="csrf" value="{{$.CSRF}}">
-          <button type="submit">Delete…</button>
+          <button type="submit">Delete</button>
         </form>
         </div>
       </td>
@@ -228,50 +236,81 @@ const fleetSource = `
   {{end}}
   </tbody></table>
 {{end}}
-</div>`
-
-const fleetTemplateSource = `{{define "fleet"}}` + fleetSource + `{{end}}`
-
-// deleteConfirmSource replaces one row with a typed-name confirmation. A dialog
-// would be a click through; the name is deliberately typed, because delete is
-// the one action that removes the tombstone stopping a stolen key from
-// re-enrolling, and it must not be reachable by a misclick on the wrong row.
-const deleteConfirmSource = `{{define "deleteconfirm"}}
-<tr id="m-{{.Name}}">
-  <td><code>{{.Name}}</code></td>
-  <td colspan="4">
-    <p>This removes <code>{{.Name}}</code> and its key from the database. The name
-    and the key are freed, so this host (or another with the same name) can enroll
-    again. Audit rows are kept.</p>
-    {{if .Online}}
-    <p class="muted">The agent is connected and will be told to retire. An agent
-    that is offline is not told, and will keep retrying until it is stopped on
-    the host.</p>
-    {{else}}
-    <p class="muted">The agent is not connected, so it cannot be told to retire.
-    It will keep retrying until it is stopped on the host.</p>
-    {{end}}
-    <form method="post" action="/ui/delete" hx-post="/ui/delete" hx-target="#fleet" hx-swap="outerHTML">
-      <input type="hidden" name="machine" value="{{.Name}}">
-      <input type="hidden" name="confirm" value="1">
-      <input type="hidden" name="csrf" value="{{.CSRF}}">
-      <label>Type <code>{{.Name}}</code> to confirm
-        <input type="text" name="confirm_name" autocomplete="off" autofocus></label>
-      <button type="submit">Delete permanently</button>
-      <button type="button" hx-get="/ui/machines" hx-target="#fleet" hx-swap="outerHTML">Cancel</button>
-    </form>
-  </td>
-</tr>
+</div>
 {{end}}`
 
+// fleetSource is the whole fleet block: the polled table inside a container that
+// owns the polling, plus the panel the Delete confirmation is written into.
+//
+// The split is the fix for a real annoyance rather than a preference. Polling
+// used to replace this whole container every five seconds, so a confirmation
+// opened from a row — and the machine name half-typed into it — was thrown away
+// by the next tick. The panel is now a sibling of the polled element, so a tick
+// refreshes the table and leaves an open confirmation alone.
+const fleetSource = `{{define "fleet"}}
+<div id="fleet" hx-get="/ui/machines" hx-trigger="every 5s" hx-target="#fleet-table" hx-swap="outerHTML">
+{{template "fleettable" .}}
+<div id="confirm"></div>
+</div>
+{{end}}`
+
+// deleteConfirmSource renders the typed-name confirmation into #confirm. It sits
+// outside the polled region (see fleetSource), which is why it is a block of its
+// own rather than a row replacing itself.
+//
+// A dialog would be a click through; the name is deliberately typed, because
+// delete is the one action that removes the tombstone stopping a stolen key from
+// re-enrolling, and it must not be reachable by a misclick on the wrong row.
+//
+// Submitting targets #fleet, whose response is the whole container again — a
+// refreshed table with an empty panel. One target, so the table cannot be
+// updated while the dialog stays on screen describing a machine that is gone.
+// Cancel is a plain GET because dismissing a dialog changes nothing, and
+// hx-params="none" keeps the form's fields (the session's CSRF token among them)
+// out of a URL.
+const deleteConfirmSource = `{{define "deleteconfirm"}}
+<div class="panel">
+  <p>This removes <code>{{.Name}}</code> and its key from the database. The name
+  and the key are freed, so this host (or another with the same name) can enroll
+  again. Audit rows are kept.</p>
+  {{if .Online}}
+  <p class="muted">The agent is connected and will be told to retire. An agent
+  that is offline is not told, and will keep retrying until it is stopped on
+  the host.</p>
+  {{else}}
+  <p class="muted">The agent is not connected, so it cannot be told to retire.
+  It will keep retrying until it is stopped on the host.</p>
+  {{end}}
+  <form method="post" action="/ui/delete" hx-post="/ui/delete" hx-target="#fleet" hx-swap="outerHTML">
+    <input type="hidden" name="machine" value="{{.Name}}">
+    <input type="hidden" name="confirm" value="1">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label>Type <code>{{.Name}}</code> to confirm
+      <input type="text" name="confirm_name" autocomplete="off" autofocus></label>
+    <p class="row-actions">
+      <button class="btn-primary" type="submit">Delete permanently</button>
+      <button type="button" hx-get="/ui/confirm/clear" hx-target="#confirm"
+              hx-swap="innerHTML" hx-params="none">Cancel</button>
+    </p>
+  </form>
+</div>
+{{end}}`
+
+// confirmClearedSource is the empty panel Cancel swaps in.
+const confirmClearedSource = `{{define "confirmcleared"}}{{end}}`
+
+// orgsSource lists orgs and their machine counts. E2E is shown here read-only —
+// the control for it lives on the org's own page, where the effective value and
+// where it comes from are both visible, rather than as three buttons whose
+// difference ("on", "off", "inherit") was not obvious from a list row.
 const orgsSource = `{{define "orgs"}}
 <div id="orgs">
 <h2>Orgs</h2>
 <p class="muted">Names are org-prefixed (<code>&lt;org&gt;-&lt;machine&gt;</code>).
 Adding an org makes that prefix enrollable. An org that came from the environment
-is pinned and cannot be removed here.</p>
+is pinned and cannot be removed here. E2E is a per-org setting, on the org's page.</p>
 <table>
-<thead><tr><th>Org</th><th>Machines</th><th>Sealed exec</th><th>Actions</th></tr></thead>
+<thead><tr><th>Org</th><th>Machines</th><th>E2E</th><th>Actions</th></tr></thead>
 <tbody>
 {{range .Rows}}
   <tr>
@@ -376,13 +415,13 @@ const loginFailedSource = `{{define "loginfailed"}}
 persists check the control plane's log for the discovery error.</p>
 {{end}}`
 
-var (
-	fleetTemplate         = template.Must(template.New("ui").Parse(fleetTemplateSource))
-	deleteConfirmTemplate = template.Must(template.New("ui").Parse(deleteConfirmSource))
-	orgsTemplate          = template.Must(template.New("ui").Parse(orgsSource))
-	memberTemplate        = template.Must(template.New("ui").Parse(memberSource))
-	loginFailedTemplate   = template.Must(template.New("ui").Parse(loginFailedSource))
-)
+// uiTmpl is every UI markup define, in one set. It is one set rather than one
+// per page because the pages now nest: the fleet page embeds the polled table,
+// and one org's page embeds its E2E control, so a define has to be resolvable
+// from the template that includes it.
+var uiTmpl = template.Must(template.New("ui").Parse(
+	fleetInnerSource + fleetSource + deleteConfirmSource + confirmClearedSource +
+		orgsSource + memberSource + loginFailedSource))
 
 // renderPage executes a content template and wraps it in the shared shell.
 func (s *Server) renderPage(w http.ResponseWriter, status int, sess uiSession, notice, title string,
