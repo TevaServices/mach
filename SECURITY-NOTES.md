@@ -117,9 +117,9 @@ from the broker; nothing protects content from the machine's own operator.
 | Per-connection challenge-bound agent hello (replay-proof) | server/agent.go, agent/run.go |
 | Control-plane identity key persisted & pinned by agents; signed update manifests (sig over version\|sha256) | server/serverkey.go, agent/run.go handleUpdate |
 | Pairing tokens: 256-bit, single-use, ~10 min TTL | store.CreatePairing |
-| Challenge codes: 12 chars, agent-console-only, typed blind on phone; 5 wrong attempts expire the pairing | store.NewChallengeCode, server/pairpages.go |
+| Challenge codes: 12 chars, agent-console-only, typed blind on phone; 5 wrong attempts expire the pairing. **Never placed in the QR, the URL or the pair page** — the QR carries the org and a suggested machine name, and the code stays on the agent's console, so a photograph of the QR alone still grants nothing | store.NewChallengeCode, server/pairpages.go, agent/register.go pairPrefill |
 | Pair-start rate limit (5 per IP / 10 min) and auth-failure rate limit (20 / 10 min) | server.go, consoleapi.go |
-| Org-prefixed machine names, no hostname-derived suggestions, conflicts error | store.ValidOrgName, server/orgs.go, pairpages.go |
+| Org-prefixed machine names, conflicts error, and every submitted name validated regardless of what the QR suggested. The pair page pre-fills the org and a hostname-derived machine name **as editable defaults under a line saying the agent supplied them** (the `org` and `name` query parameters on the pair link); a suggested value is shown only if it satisfies `store.ValidMachinePart` (the store's own rule, not a second one) and is re-validated on submit, and nothing acts on it | store.ValidOrgName/ValidMachinePart, server/orgs.go, pairpages.go suggestedOrg/suggestedNamePart, agent/register.go suggestMachinePart |
 | Scoped API keys (enroll / readonly / exec:* / exec:m1\|m2), server-generated 192-bit secrets, stretched salted hashes | controlplane.AddAPIKey, store |
 | Read-only keys see the whole fleet and the whole audit trail, and nothing else | server/consoleapi.go canRead/readScope |
 | **Fleet-wide command block list** (`MACH_EXEC_POLICY` / `MACH_EXEC_POLICY_FILE`), enforced for every key, scope and machine before dispatch — on `mach exec` **and** on the streaming console | server/policy.go, consoleapi.go handleExec, stream.go handleConsoleStreamWS |
@@ -133,6 +133,8 @@ from the broker; nothing protects content from the machine's own operator.
 | Confinement of remote commands: own process group (unix), SIGKILL as a tree on timeout (Windows: timeout + caps only) | agent/confine*.go |
 | Output caps per path, with visible truncation markers; streamed frames dropped rather than stalling an agent whose console stopped reading | agent/run.go, agent/streamexec.go |
 | Machine output is data, never input: nothing in the agent reads it back, and the console labels it rather than parsing a control fact out of text | agent/run.go, console/client.go, console/stream.go |
+| **One command is one execution, and a sealed command is never downgraded automatically**: the only plaintext fallback is a `403`, which the control plane returns before anything is dispatched. A lost or oversized sealed reply is reported instead — re-sending it would be a second execution of a command that may already have run, and the plaintext retry would hand the control plane and the audit log the text of a command the operator sent sealed | console/client.go sealedExec, apiError |
+| **Command output is bytes**: carried base64 alongside the JSON text form whenever that form would be lossy (a JSON string must be valid UTF-8, so Go's encoder replaced every invalid byte with U+FFFD), so binary output survives `mach exec` intact instead of coming back mangled and longer | protocol.ExecResult SetOutput/Output, agent/run.go, console/client.go |
 | Audit log with secret-value redaction; every dispatched command recorded on both paths; refusals audited too; a stream that dies without an exit status recorded as `-1`; optional purge on revoke | store.RedactScrubs/AuditInsert/RemoveMachineAudit, server/stream.go |
 | Signed in-toto attestations for released agent binaries, verified before an update can be queued | internal/release, controlplane/attest.go |
 | Revocation: self-retiring agents, names and keys stay reserved. **A revoked OR temporary machine can be taken over by re-enrolling it — and only one of those two**: the guard is the `WHERE revoked=1 OR temporary=1` in `store.reenroll`, so an actively enrolled **permanent** machine's name and key can never be taken by an enrollment | store.RevokeMachine/reenroll, server enrollmentRefusal, agent errRevoked |
@@ -220,8 +222,13 @@ difference. A file that becomes unreadable later keeps the last good rules.
 Two command paths, and they are different on purpose.
 
 **One-shot (`mach exec`)**: the agent runs the command, buffers the output, and
-returns a single `ExecResult` — exit code, stdout, stderr. Being one object in
-each direction is what makes it sealable, and it is the path that carries the
+returns a single `ExecResult` — exit code, stdout, stderr. A command is run
+exactly once: if the sealed reply is lost (the agent did not answer in time, or
+the reply was too large for the client to read), the client says so and stops
+rather than retrying in plaintext — resending would be a second execution of a
+command that may already have run, and the retry would hand the control plane,
+and the audit log, the text of a command the operator sent sealed.
+Being one object in each direction is what makes it sealable, and it is the path that carries the
 8 MiB cap. The console prints the machine's bytes to stdout and its own
 diagnostics to stderr with a `mach: ` prefix; `--json` prints that one result
 object instead, so a program reads the exit status as a field rather than
@@ -325,7 +332,12 @@ signature protects delivery, the attestation records provenance.
    command and result at once, a live session is neither.
 4. **Output caps are per-path and lossy at the edges**: a buffered command
    producing more than 8 MiB loses the tail; a slow console loses streamed
-   frames. Both are marked visibly, but they are not recoverable.
+   frames. Both are marked visibly, but they are not recoverable. The one-shot
+   path's *reply* bound (`protocol.MaxExecReplyBytes`) is deliberately much
+   larger than the agent's per-stream cap (`protocol.MaxOutputBytes`), so the
+   marker is reachable; the pathological case — 8 MiB of NUL bytes on both
+   streams, sealed — can still exceed it, and there the client says the reply was
+   too large to read rather than re-sending the command.
 5. **The control plane hands out the key the seal uses**, so it can substitute one
    before a console has ever sealed to a machine. Trust-on-first-use pinning makes
    a later substitution loud and one-shot, not impossible (see "Trust model"), and

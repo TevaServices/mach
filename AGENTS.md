@@ -59,9 +59,24 @@ This is `mach`: remote CLI access to registered machines, outbound-only
 4. **Challenge codes** are 12 chars (Crockford-ish alphabet, ~60 bits) and
    are printed ONLY on the agent console; the pair page never displays them
    and users type them blind. 5 wrong attempts expire the pairing.
+   **They are also never in the QR or in the pair URL.** The QR now carries the
+   org and a suggested machine name (invariant 5), and adding the code to that
+   list would be the end of the property the code exists for: a photograph of
+   the QR would grant any name in any org for the life of the pairing. The code
+   stays on the machine's own screen, read by a person standing at it.
 5. **Names are org-prefixed** (`<org>-<machine>`, validated by
-   `store.ValidOrgName`); taken names error and require a new name. The
-   pair page must never suggest names from agent-reported hostnames.
+   `store.ValidOrgName`); taken names error and require a new name. The pair
+   page may **pre-fill** the org and a machine name from the QR — a
+   `/pair/<token>` link carrying `org` and `name` parameters — but those are
+   only defaults in editable fields.
+   The name is agent-reported (the hostname), so it is shown under a line saying
+   so, and whatever is submitted is validated by `store.ValidOrgName` and the
+   enrollment policy exactly as before. What must never happen is a name being
+   *used* because the agent suggested it: no pre-selected, non-editable or
+   auto-submitted value, and nothing server-side may treat a suggestion as
+   anything but untrusted input. The page asks `store.ValidMachinePart` — the
+   store's own rule — whether to show one, rather than growing a second rule
+   that could disagree with the one that decides.
 6. **API keys are server-generated** 192-bit secrets, shown once, stored
    as stretched salted hashes. Scopes: `enroll`, `readonly`, `exec:*`,
    `exec:m1|m2`. Enrollment endpoints require the `enroll` scope; exec
@@ -80,10 +95,24 @@ This is `mach`: remote CLI access to registered machines, outbound-only
    a stream against a block list), and because the relay *can* read the command
    it is the one path where the fleet-wide policy is enforced server-side.
    Stdin reaches a machine only through a command an operator already started.
-9. **Output caps are per path**: the buffered one-shot path truncates at 8 MiB
-   (`internal/agent/run.go`), marked visibly when hit; a streamed session is
-   uncapped and the relay drops frames rather than stalling an agent whose
-   console stopped reading. Audit snippets are redacted (`RedactScrubs`).
+9. **Output caps are per path, and there are TWO of them on the one-shot path**
+   — different numbers, on purpose. `protocol.MaxOutputBytes` (8 MiB) bounds what
+   the *agent* carries back per stream, truncated with a visible marker;
+   `protocol.MaxExecReplyBytes` (16 × that) bounds the *encoded reply* a client
+   reads. They must not be equal: a reply is bigger than the result it carries
+   (JSON escaping, the exact-bytes form at 4/3×, two streams, and the sealed
+   envelope's base64 twice more at 16/9×), so an equal cap makes the agent's
+   truncation marker unreachable — the result arrives as an error instead. A
+   streamed session is uncapped and the relay drops frames rather than stalling
+   an agent whose console has stopped reading. Audit snippets are redacted
+   (`RedactScrubs`).
+
+   Related, and the reason the bytes have to be carried exactly:
+   `protocol.ExecResult.Stdout/Stderr` are JSON strings, and a JSON string must
+   be valid UTF-8, so Go's encoder replaces every invalid byte with U+FFFD. The
+   exact bytes travel in `StdoutB64`/`StderrB64` whenever the text form would be
+   lossy, and only then. Use `SetOutput`/`Output`; do not read the text fields on
+   a path that is meant to be byte-exact.
 10. **Revocation is a forced re-enrollment, and its door is narrow.** A revoked
     machine self-retires, its name and key stay reserved, and it comes back only
     by enrolling again — which needs an enroll key or a phone approval, so it is
@@ -203,6 +232,15 @@ This is `mach`: remote CLI access to registered machines, outbound-only
     retire itself and nothing else. Say what happened on the way out from the
     goroutine that returns from `RunEphemeral`, never from the signal handler:
     the handler's print raced the exit, and lost.
+
+    A temporary session also **traces every command it is asked to run**
+    (`(*sessionCtl).announce`, called from `handleExec`/`handleSealedExec`/
+    `handleStream`). It is the gate *and* the reason: this mode is watched at a
+    terminal, so "what is being done to this box" belongs on that terminal, while
+    an installed agent's journal is not the place for a line per command — so
+    `ctl` is nil there and the trace is silent. The text is `%q`-quoted because it
+    arrives from the control plane and must not be able to forge a console line;
+    it is a trace, and nothing reads it back (invariant 7).
 
 ## Environment variables (control plane)
 
@@ -328,7 +366,7 @@ only covered at the SQL-translation level.
   and drives the temporary session's whole lifecycle: bare `mach` enrolling over
   the real pair page, being recorded temporary, retiring itself on SIGTERM, and
   the next run taking that name back over with no operator action.
-  Green = 138 checks.
+  Green = 154 checks.
 - Timing-sensitive e2e checks (streaming) use a real sleep and a real
   background process; if one flakes, make the sleep longer rather than
   weakening the assertion.
@@ -365,10 +403,11 @@ only covered at the SQL-translation level.
 - **No PTY**: `mach console` has stdin and Ctrl-C (kill) but no echo/line
   discipline, so interactive and TUI programs still do not work. `mach exec`
   remains output-only. This is tracked as future work, not a design claim.
-- **Output caps are per path**: the buffered one-shot path truncates at 8 MiB
-  (marked visibly); a streamed session is uncapped, and the relay drops frames
-  rather than stalling an agent whose console has stopped reading. Neither
-  truncation nor a drop is recoverable.
+- **Output caps are per path, and the one-shot path has two of them.** See
+  invariant 9: `protocol.MaxOutputBytes` bounds the agent's output per stream and
+  `protocol.MaxExecReplyBytes` bounds the reply a client will read, and they must
+  stay different numbers — equal caps are what made the truncation marker
+  unreachable. Neither truncation nor a dropped frame is recoverable.
 - **`mach exec --json` prints one JSON object**, not a frame stream — the
   machine's output in a field, the exit status in a field. It is for programs
   that would otherwise have to parse an exit status out of bytes a command
@@ -403,10 +442,16 @@ only covered at the SQL-translation level.
   vice versa). What the console does about E2E is *obey the server*: `/e2epub`
   says whether this control plane accepts sealed commands and gives the key,
   and the console seals when both are available. It falls back to plaintext
-  only for a machine with no `pub_e2e` (pre-E2E enrollment) or a control plane
-  that refuses sealing — and in the first case it says so on stderr. Do not
-  make that downgrade silent, and do not "fix" the fallback away: the operator
-  is told which it was, which is the point.
+  only for a machine with no `pub_e2e` (pre-E2E enrollment) or a **403** from
+  the control plane — the status that means the request was refused *before
+  anything was dispatched* (E2E off for the org, the fleet policy, the key's
+  scope, a blocked machine). Nothing else qualifies, and that is load bearing: a
+  504 means the command was dispatched and the agent did not answer in time, and
+  a reply too large to read means it ran and answered. Both used to be read as
+  refusals, and the plaintext retry that followed ran the command a *second*
+  time — unsealed — under output that looked correct. **One command is one
+  execution**: a lost reply is reported, never resent. Do not make a downgrade
+  silent, and do not widen this to "retry on error".
 - **Audit in E2E mode** writes a `[E2E sealed command]` placeholder with
   exit code only. Needing command content in audit is a deliberate
   policy change to propose — not silently implement.
