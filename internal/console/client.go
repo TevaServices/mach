@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -128,16 +129,29 @@ func (c *client) do(method, path string, body any, out any) error {
 			Error string `json:"error"`
 		}
 		_ = json.Unmarshal(data, &e)
-		if e.Error != "" {
-			return fmt.Errorf("%s", e.Error)
+		msg := e.Error
+		if msg == "" {
+			msg = fmt.Sprintf("server returned %d", resp.StatusCode)
 		}
-		return fmt.Errorf("server returned %d", resp.StatusCode)
+		return &apiError{Status: resp.StatusCode, Msg: msg}
 	}
 	if out != nil {
 		return json.Unmarshal(data, out)
 	}
 	return nil
 }
+
+// apiError is a non-2xx answer from the control plane: the server read the
+// request and declined it. It is a distinct type because callers have to tell
+// that apart from everything else that can go wrong — a refusal means nothing
+// was dispatched, while a transport failure or a reply too large to read may
+// mean the command is already running on the machine.
+type apiError struct {
+	Status int
+	Msg    string
+}
+
+func (e *apiError) Error() string { return e.Msg }
 
 type MachineInfo struct {
 	Name      string `json:"name"`
@@ -293,16 +307,39 @@ func (c *client) sealedExec(machine, command string, argv []string, timeout int,
 		SealedB64 string `json:"sealed_b64"`
 	}
 	if werr := c.do("POST", "/v1/exec", body, &wire); werr != nil {
+		// Only a 403 is a refusal that is *known* to be before dispatch: it is
+		// what this control plane answers when it will not take a sealed command
+		// (E2E off for the org, the fleet policy, the key's scope, a blocked
+		// machine) and every one of those checks sits ahead of the dispatch.
+		//
+		// Nothing else qualifies, and the difference is not academic. A 504 means
+		// the command was dispatched and the agent did not answer in time; a
+		// reply too large to read means it ran and answered. Both used to be
+		// treated as refusals, and the plaintext retry that followed ran the
+		// command a *second* time — unsealed — while the operator, who saw
+		// correct-looking output, had no way to know.
+		var api *apiError
+		refused := errors.As(werr, &api) && api.Status == http.StatusForbidden
+
 		if mode == E2ERequire {
-			// Asked for sealing and did not get it: the command did not run
-			// (the refusal is before dispatch), so say so and stop.
-			fmt.Fprintln(os.Stderr, "mach: cannot seal: "+werr.Error())
+			if refused {
+				// Refused before dispatch: nothing ran, so the command is simply
+				// not sent rather than sent unsealed.
+				fmt.Fprintln(os.Stderr, "mach: cannot seal: "+werr.Error())
+				return 3, true
+			}
+			fmt.Fprintln(os.Stderr, "mach: --e2e: "+werr.Error())
+			fmt.Fprintln(os.Stderr, "mach: the command may have run on the machine; it was not resent.")
 			return 3, true
 		}
-		// The control plane refused the sealed form — most likely the setting
-		// changed between reading it and sending. Obey the refusal (it did not
-		// dispatch anything) and retry in plaintext, saying so rather than
-		// making the downgrade invisible.
+		if !refused {
+			fmt.Fprintln(os.Stderr, "mach: the sealed reply did not come back: "+werr.Error())
+			fmt.Fprintln(os.Stderr, "mach: not retrying in plaintext — the command may already have run, and"+
+				"\n      resending it would run it a second time, unsealed.")
+			return 3, true
+		}
+		// Obey the refusal and retry in plaintext, saying so rather than making
+		// the downgrade invisible.
 		fmt.Fprintf(os.Stderr, "mach: sealed exec refused (%s); retrying in plaintext\n", werr.Error())
 		return 0, false
 	}

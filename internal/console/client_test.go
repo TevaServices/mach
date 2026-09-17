@@ -269,6 +269,11 @@ type fakeExecServer struct {
 	// refuseSealed makes the server answer a sealed command the way it does when
 	// the setting changed under the client: 403 with the reason.
 	refuseSealed bool
+	// sealedStatus answers a sealed command with that status instead of a
+	// result. 504 is what the control plane returns when it dispatched the
+	// command and the agent did not answer in time — the reply is lost, but the
+	// command may well have run, which is the case the console must not retry.
+	sealedStatus int
 }
 
 func newFakeExecServer(t *testing.T, enabled bool, withKey bool) *fakeExecServer {
@@ -318,6 +323,11 @@ func newFakeExecServer(t *testing.T, enabled bool, withKey bool) *fakeExecServer
 		if f.refuseSealed || !f.enabled {
 			w.WriteHeader(http.StatusForbidden)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "sealed exec is disabled on this control plane"})
+			return
+		}
+		if f.sealedStatus != 0 {
+			w.WriteHeader(f.sealedStatus)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "timed out waiting for agent result"})
 			return
 		}
 		// Open the sealed command with the machine's key: this is what an agent
@@ -796,5 +806,61 @@ func TestUnreadablePinFileIsAnError(t *testing.T) {
 	// It says what the fix is, including what deleting it costs.
 	if !strings.Contains(stderr, "re-pins") {
 		t.Errorf("stderr = %q, want the consequence of deleting it", stderr)
+	}
+}
+
+// A sealed reply that never arrives is NOT a refusal, and must not be retried.
+//
+// This is the fix for a real double execution. The control plane answers 504
+// when it dispatched a command and the agent did not reply in time, and the
+// console's HTTP reader fails a reply larger than the protocol's bound — both
+// were read as "the control plane refused the sealed form", and the plaintext
+// retry that followed ran the command a *second* time, unsealed, while the
+// operator saw correct-looking output and had no way to know. Nothing about the
+// refusal reasoning holds for either: the command was dispatched, so a retry is
+// a second execution, and a plaintext one.
+func TestExecDoesNotRetryWhenTheSealedReplyIsLost(t *testing.T) {
+	pinState(t)
+	f := newFakeExecServer(t, true, true)
+	f.sealedStatus = http.StatusGatewayTimeout
+
+	var code int
+	stdout, stderr := capture(t, func() {
+		code = f.client().Exec("org-test-01", "echo must-not-run-twice", 0, false, E2EObey)
+	})
+	if code == 0 {
+		t.Errorf("code = 0, want a failure: the reply was lost, not refused")
+	}
+	// The retry path announces itself with this exact prefix, and only it does:
+	// asserting on the bare words "retrying in plaintext" would also match the
+	// message explaining that there is no retry.
+	if strings.Contains(stderr, "sealed exec refused") {
+		t.Errorf("stderr = %q, want no plaintext retry", stderr)
+	}
+	if !strings.Contains(stderr, "not retrying in plaintext") {
+		t.Errorf("stderr = %q, want the reason there is no retry", stderr)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want nothing — no result came back", stdout)
+	}
+	if n := len(f.bodies()); n != 1 {
+		t.Fatalf("sent %d requests, want only the sealed attempt: %v", n, f.bodies())
+	}
+
+	// --e2e loses the same reply and must also not resend it.
+	f2 := newFakeExecServer(t, true, true)
+	f2.key, f2.sealedStatus = f.key, http.StatusGatewayTimeout
+	var code2 int
+	_, stderr2 := capture(t, func() {
+		code2 = f2.client().Exec("org-test-01", "echo must-not-run-twice", 0, false, E2ERequire)
+	})
+	if code2 == 0 {
+		t.Errorf("--e2e code = 0, want a failure")
+	}
+	if strings.Contains(stderr2, "cannot seal") {
+		t.Errorf("--e2e stderr = %q: nothing was refused, the reply was lost", stderr2)
+	}
+	if n := len(f2.bodies()); n != 1 {
+		t.Errorf("--e2e sent %d requests, want only the sealed attempt", n)
 	}
 }
