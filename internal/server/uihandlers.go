@@ -178,6 +178,7 @@ func (s *Server) handleUIOrgMember(w http.ResponseWriter, r *http.Request, sess 
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
+	data.CSRF = sess.CSRF
 	s.renderPage(w, http.StatusOK, sess, "", "Org "+org, uiTmpl, "orgmember", data)
 }
 
