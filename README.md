@@ -270,6 +270,74 @@ Any host with Docker (no Go needed): `docker compose build` builds the
 control plane plus all cross-targets. Local dev with a Go toolchain:
 `go build ./cmd/mach`.
 
+## Try it locally
+
+One host, everything: a control plane, and this machine enrolled as an agent of
+it, with no Docker and no second box.
+
+```
+mise run local:up                    # build, start the control plane, enroll this host
+mise run local:mach -- list
+mise run local:mach -- exec <machine> 'uname -a'
+mise run local:mach -- exec --e2e <machine> 'echo this ran sealed'
+mise run local:logs                  # follow the control plane, the agent and the IdP
+mise run local:down                   # stop (data is kept; `up` resumes it)
+```
+
+Everything lands in `data/local/`, including a state dir for each side, so it
+cannot disturb a real deployment or your own `~/.mach`. Nothing is installed:
+the agent runs as an ordinary background process rather than a launchd/systemd
+service. `mise run local:status` prints the fleet, and `data/local/env.sh` holds
+the exports if you would rather drive `bin/mach` by hand. Prefix anything the
+control plane takes from its environment — `MACH_EXEC_POLICY='deny:rm -rf /'
+mise run local:up` — to exercise it.
+
+**The web UI is on here.** A real control plane needs `MACH_OIDC_*` for that;
+the playground supplies them by running `scripts/fakeidp`, the same test-only
+identity provider the e2e suite uses. The URL to open is printed at startup — use
+that one and not `127.0.0.1`, because the sign-in redirect and the session cookie
+are both built from the public URL. The provider is bound to loopback on purpose:
+it authenticates nobody, so widening it would let anyone on the network sign in
+and manage the fleet. So the UI answers on the LAN, but only a browser on this
+machine can complete a sign-in.
+
+### From your phone
+
+The control plane binds all interfaces, and `local:up` prints the URL a phone on
+the same network can reach. One variable decides it — `MACH_LOCAL_HOST`, default
+`auto`, meaning the IPv4 address of the interface carrying the default route —
+and the bind and the public URL are both derived from it, so they cannot
+disagree. Set it on the command that starts the server:
+
+```
+mise run local:server                     # bound to all interfaces; prints the phone URL
+MACH_LOCAL_HOST=127.0.0.1 mise run local:server   # this machine only
+```
+
+The reason it is one variable and not two: **the QR's URL is built by the client**
+from the server URL the enrolling agent was given, not by the control plane from
+its public URL. Whichever invocation runs `mach register` therefore decides what
+the phone is told, and `local:server` and `local:enroll` are separate processes —
+so the resolved host is recorded in `data/local/host` and reused. `local:enroll`
+with no environment at all uses the address the running control plane was started
+with; asking for a different one is an error telling you to `local:down` first,
+rather than a second bind that disagrees with the QR.
+
+To walk the enrollment yourself rather than have it done for you:
+
+```
+mise run local:server    # control plane only — no keys minted, nothing enrolled
+mise run local:enroll    # prints the QR and the challenge code, then waits
+#   scan it with a phone on the same network
+mise run local:up        # once enrolled: starts the agent, configures the console
+mise run local:reset     # stop and wipe back to a fresh install
+```
+
+The challenge code is printed on the agent's console and typed on the pair page:
+the QR alone grants nothing, and the page is reachable from the LAN precisely
+because the code is what gates it. On an untrusted network, start with
+`MACH_LOCAL_HOST=127.0.0.1` and enroll from a browser on this machine instead.
+
 Builds are unstamped by default and report `devel`. Stamp a version with
 `MACH_VERSION=0.3.0 mise run build`, or straight through the linker:
 

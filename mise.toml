@@ -101,12 +101,44 @@ ls bin/attestations
 '''
 
 [tasks.dev]
-description = "Run the control plane locally after 'mise run build' (pass MACH_PUBLIC_URL if not local)"
-run = '''
-MACH_DB=./data/mach.db MACH_LISTEN=127.0.0.1:8080
-MACH_PUBLIC_URL=${MACH_PUBLIC_URL:-http://127.0.0.1:8080}
-MACH_ORG=${MACH_ORG:-mach} ./bin/mach-server serve
-'''
+description = "Run the control plane in the foreground on the local playground's data (see local:up)"
+run = "scripts/localdev.sh foreground"
+
+# The local playground: one control plane and this host enrolled as an agent of
+# it, both under data/local/. See scripts/localdev.sh — its header explains what
+# it does and does not touch. The subcommands live in that script rather than
+# here because mise cannot forward arguments to a task.
+[tasks."local:up"]
+description = "Build, start a local control plane (LAN-reachable, web UI on), enroll this host, start the agent"
+run = "scripts/localdev.sh up"
+
+[tasks."local:server"]
+description = "Build and start a local control plane only — nothing enrolled, no keys minted (MACH_LOCAL_HOST=127.0.0.1 to keep it off the network)"
+run = "scripts/localdev.sh server"
+
+[tasks."local:enroll"]
+description = "Enroll this host by hand: prints the QR and challenge code and waits for approval (reuses the running server's host)"
+run = "scripts/localdev.sh enroll"
+
+[tasks."local:reset"]
+description = "Stop the playground and wipe it back to a fresh install (deletes data/local/)"
+run = "scripts/localdev.sh reset"
+
+[tasks."local:down"]
+description = "Stop the local playground's agent, control plane and fake identity provider (data is kept)"
+run = "scripts/localdev.sh down"
+
+[tasks."local:status"]
+description = "Fleet listing from the local playground, through the console CLI"
+run = "scripts/localdev.sh status"
+
+[tasks."local:logs"]
+description = "Follow the local playground's control-plane, agent and fake-IdP logs"
+run = "scripts/localdev.sh logs"
+
+[tasks."local:mach"]
+description = "Run the mach CLI against the local playground: mise run local:mach -- exec MACHINE 'cmd'"
+run = "scripts/localdev.sh mach"
 
 [tasks.all]
 description = "deps, lint (incl. the gofmt check), build, cross-compile, unit tests, e2e"

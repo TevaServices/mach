@@ -210,7 +210,7 @@ This is `mach`: remote CLI access to registered machines, outbound-only
 |---|---|
 | `MACH_DB` | SQLite path (default `/data/mach.db`) **or** a Postgres DSN (`postgres://…`) |
 | `MACH_LISTEN` | listen addr (default `:8080`; compose binds loopback) |
-| `MACH_PUBLIC_URL` | public base URL used in QR links (required to serve) |
+| `MACH_PUBLIC_URL` | public base URL (required to serve): the OIDC redirect it defaults from, the `Secure` cookie decision, and the http-issuer carve-out. **Not** the QR's host — that is built client-side from the server URL the enrolling agent was handed (`internal/agent/register.go`) |
 | `MACH_ORG` | primary org prefix (default `mach`) |
 | `MACH_ORGS` | extra org prefixes (comma-separated): the pair-page dropdown, and what resolves a machine's org for per-org settings (E2E) |
 | `MACH_TRUST_PROXY` | `1` = honor X-Forwarded-For (only behind your TLS proxy) |
@@ -254,6 +254,59 @@ only covered at the SQL-translation level.
   way for touched code.
 - `mise run lint` — the gofmt check plus `go vet`. Read-only; `mise run fmt`
   writes the formatting.
+- `mise run local:up` / `local:down` / `local:status` / `local:logs` — a real
+  control plane and this host enrolled as its agent, both under `data/local/`
+  (`scripts/localdev.sh`; `mise run dev` is the same server in the foreground).
+  Use it when the thing you are changing is easiest to judge by driving it:
+  `mise run local:mach -- exec <machine> 'uname -a'`, or source
+  `data/local/env.sh` and use `bin/mach` directly. It is isolated on purpose —
+  its own state dirs on both sides, so it never touches `~/.mach`, and it
+  registers no OS service. Anything the server reads from the environment
+  (`MACH_EXEC_POLICY`, `MACH_E2E`) can be prefixed onto `local:up` to exercise
+  it; the playground pins none of those. It does pin one set of variables, the
+  `MACH_OIDC_*` block, so the UI is on — see the bullet below.
+- `mise run local:server` / `local:enroll` / `local:reset` — the same playground
+  split into pieces, for testing enrollment itself. `local:server` starts the
+  control plane and stops there: no keys minted, nothing enrolled, so the pair
+  page is the only way in. `local:enroll` runs the QR and challenge-code flow in
+  the foreground. **One variable decides the host — `MACH_LOCAL_HOST`** (default
+  `auto`: the IPv4 of the default-route interface), and `LISTEN` and
+  `MACH_PUBLIC_URL` are derived from it in one place so they cannot disagree.
+  This is one knob rather than two because the QR's URL is built by the
+  **client** from the server URL it was given, not by the control plane from
+  `MACH_PUBLIC_URL` — so whichever invocation runs `mach register` decides what
+  the phone is told. `local:server` and `local:enroll` are separate processes,
+  so the resolved host is recorded in `data/local/host` and reused: `local:enroll`
+  with no environment at all uses the address the running control plane was
+  started with, and asking for a different one is an error naming `local:down`
+  rather than a second, disagreeing bind. Set it on the command that *starts*
+  the server; `MACH_LOCAL_HOST=127.0.0.1` is the lock-down. `local:reset` stops
+  everything and deletes `data/local/` for a fresh install — it refuses any path
+  that is not the playground, both by canonical containment and by a
+  `.playground` marker, because `MACH_LOCAL_DIR` is caller-controlled and the
+  next step is `rm -rf`.
+
+  The playground binds **all interfaces by default**, and that is worth stating
+  as a security fact rather than an ergonomic one: the pair page is reachable
+  from the LAN, gated on the challenge code (the QR token alone grants nothing),
+  and `local:enroll` is a foreground flow a person watches. Use
+  `MACH_LOCAL_HOST=127.0.0.1` on an untrusted network, or when the point of the
+  run is not the phone.
+
+- **The playground's web UI is enabled by real OIDC configuration, not a bypassed
+  gate.** `scripts/localdev.sh` starts `scripts/fakeidp` on loopback and sets all
+  three `MACH_OIDC_*` variables, so `loadUIConfig` is *fully* configured and
+  invariant 18's partial-config error does not apply — a production control plane
+  with none of them still serves no `/ui` route. The provider is bound to loopback
+  deliberately: it authenticates nobody, so widening it to the network would let
+  anyone who can reach the port sign in and manage the fleet. That loopback bind
+  is also what makes the LAN-reachable UI safe, and the reason is worth keeping
+  rather than re-deriving: a remote browser's `/ui/login` redirect goes to
+  `http://127.0.0.1:8190`, which for that browser is *its own* machine, and
+  `/ui/callback` exchanges against **this** control plane's configured issuer,
+  which only mints for a code its own `/authorize` issued. A code obtained from
+  some other machine's provider is `invalid_grant`. So the UI answers on the LAN,
+  but only a browser on this host can complete a sign-in.
 - `mise run e2e` — full end-to-end (builds binaries, spins up the control
   plane on 127.0.0.1:8099 with a fleet-wide policy installed, enrolls via API
   key + QR, exercises exec in both modes, the console relay, output-is-data,
