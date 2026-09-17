@@ -323,24 +323,6 @@ is pinned and cannot be removed here. E2E is a per-org setting, on the org's pag
     </td>
     <td>
       <div class="row-actions">
-      <form class="inline" method="post" action="/ui/orgs/e2e" hx-post="/ui/orgs/e2e" hx-target="#orgs" hx-swap="outerHTML">
-        <input type="hidden" name="org" value="{{.Name}}">
-        <input type="hidden" name="mode" value="on">
-        <input type="hidden" name="csrf" value="{{$.CSRF}}">
-        <button type="submit">E2E on</button>
-      </form>
-      <form class="inline" method="post" action="/ui/orgs/e2e" hx-post="/ui/orgs/e2e" hx-target="#orgs" hx-swap="outerHTML">
-        <input type="hidden" name="org" value="{{.Name}}">
-        <input type="hidden" name="mode" value="off">
-        <input type="hidden" name="csrf" value="{{$.CSRF}}">
-        <button type="submit">E2E off</button>
-      </form>
-      <form class="inline" method="post" action="/ui/orgs/e2e" hx-post="/ui/orgs/e2e" hx-target="#orgs" hx-swap="outerHTML">
-        <input type="hidden" name="org" value="{{.Name}}">
-        <input type="hidden" name="mode" value="inherit">
-        <input type="hidden" name="csrf" value="{{$.CSRF}}">
-        <button type="submit">Inherit</button>
-      </form>
       {{if not .Pinned}}
       <form class="inline" method="post" action="/ui/orgs/remove" hx-post="/ui/orgs/remove" hx-target="#orgs" hx-swap="outerHTML"
             hx-confirm="Remove org {{.Name}}? New machines can no longer enroll under this prefix. Existing machines keep working.">
@@ -364,6 +346,59 @@ is pinned and cannot be removed here. E2E is a per-org setting, on the org's pag
 </div>
 {{end}}`
 
+// orgE2ESource is one org's E2E control, rendered on its own page and swapped in
+// place by the two buttons.
+//
+// On/off is what an operator decides; "follow the fleet default" is a different
+// thing — clearing an override so the org tracks whatever the fleet does — and
+// it is offered only when an override exists to clear. Calling it "Inherit" in a
+// list row, next to "E2E on" and "E2E off", made it look like a third value of
+// the same setting rather than a statement about where the value comes from.
+const orgE2ESource = `{{define "orge2e"}}
+<div id="orge2e">
+<h3>E2E</h3>
+<p class="muted">End-to-end encrypted commands: this control plane relays them
+without being able to read the command or its output. With E2E off, commands for
+this org run in plaintext, where the control plane can read them and the
+fleet-wide block list applies before anything is dispatched.</p>
+{{if .E2EPinned}}<p class="notice">MACH_E2E pins every org to one value. A setting
+saved here is kept, and takes effect again once that pin is removed.</p>{{end}}
+{{if not .E2EOverridden}}<p class="muted">This org has no setting of its own and
+follows the fleet default.</p>{{end}}
+{{/* A div, not a p: the buttons live in their own forms, and a <form> start tag
+     closes an open <p> in the HTML parser — the markup would not survive as
+     written, and neither would the layout. */}}
+<div class="e2e-row">
+  <span class="seg">
+    <form class="inline" method="post" action="/ui/orgs/e2e" hx-post="/ui/orgs/e2e" hx-target="#orge2e" hx-swap="outerHTML">
+      <input type="hidden" name="org" value="{{.Org}}">
+      <input type="hidden" name="view" value="member">
+      <input type="hidden" name="mode" value="on">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit" {{if .E2EOn}}class="active"{{end}}>On</button>
+    </form>
+    <form class="inline" method="post" action="/ui/orgs/e2e" hx-post="/ui/orgs/e2e" hx-target="#orge2e" hx-swap="outerHTML">
+      <input type="hidden" name="org" value="{{.Org}}">
+      <input type="hidden" name="view" value="member">
+      <input type="hidden" name="mode" value="off">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit" {{if not .E2EOn}}class="active"{{end}}>Off</button>
+    </form>
+  </span>
+  {{if .E2EOverridden}}
+  <form class="inline" method="post" action="/ui/orgs/e2e" hx-post="/ui/orgs/e2e" hx-target="#orge2e" hx-swap="outerHTML">
+    <input type="hidden" name="org" value="{{.Org}}">
+    <input type="hidden" name="view" value="member">
+    <input type="hidden" name="mode" value="inherit">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button type="submit">Follow the fleet default</button>
+  </form>
+  {{end}}
+</div>
+<p class="muted">Effective for <code>{{.Org}}</code>: <b>{{.E2EMode}}</b> — {{.E2ESource}}.</p>
+</div>
+{{end}}`
+
 // memberSource is one org's membership view. Keys have no org column — scopes is
 // a string — so membership is derived and the two groups are labelled to say so
 // rather than implying keys belong to an org.
@@ -372,6 +407,8 @@ const memberSource = `{{define "orgmember"}}
 <p><a href="/ui/orgs">&larr; All orgs</a></p>
 {{if .Pinned}}<p class="muted">This org comes from the environment
 (<code>MACH_ORG</code>/<code>MACH_ORGS</code>), so it cannot be removed here.</p>{{end}}
+
+{{template "orge2e" .}}
 
 <h3>Machines ({{len .Machines}})</h3>
 {{if not .Machines}}<p class="muted">None.</p>{{else}}
@@ -421,7 +458,7 @@ persists check the control plane's log for the discovery error.</p>
 // from the template that includes it.
 var uiTmpl = template.Must(template.New("ui").Parse(
 	fleetInnerSource + fleetSource + deleteConfirmSource + confirmClearedSource +
-		orgsSource + memberSource + loginFailedSource))
+		orgsSource + orgE2ESource + memberSource + loginFailedSource))
 
 // renderPage executes a content template and wraps it in the shared shell.
 func (s *Server) renderPage(w http.ResponseWriter, status int, sess uiSession, notice, title string,

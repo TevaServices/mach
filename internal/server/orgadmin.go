@@ -10,6 +10,7 @@ package server
 import (
 	"errors"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
@@ -40,6 +41,20 @@ type memberData struct {
 	Machines   []fleetRow
 	ScopedKeys []store.APIKeyInfo
 	FleetKeys  []store.APIKeyInfo
+	CSRF       string
+	// E2EOn is the *effective* value for this org — what a command sent to one of
+	// its machines will actually do — and E2ESource says where it came from.
+	// E2EOverridden separates "this org has its own setting" from "this org
+	// follows the fleet default", which the On/Off buttons alone cannot express:
+	// both can read on, and only one of them can be cleared.
+	E2EOn         bool
+	E2EMode       string
+	E2ESource     string
+	E2EOverridden bool
+	// E2EPinned is true when MACH_E2E is set, in which case no stored setting for
+	// this org can take effect and the page says so instead of offering a control
+	// that does nothing.
+	E2EPinned bool
 }
 
 func (s *Server) orgRows() ([]orgRow, error) {
@@ -73,6 +88,12 @@ func (s *Server) orgMembership(org string) (memberData, error) {
 		return memberData{}, err
 	}
 	data := memberData{Org: org, Pinned: s.orgPinned(org)}
+	mode, source := E2EMode(s.st, org)
+	data.E2EOn = mode == e2eOn
+	data.E2EMode = mode
+	data.E2ESource = source
+	_, data.E2EOverridden = storedE2E(s.st, e2eOrgKey(org))
+	data.E2EPinned = strings.TrimSpace(os.Getenv(e2eEnv)) != ""
 	for _, r := range rows {
 		if machineInOrg(r.Name, org) {
 			data.Machines = append(data.Machines, r)
@@ -207,8 +228,28 @@ func (s *Server) handleUIOrgE2E(w http.ResponseWriter, r *http.Request, sess uiS
 	// MACH_E2E still wins over a stored row; say so rather than reporting a write
 	// that has no effect on behaviour.
 	effective, source := E2EMode(s.st, org)
-	s.logf("ui: sealed exec for org %q set to %q, now effective %q (%s) — by %q",
+	s.logf("ui: E2E for org %q set to %q, now effective %q (%s) — by %q",
 		org, mode, effective, source, sess.Ident.Subject)
+
+	// Answer where the control lives. The orgs list carries no E2E buttons any
+	// more, so the org's own page is the normal case; the list branch is kept for
+	// any client still posting without the view field.
+	if strings.ToLower(strings.TrimSpace(r.PostFormValue("view"))) == "member" {
+		if r.Header.Get("HX-Request") != "" {
+			data, err := s.orgMembership(org)
+			if err != nil {
+				http.Error(w, "store error", http.StatusInternalServerError)
+				return
+			}
+			data.CSRF = sess.CSRF
+			s.renderFragment(w, sess, uiTmpl, "orge2e", data)
+			return
+		}
+		// Built from the org we just validated against the configured list, never
+		// from request text, so this cannot become an open redirect.
+		http.Redirect(w, r, "/ui/orgs/"+org+"?n=e2eset", http.StatusSeeOther)
+		return
+	}
 	s.refreshOrgs(w, r, sess, "e2eset")
 }
 

@@ -330,7 +330,7 @@ var uiNotices = map[string]string{
 	"deleted":    "Machine deleted. Its name and key are free to enroll again.",
 	"orgadded":   "Org added. Machines may now enroll under that prefix.",
 	"orgremoved": "Org removed. Existing machines keep working; new enrollment under that prefix stops.",
-	"e2eset":     "Sealed exec setting updated for that org.",
+	"e2eset":     "E2E setting updated for that org.",
 	"signedout":  "Signed out.",
 }
 
