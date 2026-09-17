@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -61,6 +62,64 @@ func hostname() string {
 	return h
 }
 
+// pairPrefill builds the query string the QR carries, so the phone page opens
+// with the org and a machine name already in it and the operator only has to
+// read the challenge code off this console.
+//
+// Both values are suggestions in editable fields: the page shows them under a
+// line saying the agent supplied them, and whatever is submitted is validated
+// on the control plane exactly as it was before suggestions existed. The
+// challenge code is deliberately NOT here — it is the one thing that makes a
+// photograph of this QR worthless, and it stays on this screen.
+func pairPrefill(org, host string) string {
+	v := url.Values{}
+	if o := strings.ToLower(strings.TrimSpace(org)); o != "" {
+		v.Set("org", o)
+	}
+	if part := suggestMachinePart(host); part != "" {
+		v.Set("name", part)
+	}
+	return v.Encode()
+}
+
+// suggestMachinePart turns a hostname into a machine-name candidate: lowercased
+// (hostnames conventionally are, and it keeps the suggestion visually distinct
+// from the uppercase challenge code printed on the same screen), its domain
+// dropped, anything outside [a-z0-9-] folded to a single hyphen, and the whole
+// thing capped at the length a machine-name part may have. A hostname that folds
+// away to nothing yields "" and the page simply starts empty.
+//
+// The result must satisfy store.ValidMachinePart — that is the rule the control
+// plane validates the submitted name with, and a suggestion it would reject is
+// worse than none. This package does not import internal/store to reuse the
+// function (it would drag both SQL drivers into a binary that ships to every
+// target), so the agreement is asserted in register_test.go and again across the
+// seam by scripts/e2e.sh, which checks the name in the QR survives to the page.
+func suggestMachinePart(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if i := strings.IndexByte(host, '.'); i >= 0 {
+		host = host[:i]
+	}
+	var b strings.Builder
+	dash := false
+	for _, r := range host {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			b.WriteRune(r)
+			dash = false
+			continue
+		}
+		if !dash && b.Len() > 0 {
+			b.WriteByte('-')
+			dash = true
+		}
+	}
+	s := strings.Trim(b.String(), "-")
+	if len(s) > 48 {
+		s = strings.Trim(s[:48], "-")
+	}
+	return s
+}
+
 // warnInsecureServer prints a loud warning when the control plane is plain
 // http: enrollment credentials (and later, commands) cross the wire
 // unencrypted. Allowed (dev deployments) but never silently.
@@ -112,6 +171,9 @@ func registerQRCore(server, org string, id *Identity, e2eKey *E2EKeyPair, tempor
 	}
 
 	pairURL := strings.TrimRight(server, "/") + "/pair/" + start.Token
+	if q := pairPrefill(org, hostname()); q != "" {
+		pairURL += "?" + q
+	}
 	qr, err := qrcode.New(pairURL, qrcode.Medium)
 	if err != nil {
 		return nil, err
@@ -128,8 +190,9 @@ func registerQRCore(server, org string, id *Identity, e2eKey *E2EKeyPair, tempor
 	fmt.Printf("     %s\n", pairURL)
 	fmt.Println("  2. On the phone page, TYPE this machine's challenge code")
 	fmt.Printf("     (the page never shows it — read it here):  %s\n", bold(start.Code))
-	fmt.Printf("  3. Approve and pick a name starting with your org prefix\n")
-	fmt.Printf("     (%s-<machine>; the operator knows the org).\n", org)
+	fmt.Println("     Its dashes are optional; the 12 characters are what matter.")
+	fmt.Println("  3. Approve. The page arrives with the org and a machine name")
+	fmt.Printf("     already filled in (%s-<hostname>); edit either if it is wrong.\n", org)
 	fmt.Println()
 	fmt.Println("Waiting for approval (this pairing expires in ~10 minutes; 5 wrong code attempts expire it)...")
 	fmt.Println("==========================================================")

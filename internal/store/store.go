@@ -344,8 +344,18 @@ func ValidOrgName(org, name string) bool {
 	if !strings.HasPrefix(name, org+"-") {
 		return false
 	}
-	return validLabel(strings.TrimPrefix(name, org+"-"), 1, 48)
+	return ValidMachinePart(strings.TrimPrefix(name, org+"-"))
 }
+
+// ValidMachinePart reports whether s is a valid machine-name part — the half of
+// a machine name that follows the "<org>-" prefix.
+//
+// It is ValidOrgName's own rule, exported so that a caller holding a *candidate*
+// name can ask the rule that decides rather than growing a second copy of it.
+// The pair page is that caller: it shows a machine name the enrolling agent
+// suggested from its hostname, and a second, looser rule there is exactly how
+// the page would come to offer a name the store then refuses.
+func ValidMachinePart(s string) bool { return validLabel(s, 1, 48) }
 
 func validLabel(s string, min, max int) bool {
 	if len(s) < min || len(s) > max {

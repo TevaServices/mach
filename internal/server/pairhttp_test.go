@@ -200,3 +200,88 @@ func TestPairPageStillRefusesAnActiveMachinesName(t *testing.T) {
 		t.Fatalf("an active machine's name was offered to a new agent: %s", page)
 	}
 }
+
+// The QR carries a suggestion, and the page opens with it already filled in: the
+// org chosen in the dropdown, the machine name in an editable box. That is a
+// convenience over the same validation, and the distinction matters — the
+// suggestion is agent-reported text (a hostname), so nothing downstream of it
+// may be treated as trusted, and the challenge code is not part of it at all.
+func TestPairPagePrefillsFromTheQRQuery(t *testing.T) {
+	s, _ := newAuthTestServer(t)
+	h := s.Routes()
+
+	code, body := bearerJSON(t, h, "POST", "/v1/pair/start", "",
+		`{"pub_key":"`+strings.Repeat("ab", 32)+`","hostname":"h","os":"linux","arch":"amd64"}`)
+	if code != http.StatusOK {
+		t.Fatalf("pair start: %d (%s)", code, body)
+	}
+	var start protocol.PairStartResponse
+	if err := json.Unmarshal([]byte(body), &start); err != nil {
+		t.Fatalf("decode pair start: %v", err)
+	}
+	get := func(q string) string {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/pair/"+start.Token+q, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /pair/...%s: %d", q, rec.Code)
+		}
+		return rec.Body.String()
+	}
+
+	page := get("?org=bcross&name=web-01")
+	if !strings.Contains(page, `<option value="bcross" selected>`) {
+		t.Errorf("the QR's org is not the selected option:\n%s", page)
+	}
+	if !strings.Contains(page, `value="web-01"`) {
+		t.Errorf("the QR's machine name is not pre-filled:\n%s", page)
+	}
+	if !strings.Contains(page, "suggested by the") {
+		t.Error("the page does not say the pre-filled values came from the enrolling agent")
+	}
+	// The one thing the QR must never carry. The field is empty on arrival, which
+	// is what keeps "a photograph of the QR alone grants nothing" true.
+	if strings.Contains(page, `name="code" value=`) || strings.Contains(page, `name="code"value=`) {
+		t.Error("the challenge-code field arrives pre-filled")
+	}
+
+	// An org this control plane does not have is dropped, not shown: the
+	// dropdown cannot offer it, so pre-selecting it would leave the operator
+	// looking at a different org than the one they were told, with no sign why.
+	if got := get("?org=notconfigured&name=web-01"); strings.Contains(got, "notconfigured") {
+		t.Errorf("an unconfigured org reached the page:\n%s", got)
+	}
+	// A name a machine name may not contain is dropped rather than rewritten or
+	// handed to the form to reject — the field starts empty.
+	for _, bad := range []string{"Web_01.Example.COM", "web 01", strings.Repeat("x", 49)} {
+		if got := get("?name=" + url.QueryEscape(bad)); !strings.Contains(got, `name="name" required value=""`) {
+			t.Errorf("name %q was pre-filled:\n%s", bad, got)
+		}
+	}
+}
+
+// A refused approval hands back the org and the name the operator typed, so a
+// mistyped challenge code does not also cost them the rest of the form.
+func TestPairPageKeepsTypedValuesOnARetry(t *testing.T) {
+	s, _ := newAuthTestServer(t)
+	h := s.Routes()
+
+	_, body := bearerJSON(t, h, "POST", "/v1/pair/start", "",
+		`{"pub_key":"`+strings.Repeat("cd", 32)+`","hostname":"h"}`)
+	var start protocol.PairStartResponse
+	_ = json.Unmarshal([]byte(body), &start)
+
+	form := url.Values{"code": {"AAAA-AAAA-AAAA"}, "org": {"bcross"}, "name": {"web-01"}, "approve": {"1"}}
+	req := httptest.NewRequest("POST", "/pair/"+start.Token, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	page := rec.Body.String()
+	if !strings.Contains(page, "Wrong code") {
+		t.Fatalf("a wrong code was not refused:\n%s", page)
+	}
+	if !strings.Contains(page, `<option value="bcross" selected>`) || !strings.Contains(page, `value="web-01"`) {
+		t.Errorf("the retry form lost what the operator had typed:\n%s", page)
+	}
+}
