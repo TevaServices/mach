@@ -349,3 +349,31 @@ One string serves everything: both binaries, and the six agent binaries baked
 into the container image. Signed-in operators see the control plane's version in
 the web UI nav, and any machine whose agent reports a different version is
 marked `differs` in the fleet table.
+
+## Releasing (GitHub Actions)
+
+Push a tag named `v*` and the `release` workflow publishes, on the GitHub
+release for that tag: the `mach` client for linux / darwin / windows on
+amd64 + arm64, and one in-toto attestation bundle
+(`mach-attestations.intoto.jsonl`, a DSSE envelope per line, one per
+binary). Each statement carries its binary's sha256, so the bundle is the
+release's signed integrity record; the signing key's public half is in the
+release notes. A multi-arch (linux/amd64, linux/arm64) `mach-server`
+container goes to GHCR.
+
+The tag is also the version: `v0.3.0` publishes binaries and an image that
+report `0.3.0` (the leading `v` is stripped). So `mach version` inside a
+container, `mach-server version` on the host, and the GHCR tag all name the
+same release — the binaries previously carried a hardcoded constant that no tag
+ever reached.
+
+One-time setup: generate a signing key with `scripts/gen-release-key.sh` and
+add it as the `MACH_RELEASE_SIGNING_KEY` repository secret. Without it the
+release fails rather than shipping unattested binaries — the same rule the
+control plane applies to an unreadable policy file. The key is a
+provenance/audit control: agents never see the attestation, and a live
+control plane still re-attests with its own identity key per the Dockerfile
+footer, so `push-update --attestation` works there as documented.
+
+CI (`.github/workflows/ci.yml`) runs lint, unit tests and e2e on main and on
+every PR, using the same `mise` tasks the repo documents.
