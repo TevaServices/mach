@@ -302,6 +302,7 @@ func (s *Server) Routes() http.Handler {
 		mux.HandleFunc("GET /ui", s.uiGet(s.handleUIFleet))
 		mux.HandleFunc("GET /ui/{$}", s.uiGet(s.handleUIFleet))
 		mux.HandleFunc("GET /ui/machines", s.uiGet(s.handleUIMachines))
+		mux.HandleFunc("GET /ui/confirm/clear", s.uiGet(s.handleUIConfirmClear))
 		mux.HandleFunc("GET /ui/orgs", s.uiGet(s.handleUIOrgs))
 		mux.HandleFunc("GET /ui/orgs/{org}", s.uiGet(s.handleUIOrgMember))
 		mux.HandleFunc("GET /ui/login", s.handleUILogin)

@@ -131,18 +131,30 @@ func (s *Server) handleUIFleet(w http.ResponseWriter, r *http.Request, sess uiSe
 		return
 	}
 	notice := uiNoticeText(r.URL.Query().Get("n"))
-	s.renderPage(w, http.StatusOK, sess, notice, "Fleet", fleetTemplate, "fleet", fleetData{Rows: rows, CSRF: sess.CSRF})
+	s.renderPage(w, http.StatusOK, sess, notice, "Fleet", uiTmpl, "fleet", fleetData{Rows: rows, CSRF: sess.CSRF})
 }
 
 // handleUIMachines serves the table fragment the page polls, so online, blocked
 // and revoked state stays current without a reload.
+//
+// It is the *inner* region, not the container: a tick that replaced the
+// container would take the Delete confirmation panel with it, which is exactly
+// how a half-typed machine name used to disappear mid-confirmation.
 func (s *Server) handleUIMachines(w http.ResponseWriter, r *http.Request, sess uiSession) {
 	rows, err := s.fleetRows()
 	if err != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
-	s.renderFragment(w, sess, fleetTemplate, "fleet", fleetData{Rows: rows, CSRF: sess.CSRF})
+	s.renderFragment(w, sess, uiTmpl, "fleettable", fleetData{Rows: rows, CSRF: sess.CSRF})
+}
+
+// handleUIConfirmClear empties the confirmation panel. It is a GET because
+// dismissing a dialog changes nothing on the server, and it exists as a route
+// rather than as a form button so the operator's Cancel does not have to submit
+// the confirmation form to get out of it.
+func (s *Server) handleUIConfirmClear(w http.ResponseWriter, r *http.Request, sess uiSession) {
+	s.renderFragment(w, sess, uiTmpl, "confirmcleared", nil)
 }
 
 func (s *Server) handleUIOrgs(w http.ResponseWriter, r *http.Request, sess uiSession) {
@@ -152,7 +164,7 @@ func (s *Server) handleUIOrgs(w http.ResponseWriter, r *http.Request, sess uiSes
 		return
 	}
 	notice := uiNoticeText(r.URL.Query().Get("n"))
-	s.renderPage(w, http.StatusOK, sess, notice, "Orgs", orgsTemplate, "orgs", orgsData{Rows: rows, CSRF: sess.CSRF})
+	s.renderPage(w, http.StatusOK, sess, notice, "Orgs", uiTmpl, "orgs", orgsData{Rows: rows, CSRF: sess.CSRF})
 }
 
 func (s *Server) handleUIOrgMember(w http.ResponseWriter, r *http.Request, sess uiSession) {
@@ -166,7 +178,7 @@ func (s *Server) handleUIOrgMember(w http.ResponseWriter, r *http.Request, sess 
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
-	s.renderPage(w, http.StatusOK, sess, "", "Org "+org, memberTemplate, "orgmember", data)
+	s.renderPage(w, http.StatusOK, sess, "", "Org "+org, uiTmpl, "orgmember", data)
 }
 
 // ---- machine actions ----
@@ -229,7 +241,7 @@ func (s *Server) handleUIDelete(w http.ResponseWriter, r *http.Request, sess uiS
 	// and it must not be reachable by a misclick on the wrong row.
 	confirmName := r.PostFormValue("confirm_name")
 	if r.PostFormValue("confirm") != "1" || confirmName != name {
-		s.renderFragment(w, sess, deleteConfirmTemplate, "deleteconfirm", deleteConfirmData{
+		s.renderFragment(w, sess, uiTmpl, "deleteconfirm", deleteConfirmData{
 			Name: name, Online: m.Name != "" && s.agentOnline(name), CSRF: sess.CSRF,
 		})
 		return
@@ -259,7 +271,7 @@ func (s *Server) refreshOrRedirect(w http.ResponseWriter, r *http.Request, sess 
 			http.Error(w, "store error", http.StatusInternalServerError)
 			return
 		}
-		s.renderFragment(w, sess, fleetTemplate, "fleet", fleetData{Rows: rows, CSRF: sess.CSRF})
+		s.renderFragment(w, sess, uiTmpl, "fleet", fleetData{Rows: rows, CSRF: sess.CSRF})
 		return
 	}
 	http.Redirect(w, r, "/ui?n="+noticeCode, http.StatusSeeOther)
@@ -426,7 +438,7 @@ func (s *Server) handleUILogout(w http.ResponseWriter, r *http.Request, sess uiS
 // renderSignInMessage renders a page shown when there is no session: a fixed
 // server-authored sentence, never provider or request text.
 func (s *Server) renderSignInMessage(w http.ResponseWriter, status int, title, reason string) {
-	s.renderPage(w, status, uiSession{}, "", title, loginFailedTemplate, "loginfailed", struct{ Reason string }{reason})
+	s.renderPage(w, status, uiSession{}, "", title, uiTmpl, "loginfailed", struct{ Reason string }{reason})
 }
 
 // ---- static assets ----
