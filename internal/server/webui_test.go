@@ -23,6 +23,7 @@ import (
 	"github.com/bcross/mach/internal/broker"
 	"github.com/bcross/mach/internal/oidcauth"
 	"github.com/bcross/mach/internal/store"
+	"github.com/bcross/mach/internal/version"
 )
 
 type fakeProvider struct {
@@ -637,6 +638,95 @@ func TestUIOrgMembershipSplitsKeys(t *testing.T) {
 		if k.Name == "elsewhere" {
 			t.Fatal("a key scoped to another org was listed as this org's")
 		}
+	}
+}
+
+// A signed-in operator can see which build is managing the fleet, so an
+// operator reading the page does not have to guess or shell into the control
+// plane's host to find out.
+//
+// Asserted against version.Version rather than a literal: the value is compiled
+// in, and a test that hardcoded it would fail the moment the version is bumped
+// or the test binary is stamped with -X — testing the constant, not the wiring.
+func TestUIPageCarriesTheControlPlaneVersionWhenSignedIn(t *testing.T) {
+	s, _, p := newUITestServer(t)
+	h := s.Routes()
+	session, _ := uiSignIn(t, s, p)
+
+	req := httptest.NewRequest("GET", "/ui", nil)
+	req.AddCookie(session)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("fleet page returned %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "mach-server "+version.Version) {
+		t.Fatal("the signed-in page does not carry the control plane's version")
+	}
+}
+
+// The version is withheld from pages served to someone who is not signed in.
+//
+// Two cases, because they fail for different reasons. The enrollment page is
+// anonymous by construction (Public), and the sign-in message page is NOT
+// Public — it renders through the same shell with an empty session. Gating on
+// Public alone would pass the first and leak on the second, so the second is the
+// one that actually pins the gate to the session.
+func TestUIPagesWithoutASessionOmitTheVersion(t *testing.T) {
+	s, _, _ := newUITestServer(t)
+	h := s.Routes()
+	want := "mach-server " + version.Version
+
+	// (a) the public enrollment page.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("enrollment page returned %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), want) {
+		t.Fatal("the public enrollment page carries the control plane's version")
+	}
+
+	// (b) a sign-in message page: reachable by anyone, Public false, no session.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/ui/callback", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("callback with no state returned %d, want 400", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), want) {
+		t.Fatal("a page rendered with no session carries the control plane's version")
+	}
+}
+
+// An agent reporting a version other than this control plane's own is marked, so
+// an operator can see which machines are not on the build they are managing from
+// without comparing the numbers by eye.
+func TestUIFleetMarksAVersionSkew(t *testing.T) {
+	s, st, p := newUITestServer(t)
+	// Three machines: one on this build, one older, and one that has enrolled but
+	// never sent a hello. Exactly one is expected to be flagged — the third has no
+	// reported version, and asserting on a value we do not have would be a lie.
+	for _, m := range []struct{ name, ver string }{
+		{"bcross-current", version.Version},
+		{"bcross-old", "0.0.1-old"},
+		{"bcross-silent", ""},
+	} {
+		if err := st.CreateMachine(m.name, "pub-"+m.name, "h-"+m.name, "linux", "amd64", m.ver, "", false); err != nil {
+			t.Fatalf("seeding %s: %v", m.name, err)
+		}
+	}
+
+	h := s.Routes()
+	session, _ := uiSignIn(t, s, p)
+	req := httptest.NewRequest("GET", "/ui", nil)
+	req.AddCookie(session)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("fleet page returned %d", rec.Code)
+	}
+	if n := strings.Count(rec.Body.String(), ">differs<"); n != 1 {
+		t.Fatalf("skew badges = %d, want exactly 1 (one agent differs, one matches, one has not reported)", n)
 	}
 }
 

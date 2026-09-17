@@ -275,7 +275,7 @@ only covered at the SQL-translation level.
   and drives the temporary session's whole lifecycle: bare `mach` enrolling over
   the real pair page, being recorded temporary, retiring itself on SIGTERM, and
   the next run taking that name back over with no operator action.
-  Green = 131 checks.
+  Green = 138 checks.
 - Timing-sensitive e2e checks (streaming) use a real sleep and a real
   background process; if one flakes, make the sleep longer rather than
   weakening the assertion.
