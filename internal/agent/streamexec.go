@@ -19,7 +19,7 @@ import (
 // handleStream runs a streaming exec session (server already verified auth
 // and routed the frame by session ID). Streaming is plaintext by design:
 // it serves the interactive console; one-shot exec is the E2E-able path.
-func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{}) {
+func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{}, ctl *sessionCtl) {
 	var start protocol.StreamStart
 	if err := json.Unmarshal(env.Payload, &start); err != nil {
 		_ = conn.WriteEnvelope(protocol.Envelope{
@@ -29,11 +29,20 @@ func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{
 		return
 	}
 
-	if reason := checkCommand(start.Command, start.Argv); reason != "" {
+	// One place that ends a session, so the console trace and the terminal frame
+	// cannot disagree about how it ended — every early refusal below goes through
+	// it too, and a temporary session's operator sees a refused command rather
+	// than silence followed by nothing.
+	end := func(e protocol.StreamEnd) {
+		ctl.announce("console: exit %d", e.ExitCode)
 		_ = conn.WriteEnvelope(protocol.Envelope{
-			Type: "stream_end", ReqID: env.ReqID,
-			Payload: mustJSONStream(protocol.StreamEnd{ExitCode: 126, Error: reason}),
+			Type: "stream_end", ReqID: env.ReqID, Payload: mustJSONStream(e),
 		})
+	}
+	ctl.announce("console: %q", describeCommandText(start.Command, start.Argv))
+
+	if reason := checkCommand(start.Command, start.Argv); reason != "" {
+		end(protocol.StreamEnd{ExitCode: 126, Error: reason})
 		return
 	}
 
@@ -41,10 +50,7 @@ func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{
 	case sem <- struct{}{}:
 		defer func() { <-sem }()
 	case <-time.After(10 * time.Second):
-		_ = conn.WriteEnvelope(protocol.Envelope{
-			Type: "stream_end", ReqID: env.ReqID,
-			Payload: mustJSONStream(protocol.StreamEnd{ExitCode: 126, Error: "too many concurrent commands on this machine"}),
-		})
+		end(protocol.StreamEnd{ExitCode: 126, Error: "too many concurrent commands on this machine"})
 		return
 	}
 
@@ -59,10 +65,7 @@ func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{
 	default:
 		sh, err := resolveShell()
 		if err != nil {
-			_ = conn.WriteEnvelope(protocol.Envelope{
-				Type: "stream_end", ReqID: env.ReqID,
-				Payload: mustJSONStream(protocol.StreamEnd{ExitCode: 126, Error: err.Error()}),
-			})
+			end(protocol.StreamEnd{ExitCode: 126, Error: err.Error()})
 			return
 		}
 		c = exec.CommandContext(ctx, sh.path, sh.args(start.Command)...)
@@ -73,10 +76,7 @@ func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{
 	stdoutPipe, _ := c.StdoutPipe()
 	stderrPipe, _ := c.StderrPipe()
 	if err := c.Start(); err != nil {
-		_ = conn.WriteEnvelope(protocol.Envelope{
-			Type: "stream_end", ReqID: env.ReqID,
-			Payload: mustJSONStream(protocol.StreamEnd{ExitCode: 126, Error: err.Error()}),
-		})
+		end(protocol.StreamEnd{ExitCode: 126, Error: err.Error()})
 		return
 	}
 	// Route stdin/kill frames to this session until it ends.
@@ -156,10 +156,7 @@ func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{
 	}
 	errText = withDrainNote(errText, cut)
 	_ = stdinPipe
-	_ = conn.WriteEnvelope(protocol.Envelope{
-		Type: "stream_end", ReqID: env.ReqID,
-		Payload: mustJSONStream(protocol.StreamEnd{ExitCode: exitCode, Error: errText}),
-	})
+	end(protocol.StreamEnd{ExitCode: exitCode, Error: errText})
 }
 
 // streamDrainGrace bounds how long the terminal record waits for the output pumps

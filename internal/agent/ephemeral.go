@@ -138,6 +138,28 @@ func (c *sessionCtl) shutDown() {
 	conn.Close()
 }
 
+// announce prints a one-line trace of a command this session is asked to run, so
+// the operator watching the console it was started from can see what is being
+// done to the machine. Without it a temporary session sat silent while commands
+// arrived, executed and returned.
+//
+// Only a temporary session traces. That is the whole gate, and it is the right
+// one: this mode exists to be watched at a terminal, whereas an installed
+// agent's output goes to systemd/launchd's journal, where a line per command is
+// noise nobody asked for. The nil receiver is the permanent agent's case, so the
+// shared command loop does not have to branch on which mode it is in.
+//
+// The text is %q-quoted by every caller because it arrives from the control
+// plane: a command carrying a newline must not be able to forge a second line of
+// this machine's console — the same rule the disconnect log line follows. It is
+// a trace, never input: nothing reads it back.
+func (c *sessionCtl) announce(format string, args ...any) {
+	if c == nil || c.stopped() {
+		return
+	}
+	fmt.Fprintf(os.Stdout, "mach: "+format+"\n", args...)
+}
+
 // retiredEnrollment reports whether the retire frame actually went out.
 func (c *sessionCtl) retiredEnrollment() bool {
 	if c == nil {

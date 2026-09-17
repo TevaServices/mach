@@ -453,6 +453,25 @@ OUT=$(curl -sS "$BASE/v1/machines" -H "Authorization: Bearer $ADMIN_KEY" 2>&1)
 [[ "$OUT" == *"$TMP_NAME"* ]]; check "the temporary session enrolled" $?
 [[ "$OUT" == *'"temporary":true'* ]]; check "and the control plane recorded it as temporary" $?
 
+# A temporary session says what is being done to its machine. The operator is
+# watching this console — it is the whole mode — and without the trace, commands
+# arrived, ran and returned without a word appearing on it.
+OUT=$(machc exec "$TMP_NAME" 'echo temp-trace-marker' 2>&1)
+[[ "$OUT" == *temp-trace-marker* ]]; check "a temporary session runs commands like any other machine" $?
+sleep 1
+# Every trace line starts with the prefix, so the count is the trace itself. The
+# command may be sealed here (E2E is on for this org), which is why the checks
+# match either spelling rather than pinning the unsealed one.
+OUT=$(grep -c '^mach: exec' "$WORKDIR/agent-tmp.log")
+[[ "$OUT" -ge 2 ]]; check "the temporary session traced a command it was asked to run" $?
+OUT=$(grep -c '^mach: exec.*: exit 0' "$WORKDIR/agent-tmp.log")
+[[ "$OUT" -ge 1 ]]; check "and traced the exit status back onto its console" $?
+# The trace is the temporary session's alone. An installed agent's journal is not
+# the place for a line per command, and "echo not-blocked" ran against agent1
+# earlier in this run without ever being written there.
+OUT=$(grep -c 'echo not-blocked' "$WORKDIR/agent1.log")
+[[ "$OUT" -eq 0 ]]; check "an installed agent does not trace commands into its journal" $?
+
 # Nothing on disk: that is what makes the next run a re-enrollment rather than a
 # silent reuse of an identity.
 ENTRIES=$(ls -A "$TMP_STATE" 2>/dev/null | wc -l | tr -d ' ')

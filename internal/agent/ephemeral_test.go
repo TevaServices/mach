@@ -13,11 +13,14 @@ package agent
 // state: it cannot read, re-key or delete an enrollment an `mach install` made.
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/bcross/mach/internal/protocol"
@@ -156,4 +159,86 @@ func TestTemporarySessionLeavesAnInstalledEnrollmentAlone(t *testing.T) {
 	if string(keyBefore) != string(keyAfter) {
 		t.Fatal("a temporary session changed an installed agent's key")
 	}
+}
+
+// The console trace, driven through the real command path: a temporary session
+// prints one quoted line when a command arrives and one when it finishes.
+//
+// Quoting is the security-relevant half. The command text comes from the control
+// plane, and a command carrying a newline must not be able to print a second
+// line of this machine's console that reads like mach's own — so the test runs a
+// command with a newline in it and counts the lines that came out.
+func TestTemporarySessionTracesTheCommandsItRuns(t *testing.T) {
+	globalPolicy.install("")
+	conn, peer := streamPipe(t)
+
+	payload, _ := json.Marshal(protocol.ExecCommand{Command: "echo traced\necho forged", Timeout: 5})
+	got := captureStdout(t, func() {
+		handleExec(conn, protocol.Envelope{Type: "exec", ReqID: "trace-1", Payload: payload},
+			make(chan struct{}, 1), newSessionCtl())
+	})
+
+	// The command still ran and still answered: tracing is a side channel, not a
+	// replacement for the protocol.
+	env := readEnvelope(t, peer)
+	if env.Type != "exec_result" {
+		t.Fatalf("reply frame = %q, want exec_result", env.Type)
+	}
+	var res protocol.ExecResult
+	if err := json.Unmarshal(env.Payload, &res); err != nil {
+		t.Fatalf("exec_result payload: %v", err)
+	}
+	if !strings.Contains(res.Stdout, "traced") || !strings.Contains(res.Stdout, "forged") {
+		t.Errorf("stdout = %q, want both echoed lines", res.Stdout)
+	}
+
+	if !strings.Contains(got, `mach: exec: "echo traced\necho forged"`) {
+		t.Errorf("trace = %q, want the command quoted on one line", got)
+	}
+	if !strings.Contains(got, "mach: exec: exit 0") {
+		t.Errorf("trace = %q, want the exit status reported", got)
+	}
+	// Exactly two lines: the command's own newline was escaped, not printed.
+	if n := strings.Count(got, "\n"); n != 2 {
+		t.Errorf("trace has %d lines, want 2 — a command forged an extra console line:\n%s", n, got)
+	}
+}
+
+// Only a temporary session traces: the permanent agent passes a nil *sessionCtl,
+// and a session that is already shutting down has said its farewell already.
+func TestAnnounceIsSilentWithoutALiveTemporarySession(t *testing.T) {
+	got := captureStdout(t, func() {
+		var noSession *sessionCtl // the installed agent's case
+		noSession.announce("exec: %q", "echo hi")
+
+		stopped := newSessionCtl()
+		stopped.shutDown()
+		stopped.announce("exec: %q", "echo hi")
+	})
+	if got != "" {
+		t.Errorf("something with no console to trace to printed %q", got)
+	}
+}
+
+// captureStdout runs fn with os.Stdout redirected to a pipe and returns what it
+// wrote. The agent writes its console trace with fmt.Fprintf rather than through
+// the logger, so there is no seam to inject — this is the seam.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
+
+	fn()
+
+	os.Stdout = old
+	_ = w.Close()
+	defer r.Close()
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	return buf.String()
 }

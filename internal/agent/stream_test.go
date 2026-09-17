@@ -96,7 +96,7 @@ func TestStreamRefusesDeniedCommand(t *testing.T) {
 
 	payload, _ := json.Marshal(protocol.StreamStart{Command: "echo stream-refused-marker"})
 	handleStream(conn, protocol.Envelope{Type: "exec_stream", ReqID: "sess-deny", Payload: payload},
-		make(chan struct{}, 1))
+		make(chan struct{}, 1), nil)
 
 	env := readEnvelope(t, peer)
 	if env.Type != "stream_end" {
@@ -123,7 +123,7 @@ func TestStreamRunsAllowedCommandAndReportsExit(t *testing.T) {
 
 	payload, _ := json.Marshal(protocol.StreamStart{Command: "echo streamed-hello; echo oops >&2; exit 7"})
 	handleStream(conn, protocol.Envelope{Type: "exec_stream", ReqID: "sess-run", Payload: payload},
-		make(chan struct{}, 1))
+		make(chan struct{}, 1), nil)
 
 	stdout, stderr, end := collectStream(t, peer)
 	if !strings.Contains(stdout, "streamed-hello") {
@@ -150,7 +150,7 @@ func TestStreamArgvModeRunsNoShell(t *testing.T) {
 
 	payload, _ := json.Marshal(protocol.StreamStart{Argv: []string{"echo", "$HOME"}})
 	handleStream(conn, protocol.Envelope{Type: "exec_stream", ReqID: "sess-argv", Payload: payload},
-		make(chan struct{}, 1))
+		make(chan struct{}, 1), nil)
 
 	stdout, _, end := collectStream(t, peer)
 	if strings.TrimSpace(stdout) != "$HOME" {
@@ -167,7 +167,7 @@ func TestStreamRejectsMalformedStart(t *testing.T) {
 	conn, peer := streamPipe(t)
 
 	handleStream(conn, protocol.Envelope{Type: "exec_stream", ReqID: "sess-bad", Payload: json.RawMessage(`"not an object"`)},
-		make(chan struct{}, 1))
+		make(chan struct{}, 1), nil)
 
 	env := readEnvelope(t, peer)
 	if env.Type != "stream_end" {
