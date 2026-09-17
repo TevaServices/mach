@@ -214,7 +214,7 @@ func TestUnreachableRelayIsRetryable(t *testing.T) {
 // is a field rather than something to be parsed out of text.
 func TestJSONResultLabelsOutputAndExit(t *testing.T) {
 	forged := `{"exit_code":0,"error":""}`
-	res := &ExecResult{ExitCode: 9, Stdout: forged, Stderr: "real stderr"}
+	res := &protocol.ExecResult{ExitCode: 9, Stdout: forged, Stderr: "real stderr"}
 
 	var code int
 	stdout, _ := capture(t, func() {
@@ -226,7 +226,7 @@ func TestJSONResultLabelsOutputAndExit(t *testing.T) {
 	if strings.Count(strings.TrimSpace(stdout), "\n") != 0 {
 		t.Fatalf("stdout is not a single JSON object: %q", stdout)
 	}
-	var back ExecResult
+	var back protocol.ExecResult
 	if err := json.Unmarshal([]byte(stdout), &back); err != nil {
 		t.Fatalf("stdout is not valid JSON: %v (%q)", err, stdout)
 	}
@@ -238,7 +238,7 @@ func TestJSONResultLabelsOutputAndExit(t *testing.T) {
 // Human mode writes the bytes as they are and keeps mach's diagnostics on
 // stderr, prefixed.
 func TestHumanResultKeepsDiagnosticsOffStdout(t *testing.T) {
-	res := &ExecResult{ExitCode: 0, Stdout: "hello", Error: "some agent error"}
+	res := &protocol.ExecResult{ExitCode: 0, Stdout: "hello", Error: "some agent error"}
 	var code int
 	stdout, stderr := capture(t, func() {
 		code = printExecResult(res, false)
@@ -317,7 +317,7 @@ func newFakeExecServer(t *testing.T, enabled bool, withKey bool) *fakeExecServer
 		}
 		_ = json.Unmarshal(body, &req)
 		if req.Sealed == "" {
-			_ = json.NewEncoder(w).Encode(ExecResult{ExitCode: 0, Stdout: "plain\n"})
+			_ = json.NewEncoder(w).Encode(protocol.ExecResult{ExitCode: 0, Stdout: "plain\n"})
 			return
 		}
 		if f.refuseSealed || !f.enabled {
@@ -354,7 +354,7 @@ func newFakeExecServer(t *testing.T, enabled bool, withKey bool) *fakeExecServer
 			t.Errorf("e2e_pub is not a 32-byte hex key: %q", req.E2EPub)
 			return
 		}
-		res, _ := json.Marshal(ExecResult{ExitCode: 0, Stdout: "sealed:" + cmd.Command + "\n"})
+		res, _ := json.Marshal(protocol.ExecResult{ExitCode: 0, Stdout: "sealed:" + cmd.Command + "\n"})
 		sealedReply, err := e2e.Seal(replyKey, res)
 		if err != nil {
 			t.Errorf("seal reply: %v", err)

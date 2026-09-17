@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/bcross/mach/internal/e2e"
+	"github.com/bcross/mach/internal/protocol"
 )
 
 // Config is the console client's local config (~/.mach/console.json).
@@ -95,6 +96,12 @@ func New(cfg *Config) *client {
 	return &client{cfg: cfg, http: &http.Client{Timeout: 12 * time.Minute}, pins: newPinStore()}
 }
 
+// maxResp bounds what one API response may be. It comes from the protocol
+// because it has to be larger than the agent's own per-stream output cap: the
+// reply carrying a result is bigger than the result, and a client cap equal to
+// the agent's is what stopped the agent's truncation marker from ever arriving.
+const maxResp = protocol.MaxExecReplyBytes
+
 func (c *client) do(method, path string, body any, out any) error {
 	var rd io.Reader
 	if body != nil {
@@ -117,7 +124,6 @@ func (c *client) do(method, path string, body any, out any) error {
 		return err
 	}
 	defer resp.Body.Close()
-	const maxResp = 8 << 20
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, maxResp))
 	if len(data) == maxResp {
 		// Failing open here would surface as a confusing JSON unmarshal
@@ -169,13 +175,6 @@ type MachineInfo struct {
 	// `mach list` can say so, rather than leaving an operator to wonder why every
 	// command against a machine that looks online comes back refused.
 	Blocked bool `json:"blocked"`
-}
-
-type ExecResult struct {
-	ExitCode int    `json:"exit_code"`
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
-	Error    string `json:"error"`
 }
 
 type auditEntry struct {
@@ -267,7 +266,7 @@ func (c *client) runExec(machine, command string, argv []string, timeout int, as
 	}
 
 	// Plaintext: what the server can read, refuse, and record in full.
-	var res ExecResult
+	var res protocol.ExecResult
 	if err := c.do("POST", "/v1/exec", buildBody(), &res); err != nil {
 		fmt.Fprintln(os.Stderr, "mach: "+err.Error())
 		return 3
@@ -354,7 +353,7 @@ func (c *client) sealedExec(machine, command string, argv []string, timeout int,
 		fmt.Fprintln(os.Stderr, "mach: e2e: failed to open sealed result ("+oerr.Error()+")")
 		return 3, true
 	}
-	var res ExecResult
+	var res protocol.ExecResult
 	if jerr := json.Unmarshal(opened, &res); jerr != nil {
 		fmt.Fprintln(os.Stderr, "mach: e2e: sealed result undecodable")
 		return 3, true
@@ -386,9 +385,12 @@ func mapDefaultTimeout(timeout int) int {
 // --json — as one JSON object on stdout. In JSON mode every field is labeled
 // data: a program consuming mach reads the exit status from a field rather
 // than having to interpret a mix of a byte stream and a process status.
-func printExecResult(res *ExecResult, asJSON bool) int {
+func printExecResult(res *protocol.ExecResult, asJSON bool) int {
 	if asJSON {
-		if b, err := json.Marshal(res); err == nil {
+		// protocol.MarshalResult: the machine's output is bytes, not markup, and
+		// the default HTML escaping would rewrite every < and & in it on a path
+		// where nothing is ever rendered as HTML.
+		if b, err := protocol.MarshalResult(*res); err == nil {
 			os.Stdout.Write(append(b, '\n'))
 		}
 		if res.Error != "" {
@@ -396,9 +398,12 @@ func printExecResult(res *ExecResult, asJSON bool) int {
 		}
 		return res.ExitCode
 	}
-	fmt.Print(res.Stdout)
-	if res.Stderr != "" {
-		os.Stderr.WriteString(res.Stderr)
+	// Output(), not the text fields: it is what carries the exact bytes when the
+	// machine's output was not valid UTF-8.
+	stdout, stderr := res.Output()
+	os.Stdout.Write(stdout)
+	if len(stderr) > 0 {
+		os.Stderr.Write(stderr)
 	}
 	if res.Error != "" {
 		fmt.Fprintln(os.Stderr, "mach: "+res.Error)

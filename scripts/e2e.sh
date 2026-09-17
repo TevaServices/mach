@@ -136,6 +136,43 @@ step "exec: argv mode byte-exact"
 OUT=$(machc exec "$MACHINE" -- printf '%s|%s\n' 'two  spaces' 'a$*.b')
 [[ "$OUT" == *"two  spaces|a\$*.b"* ]]; check "argv passthrough byte-exact" $?
 
+step "exec: output is bytes, and a capped stream says so"
+# A command's output is bytes, not text: Stdout is a JSON string, JSON strings
+# must be valid UTF-8, and Go's encoder used to replace every invalid byte with
+# U+FFFD — so a tarball came back mangled and longer. The exact bytes now ride
+# beside the text form. Compared by digest because the point IS the bytes.
+#
+# The fixture is written ON the machine, not through the console: a file the
+# console had produced would already be sanitized, and the check would compare
+# two copies of the same loss — passing against exactly the bug it tests for.
+machc exec "$MACHINE" "head -c 16384 /dev/urandom > '$WORKDIR/bin.random'"
+# ...and it is genuinely not valid UTF-8, or the whole check is vacuous.
+UTFOK=$(python3 -c "
+d = open('$WORKDIR/bin.random','rb').read()
+try:
+    d.decode(); print('text')
+except UnicodeDecodeError:
+    print('binary')")
+[[ "$UTFOK" == "binary" ]]; check "the byte-fidelity fixture is really not valid UTF-8" $?
+WANT=$(shasum -a 256 <"$WORKDIR/bin.random" | cut -d' ' -f1)
+machc exec "$MACHINE" -- cat "$WORKDIR/bin.random" >"$WORKDIR/bin.back" 2>/dev/null
+GOT=$(shasum -a 256 <"$WORKDIR/bin.back" | cut -d' ' -f1)
+[[ "$WANT" == "$GOT" ]]; check "binary output round-trips byte-for-byte" $?
+# And the agent's own cap is reachable: a result that hits it arrives truncated
+# with its marker. It could not before — the client's reply bound was the same
+# 8 MiB as the agent's output cap, and the encoding inflation between them meant
+# the reply never fit, so the marker was unreachable and the command came back as
+# an error instead.
+OUT=$(machc exec "$MACHINE" 'python3 -c "print(\"x\"*8500000)"' 2>/dev/null | tail -c 60)
+[[ "$OUT" == *"[mach: output truncated at cap]"* ]]; check "output past the agent cap arrives truncated and marked" $?
+# The same result sealed, which is the case that used to run the command TWICE:
+# the oversized reply was misread as a refusal and retried in plaintext. One
+# run, one result, still sealed.
+rm -f "$WORKDIR/runs.txt"
+OUT=$(machc exec "$MACHINE" 'echo ran >> '"$WORKDIR"'/runs.txt; python3 -c "print(\"y\"*6000000)"' 2>&1 >/dev/null)
+[[ "$OUT" != *"retrying in plaintext"* ]]; check "an oversized sealed reply is not retried in plaintext" $?
+OUT=$(wc -l <"$WORKDIR/runs.txt" | tr -d ' '); [[ "$OUT" -eq 1 ]]; check "and the command ran exactly once" $?
+
 step "streaming: console output arrives while the command is still running"
 # Streaming lives on the console relay: the interactive path opens the
 # /v1/console/stream WebSocket and the control plane pumps the agent's output
