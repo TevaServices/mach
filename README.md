@@ -1,5 +1,9 @@
 # mach
 
+Apache-2.0 licensed — free for personal and commercial use. Contributions
+follow the same terms; see [License](#license) and
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 One binary, any OS, zero inbound ports. `mach` gives you remote CLI access
 to registered machines — quick interactive troubleshooting plus long-running
 named access — where **every target only ever makes outbound connections**;
@@ -388,3 +392,16 @@ footer, so `push-update --attestation` works there as documented.
 
 CI (`.github/workflows/ci.yml`) runs lint, unit tests and e2e on main and on
 every PR, using the same `mise` tasks the repo documents.
+
+## License
+
+`SPDX-License-Identifier: Apache-2.0`
+
+mach is licensed under the [Apache License 2.0](LICENSE) — use it,
+ship it, build a product on it, including commercially.
+
+Contributions are licensed under the same terms (inbound = outbound)
+and every commit needs a `Signed-off-by:` line; CI checks it. See
+[CONTRIBUTING.md](CONTRIBUTING.md). Found a vulnerability? Don't open
+an issue — see [SECURITY.md](SECURITY.md). Code vendored into the tree
+(htmx) is listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

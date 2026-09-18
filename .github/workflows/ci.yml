@@ -12,6 +12,39 @@ permissions:
   contents: read
 
 jobs:
+  # DCO: every commit on a PR must carry a Signed-off-by line matching
+  # its author or committer (CONTRIBUTING.md). Merge commits are exempt
+  # (their parents carry their own sign-offs), and so is dependabot,
+  # which cannot sign off.
+  dco:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Require Signed-off-by on every commit
+        run: |
+          set -u
+          fail=0
+          for c in $(git rev-list "origin/${{ github.base_ref }}..HEAD"); do
+            if [ "$(git rev-list --parents -n1 "$c" | wc -w)" -gt 2 ]; then
+              continue
+            fi
+            author=$(git show -s --format='%an <%aE>' "$c")
+            committer=$(git show -s --format='%cn <%cE>' "$c")
+            body=$(git show -s --format='%B' "$c")
+            if ! printf '%s\n' "$body" | grep -qxF "Signed-off-by: $author" \
+            && ! printf '%s\n' "$body" | grep -qxF "Signed-off-by: $committer"; then
+              echo "::error::DCO: commit $(git show -s --format='%h %s' "$c") lacks 'Signed-off-by: $author'"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "Every commit needs a 'Signed-off-by:' line matching its author. Use 'git commit -s' — see CONTRIBUTING.md."
+          fi
+          exit "$fail"
+
   lint:
     runs-on: ubuntu-latest
     steps:
