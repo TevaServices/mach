@@ -256,6 +256,12 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+          # The client binaries and their attestations only. Without a pattern
+          # this step downloads every artifact the run produced — and buildx's
+          # gha cache uploads a .dockerbuild build record per container job,
+          # which is neither a release artifact nor something this job should
+          # stall on downloading.
+          pattern: client-*
 
       - name: Assemble the attestation bundle and release body
         run: |
