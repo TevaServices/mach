@@ -185,12 +185,26 @@ func (s *Server) killStreamsForMachine(machine, reason string) int {
 }
 
 // beginCommand records the command a stream is about to run, for the audit row
-// written when it ends.
-func (r *streamRelay) beginCommand(command, source string) {
+// written when it ends. It reports false when a command is already running on
+// this session, and the caller refuses the second one rather than starting it.
+//
+// One session carries one command, and that is a property of the wire rather
+// than a choice: the agent tags every stream_out and stream_end with the
+// SESSION id, so two commands interleaved on one connection cannot be told
+// apart. Overwriting the running command's identity is not a cosmetic bug —
+// it wrote one audit row naming the second command with the first command's exit
+// code, and no row at all for the other, so a command could be hidden from the
+// trail by pipelining it behind one that was already running. Refusing is what
+// an audit trail that records every dispatched command requires.
+func (r *streamRelay) beginCommand(command, source string) bool {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.command != "" {
+		return false
+	}
 	r.command, r.source = command, source
 	r.out, r.errOut = nil, nil
-	r.mu.Unlock()
+	return true
 }
 
 // capture keeps the head of the command's output for the audit row.
@@ -389,7 +403,17 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 				s.streamRefuse(consoleConn, machine, ref.msg)
 				continue
 			}
-			relay.beginCommand(display, "console:"+keyName)
+			if !relay.beginCommand(display, "console:"+keyName) {
+				// A command is already running in this session, and the relay has
+				// no way to attribute a second one's output or exit status. Refused
+				// and audited like any other declined dispatch, so the attempt is
+				// visible rather than silently run.
+				s.st.AuditInsert(nowRFC3339(), machine, display, "console:"+keyName,
+					sqlNullInt(execRefused), "", "refused: a command is already running in this session")
+				s.streamRefuse(consoleConn, machine,
+					"a command is already running in this session — wait for it to finish, or open another `mach console`")
+				continue
+			}
 			env.ReqID = sessionID // tag for the agent pump's routing
 			s.streamToAgent(sessionID, consoleConn, env)
 		case "stream_stdin", "stream_kill":

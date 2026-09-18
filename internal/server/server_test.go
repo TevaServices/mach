@@ -194,9 +194,16 @@ func TestKeyCanExecOn(t *testing.T) {
 		// comma-separated allowlists must work too, not just pipes
 		{"exec:bcross-a,bcross-b", "bcross-b", true},
 		{"exec:bcross-a,bcross-b", "bcross-c", false},
-		// case-insensitive against the enrollment-normalized name
-		{"exec:bcross-Web-1", "bcross-web-1", true},
-		{"exec:bcross-web-1", "bcross-Web-1", true},
+		// Exact, not case-folded. The old expectation here read "case-insensitive
+		// against the enrollment-normalized name" — but nothing normalizes the
+		// machine part at enrollment, ValidMachinePart accepts uppercase, and the
+		// store's uniqueness, its lookups and the dispatch path are all
+		// case-sensitive. So a difference in case is a DIFFERENT machine, and
+		// folding made a key scoped to one authorize the other.
+		{"exec:bcross-Web-1", "bcross-web-1", false},
+		{"exec:bcross-web-1", "bcross-Web-1", false},
+		{"exec:bcross-Web-1", "bcross-Web-1", true},
+		{"exec:bcross-web-1", "bcross-web-1", true},
 		{"readonly", "bcross-a", false},
 		{"enroll", "bcross-a", false},
 	}

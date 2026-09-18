@@ -746,3 +746,91 @@ func TestPolicyFileReloadReachesConnectedAgents(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+// One session carries one command, because the agent tags every output frame and
+// the terminal record with the SESSION id — two commands interleaved on one
+// connection cannot be told apart. Pipelining a second exec_stream used to
+// overwrite the running command's identity, which wrote a single audit row
+// naming the second command with the FIRST command's exit code and no row at all
+// for the first: a command could be hidden from the trail by sending it behind
+// one that was already running.
+func TestSecondCommandInOneSessionIsRefused(t *testing.T) {
+	h := newStreamHarness(t)
+	key := adminKey(t, h.s, "exec:*")
+	console, sessionID, resp := h.console(t, key, h.mach)
+	if console == nil {
+		t.Fatalf("console dial failed: %v", resp)
+	}
+
+	execStream(t, console, "echo first-marker")
+	select {
+	case f := <-h.frames:
+		if f.Type != "exec_stream" {
+			t.Fatalf("agent got %q, want exec_stream", f.Type)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first command never reached the agent")
+	}
+
+	// A second command while the first is still running.
+	execStream(t, console, "echo second-marker")
+	env := nextFrame(t, console)
+	if env.Type != "stream_end" {
+		t.Fatalf("second command frame = %q, want a stream_end refusal", env.Type)
+	}
+	var end protocol.StreamEnd
+	_ = json.Unmarshal(env.Payload, &end)
+	if end.ExitCode != execRefused {
+		t.Errorf("refusal exit = %d, want %d", end.ExitCode, execRefused)
+	}
+	if !strings.Contains(end.Error, "already running") {
+		t.Errorf("refusal %q does not say why", end.Error)
+	}
+
+	// Nothing was dispatched to the machine for it.
+	select {
+	case f := <-h.frames:
+		t.Fatalf("the refused command was dispatched anyway: %q", f.Type)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// The first command still finishes and is audited under its own name.
+	end1, _ := json.Marshal(protocol.StreamEnd{ExitCode: 3})
+	if err := h.agent.WriteJSON(protocol.Envelope{Type: "stream_end", ReqID: sessionID, Payload: end1}); err != nil {
+		t.Fatalf("agent write: %v", err)
+	}
+	// The refusal is audited immediately, so wait for the RUNNING command's row
+	// specifically rather than for "any row at all".
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		entries, err := h.st.AuditList(h.mach, 10)
+		if err != nil {
+			t.Fatalf("audit list: %v", err)
+		}
+		var first, second *store.AuditEntry
+		for i := range entries {
+			switch {
+			case strings.Contains(entries[i].Command, "first-marker"):
+				first = &entries[i]
+			case strings.Contains(entries[i].Command, "second-marker"):
+				second = &entries[i]
+			}
+		}
+		if first != nil {
+			if !first.ExitCode.Valid || first.ExitCode.Int64 != 3 {
+				t.Errorf("first command audited as %+v, want exit 3 under its own name", first.ExitCode)
+			}
+			if second == nil {
+				t.Fatal("the refused command was not audited")
+			}
+			if !second.ExitCode.Valid || second.ExitCode.Int64 != execRefused {
+				t.Errorf("refused command audited as %+v, want %d", second.ExitCode, execRefused)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the running command left no audit row (%d rows seen)", len(entries))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}

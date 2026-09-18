@@ -65,7 +65,7 @@ func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request, keyName,
 		if m.Revoked {
 			continue
 		}
-		if !all && !containsFold(allowed, m.Name) {
+		if !all && !containsExact(allowed, m.Name) {
 			continue
 		}
 		// The E2E signal rides each machine, not the listing: the setting is
@@ -82,9 +82,14 @@ func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request, keyName,
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func containsFold(list []string, s string) bool {
+// containsExact reports whether a machine name is on an allowlist. Exact, for
+// the reason spelled out on execAllowlist: the store's name matching is
+// case-sensitive, so folding here would let a scoped key read the fleet listing
+// and audit trail of a machine it cannot exec on — or, worse, of one that merely
+// differs in case.
+func containsExact(list []string, s string) bool {
 	for _, v := range list {
-		if strings.EqualFold(v, s) {
+		if v == s {
 			return true
 		}
 	}
@@ -303,7 +308,12 @@ type e2ePubResponse struct {
 // like exec: a key that may run commands on the machine may fetch its E2E key.
 func (s *Server) handleE2EPub(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
 	name := r.PathValue("name")
-	if !keyCanExecOn(scopes, name) && scopes != "readonly" {
+	// Exec scope only, with no readonly carve-out. The key this hands out is the
+	// one used to seal commands, so a key that may not run commands has no use for
+	// it — and the control table's promise is that a read-only key sees the fleet
+	// and the audit trail "and nothing else". A readonly key can be refused here
+	// sooner and more legibly than at the exec it would attempt next.
+	if !keyCanExecOn(scopes, name) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key is not scoped for machine " + name})
 		return
 	}
@@ -362,7 +372,7 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, keyName, sc
 	}
 	allowed, all := readScope(scopes)
 	machine := r.URL.Query().Get("machine")
-	if !all && machine != "" && machine != "*" && !containsFold(allowed, machine) {
+	if !all && machine != "" && machine != "*" && !containsExact(allowed, machine) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key is not scoped for machine " + machine})
 		return
 	}
@@ -388,7 +398,7 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, keyName, sc
 	}
 	rows := make([]auditRow, 0, len(entries))
 	for _, e := range entries {
-		if !all && !containsFold(allowed, e.Machine) {
+		if !all && !containsExact(allowed, e.Machine) {
 			continue
 		}
 		var ec *int64
