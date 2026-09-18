@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -572,14 +573,32 @@ func oneLine(s string) string {
 	return s
 }
 
-// InterruptGuard exits immediately on Ctrl-C / SIGTERM. (There is no
-// in-flight request to cancel in the one-shot exec path; output printed
-// so far stands.)
+// streamOwnsInterrupt is true while a streamed command is running. In that
+// window Ctrl-C belongs to the remote command — killing it is exactly what the
+// console's banner promises, and what the operator means by pressing it — so
+// this process's interrupt guard stands down and the signal lands on the
+// streaming session instead. See streamConsole.
+var streamOwnsInterrupt atomic.Bool
+
+// InterruptGuard exits immediately on Ctrl-C / SIGTERM. (There is no in-flight
+// request to cancel in the one-shot exec path; output printed so far stands.)
+//
+// With one exception: a running streamed command owns the interrupt, because
+// exiting here is what made Ctrl-C a no-op on the machine. It used to exit the
+// process on the first signal, which raced the stream handler's own
+// `stream_kill` write and almost always won — so the console vanished, the
+// command kept running, and the audit row said only that its fate was unknown.
 func InterruptGuard() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		<-sig
-		os.Exit(130)
+		for range sig {
+			if streamOwnsInterrupt.Load() {
+				// The streaming session handles it, and exits the process itself
+				// if the remote end will not stop.
+				continue
+			}
+			os.Exit(130)
+		}
 	}()
 }
