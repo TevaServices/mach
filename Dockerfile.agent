@@ -10,7 +10,7 @@
 #     -e MACH_API_KEY=<enroll-scoped key> \
 #     -e MACH_NAME=acme-container-1 \
 #     -v mach-agent-state:/data \
-#     ghcr.io/bcross/mach-agent
+#     ghcr.io/tevaservices/mach-agent
 #
 # On first start the entrypoint enrolls with those credentials; on every start
 # after that it execs `mach run`, which dials out, signs in and reconnects with
@@ -56,7 +56,7 @@ export CGO_ENABLED=0
 export GOOS="$TARGETOS" GOARCH="$TARGETARCH"
 LDFLAGS="-s -w"
 if [ -n "$MACH_VERSION" ]; then
-  LDFLAGS="$LDFLAGS -X github.com/bcross/mach/internal/version.Version=$MACH_VERSION"
+  LDFLAGS="$LDFLAGS -X github.com/TevaServices/mach/internal/version.Version=$MACH_VERSION"
 fi
 go build -trimpath -ldflags "$LDFLAGS" -o /out/mach ./cmd/mach
 EOF

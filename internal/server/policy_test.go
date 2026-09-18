@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bcross/mach/internal/store"
+	"github.com/TevaServices/mach/internal/store"
 )
 
 // The point of the server-side policy: one block list, applied to every key,

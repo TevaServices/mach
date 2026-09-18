@@ -21,10 +21,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bcross/mach/internal/broker"
-	"github.com/bcross/mach/internal/oidcauth"
-	"github.com/bcross/mach/internal/store"
-	"github.com/bcross/mach/internal/version"
+	"github.com/TevaServices/mach/internal/broker"
+	"github.com/TevaServices/mach/internal/oidcauth"
+	"github.com/TevaServices/mach/internal/store"
+	"github.com/TevaServices/mach/internal/version"
 )
 
 type fakeProvider struct {

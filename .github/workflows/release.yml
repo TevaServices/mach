@@ -79,7 +79,7 @@ jobs:
           # stamps the binary and is handed to `attest` below, so the artifact
           # and the attestation that describes it cannot disagree.
           VER="${GITHUB_REF_NAME#v}"
-          LDFLAGS="-s -w -X github.com/bcross/mach/internal/version.Version=$VER"
+          LDFLAGS="-s -w -X github.com/TevaServices/mach/internal/version.Version=$VER"
           go build -trimpath -ldflags "$LDFLAGS" \
             -o "dist/mach-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}" ./cmd/mach
           # attest/verify-attestation live in mach-server; a native copy is

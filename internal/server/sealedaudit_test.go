@@ -19,8 +19,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/bcross/mach/internal/protocol"
-	"github.com/bcross/mach/internal/store"
+	"github.com/TevaServices/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/store"
 	"github.com/gorilla/websocket"
 )
 

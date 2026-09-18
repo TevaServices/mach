@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bcross/mach/internal/broker"
-	"github.com/bcross/mach/internal/store"
+	"github.com/TevaServices/mach/internal/broker"
+	"github.com/TevaServices/mach/internal/store"
 )
 
 func TestIPLimiter(t *testing.T) {

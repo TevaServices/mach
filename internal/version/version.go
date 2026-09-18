@@ -2,7 +2,7 @@
 //
 // The value is compiled in, and a release build overrides it at link time:
 //
-//	go build -ldflags "-X github.com/bcross/mach/internal/version.Version=0.3.0"
+//	go build -ldflags "-X github.com/TevaServices/mach/internal/version.Version=0.3.0"
 //
 // A plain `go build` reports "devel" below, and that default says so on purpose:
 // a binary that cannot say what it is must not claim to be a release. Nothing

@@ -10,8 +10,8 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/bcross/mach/internal/controlplane"
-	"github.com/bcross/mach/internal/version"
+	"github.com/TevaServices/mach/internal/controlplane"
+	"github.com/TevaServices/mach/internal/version"
 )
 
 func main() {

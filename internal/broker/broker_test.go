@@ -3,7 +3,7 @@ package broker
 import (
 	"testing"
 
-	"github.com/bcross/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/protocol"
 )
 
 // A full console buffer may drop output, but it must not drop the terminal

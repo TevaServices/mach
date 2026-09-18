@@ -346,7 +346,7 @@ Builds are unstamped by default and report `devel`. Stamp a version with
 `MACH_VERSION=0.3.0 mise run build`, or straight through the linker:
 
 ```
-go build -ldflags "-X github.com/bcross/mach/internal/version.Version=0.3.0" ./cmd/mach
+go build -ldflags "-X github.com/TevaServices/mach/internal/version.Version=0.3.0" ./cmd/mach
 ```
 
 One string serves everything: both binaries, and the six agent binaries baked

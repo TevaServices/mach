@@ -8,7 +8,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/bcross/mach/internal/version"
+	"github.com/TevaServices/mach/internal/version"
 )
 
 func envOr(key, def string) string {

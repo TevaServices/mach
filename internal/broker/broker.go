@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bcross/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/protocol"
 )
 
 type AgentConn struct {

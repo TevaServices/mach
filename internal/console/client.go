@@ -22,8 +22,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bcross/mach/internal/e2e"
-	"github.com/bcross/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/e2e"
+	"github.com/TevaServices/mach/internal/protocol"
 )
 
 // Config is the console client's local config (~/.mach/console.json).

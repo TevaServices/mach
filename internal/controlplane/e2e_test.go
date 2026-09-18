@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bcross/mach/internal/server"
-	"github.com/bcross/mach/internal/store"
+	"github.com/TevaServices/mach/internal/server"
+	"github.com/TevaServices/mach/internal/store"
 )
 
 // captureStdout runs f with os.Stdout redirected and returns what it printed.

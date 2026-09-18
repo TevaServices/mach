@@ -14,9 +14,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bcross/mach/internal/broker"
-	"github.com/bcross/mach/internal/oidcauth"
-	"github.com/bcross/mach/internal/store"
+	"github.com/TevaServices/mach/internal/broker"
+	"github.com/TevaServices/mach/internal/oidcauth"
+	"github.com/TevaServices/mach/internal/store"
 	"github.com/gorilla/websocket"
 )
 

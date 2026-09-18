@@ -13,8 +13,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bcross/mach/internal/e2e"
-	"github.com/bcross/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/e2e"
+	"github.com/TevaServices/mach/internal/protocol"
 	"github.com/gorilla/websocket"
 )
 

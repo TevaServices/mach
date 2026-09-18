@@ -91,7 +91,7 @@ func TestPredicateRecordsBuildFactsFromArtifact(t *testing.T) {
 	if !strings.HasPrefix(pred.Byproducts.GoVersion, "go1.") {
 		t.Errorf("goVersion = %q, want a toolchain version read from the artifact", pred.Byproducts.GoVersion)
 	}
-	if !strings.Contains(pred.Byproducts.GoModule, "github.com/bcross/mach") {
+	if !strings.Contains(pred.Byproducts.GoModule, "github.com/TevaServices/mach") {
 		t.Errorf("goModule = %q, want this module", pred.Byproducts.GoModule)
 	}
 	if len(pred.Materials) == 0 {
@@ -103,7 +103,7 @@ func TestPredicateRecordsBuildFactsFromArtifact(t *testing.T) {
 		if m.URI == "" {
 			t.Errorf("material with no URI: %+v", m)
 		}
-		if strings.Contains(m.URI, "github.com/bcross/mach") {
+		if strings.Contains(m.URI, "github.com/TevaServices/mach") {
 			sawSelf = true
 		}
 	}

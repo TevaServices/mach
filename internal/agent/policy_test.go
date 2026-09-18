@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bcross/mach/internal/e2e"
-	"github.com/bcross/mach/internal/policy"
-	"github.com/bcross/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/e2e"
+	"github.com/TevaServices/mach/internal/policy"
+	"github.com/TevaServices/mach/internal/protocol"
 )
 
 // sealedExecForTest runs one sealed command through the agent's sealed exec path

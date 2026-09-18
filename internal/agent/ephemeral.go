@@ -30,7 +30,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bcross/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/protocol"
 )
 
 // sessionCtl carries what a temporary session needs to end cleanly: the live

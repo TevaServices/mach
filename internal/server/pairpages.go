@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bcross/mach/internal/store"
+	"github.com/TevaServices/mach/internal/store"
 )
 
 // Minimal phone-facing approve page. Not for human dashboards.

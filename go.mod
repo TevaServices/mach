@@ -1,4 +1,4 @@
-module github.com/bcross/mach
+module github.com/TevaServices/mach
 
 go 1.26.0
 

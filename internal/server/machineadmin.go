@@ -21,8 +21,8 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/bcross/mach/internal/protocol"
-	"github.com/bcross/mach/internal/version"
+	"github.com/TevaServices/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/version"
 )
 
 // errNoSuchMachine distinguishes "that machine does not exist" from a store

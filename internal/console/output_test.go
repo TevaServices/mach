@@ -9,7 +9,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/bcross/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/protocol"
 )
 
 // Output that is not valid UTF-8 reaches the terminal as the bytes the machine

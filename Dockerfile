@@ -47,7 +47,7 @@ export CGO_ENABLED=0
 export GOOS="$TARGETOS" GOARCH="$TARGETARCH"
 LDFLAGS="-s -w"
 if [ -n "$MACH_VERSION" ]; then
-  LDFLAGS="$LDFLAGS -X github.com/bcross/mach/internal/version.Version=$MACH_VERSION"
+  LDFLAGS="$LDFLAGS -X github.com/TevaServices/mach/internal/version.Version=$MACH_VERSION"
 fi
 go build -trimpath -ldflags "$LDFLAGS" -o /out/mach-server ./cmd/mach-server
 mkdir -p /out/agents

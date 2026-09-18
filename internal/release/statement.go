@@ -54,9 +54,9 @@ const (
 	// PredicateType names mach's release predicate. It is a URI under the
 	// project's own namespace on purpose: predicates are not interchangeable,
 	// and calling this SLSA provenance would claim more than it says.
-	PredicateType = "https://mach.bcross.dev/attestation/agent-release/v1"
+	PredicateType = "https://mach.teva.dev/attestation/agent-release/v1"
 	// BuildType names the build recipe: a plain `go build` of a mach agent.
-	BuildType = "https://mach.bcross.dev/buildtype/go-build/v1"
+	BuildType = "https://mach.teva.dev/buildtype/go-build/v1"
 	// BuilderID names the tool that produced the attestation.
 	BuilderID = "mach-server attest"
 )
@@ -212,7 +212,7 @@ func Inspect(binPath string) (Artifact, error) {
 	var mats []Material
 	if by.VCSRevision != "" {
 		mats = append(mats, Material{
-			URI:    "git+https://github.com/bcross/mach@" + by.VCSRevision,
+			URI:    "git+https://github.com/TevaServices/mach@" + by.VCSRevision,
 			Digest: map[string]string{"sha1": by.VCSRevision},
 		})
 	}

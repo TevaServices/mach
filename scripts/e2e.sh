@@ -76,7 +76,7 @@ ok "binaries built"
 # does nothing at all rather than failing — a stamp that silently does not take
 # would leave every release reporting the development default.
 step "version: compiled-in default, and -X overriding it"
-go build -ldflags "-X github.com/bcross/mach/internal/version.Version=9.9.9-test" \
+go build -ldflags "-X github.com/TevaServices/mach/internal/version.Version=9.9.9-test" \
   -o "$WORKDIR/mach-server-stamped" ./cmd/mach-server || { echo "stamped build failed"; exit 1; }
 OUT=$("$WORKDIR/mach-server-stamped" version); [[ "$OUT" == "mach-server 9.9.9-test "* ]]
 check "an -X build reports the stamped version" $?

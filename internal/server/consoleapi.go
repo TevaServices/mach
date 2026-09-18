@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bcross/mach/internal/protocol"
-	"github.com/bcross/mach/internal/store"
+	"github.com/TevaServices/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/store"
 )
 
 // authConsole requires a valid API key (Bearer) and rate-limits failures.

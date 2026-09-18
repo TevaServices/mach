@@ -23,7 +23,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bcross/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/protocol"
 )
 
 func TestPairApprovalWorksOverHTTP(t *testing.T) {

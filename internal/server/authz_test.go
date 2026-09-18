@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bcross/mach/internal/protocol"
-	"github.com/bcross/mach/internal/store"
+	"github.com/TevaServices/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/store"
 )
 
 // exec posts an exec request and returns the status and body.

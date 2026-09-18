@@ -24,7 +24,7 @@ mkdir -p bin
 # view. `go build -ldflags ""` is a legal no-op, so the flag is passed either way.
 X=""
 if [ -n "${MACH_VERSION:-}" ]; then
-  X="-X github.com/bcross/mach/internal/version.Version=$MACH_VERSION"
+  X="-X github.com/TevaServices/mach/internal/version.Version=$MACH_VERSION"
 fi
 CGO_ENABLED=0 go build -ldflags "$X" -o bin/mach ./cmd/mach
 CGO_ENABLED=0 go build -ldflags "$X" -o bin/mach-server ./cmd/mach-server
@@ -37,7 +37,7 @@ run = '''
 mkdir -p bin/cross
 X=""
 if [ -n "${MACH_VERSION:-}" ]; then
-  X="-X github.com/bcross/mach/internal/version.Version=$MACH_VERSION"
+  X="-X github.com/TevaServices/mach/internal/version.Version=$MACH_VERSION"
 fi
 for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
   os=${t%/*}; arch=${t#*/}; ext=""
@@ -129,7 +129,7 @@ for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows
   [ "$os" = windows ] && ext=.exe
   out="bin/cross/mach-$os-$arch$ext"
   CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
-    -ldflags="-s -w -X github.com/bcross/mach/internal/version.Version=$VER" -o "$out" ./cmd/mach
+    -ldflags="-s -w -X github.com/TevaServices/mach/internal/version.Version=$VER" -o "$out" ./cmd/mach
   ./bin/mach-server attest "$out" "$VER" --out "bin/attestations/mach-$os-$arch$ext.intoto.jsonl"
 done
 ls bin/attestations

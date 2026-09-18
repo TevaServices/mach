@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bcross/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/protocol"
 )
 
 // A command's output reaches the wire as the bytes it produced, and a truncated

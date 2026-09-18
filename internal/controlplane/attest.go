@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/bcross/mach/internal/release"
+	"github.com/TevaServices/mach/internal/release"
 )
 
 // Attest writes a signed in-toto attestation for a compiled agent binary.

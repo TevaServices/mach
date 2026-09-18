@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bcross/mach/internal/release"
-	"github.com/bcross/mach/internal/store"
+	"github.com/TevaServices/mach/internal/release"
+	"github.com/TevaServices/mach/internal/store"
 )
 
 // setup points the control plane's paths at a temp dir and installs a fresh

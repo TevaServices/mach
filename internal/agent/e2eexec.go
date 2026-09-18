@@ -7,8 +7,8 @@ import (
 	"errors"
 	"log"
 
-	"github.com/bcross/mach/internal/e2e"
-	"github.com/bcross/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/e2e"
+	"github.com/TevaServices/mach/internal/protocol"
 )
 
 // handleExecFrame dispatches an exec envelope: sealed (E2E) or plaintext.

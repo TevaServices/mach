@@ -17,8 +17,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bcross/mach/internal/oidcauth"
-	"github.com/bcross/mach/internal/store"
+	"github.com/TevaServices/mach/internal/oidcauth"
+	"github.com/TevaServices/mach/internal/store"
 )
 
 // uiHeaders are set on every UI response, fragments and redirects included: a

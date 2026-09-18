@@ -33,8 +33,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bcross/mach/internal/protocol"
-	"github.com/bcross/mach/internal/store"
+	"github.com/TevaServices/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/store"
 )
 
 // auditHeadBytes bounds how much of a streamed command's output the relay

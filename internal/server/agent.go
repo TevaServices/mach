@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bcross/mach/internal/broker"
-	"github.com/bcross/mach/internal/protocol"
-	"github.com/bcross/mach/internal/store"
+	"github.com/TevaServices/mach/internal/broker"
+	"github.com/TevaServices/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/store"
 )
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -9,7 +9,7 @@ package agent
 import (
 	"encoding/json"
 
-	"github.com/bcross/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/protocol"
 )
 
 // streamOutChunkSize is the max bytes per stream_out chunk (agent side).

@@ -31,8 +31,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bcross/mach/internal/agent"
-	"github.com/bcross/mach/internal/console"
+	"github.com/TevaServices/mach/internal/agent"
+	"github.com/TevaServices/mach/internal/console"
 )
 
 func main() {

@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bcross/mach/internal/broker"
-	"github.com/bcross/mach/internal/policy"
-	"github.com/bcross/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/broker"
+	"github.com/TevaServices/mach/internal/policy"
+	"github.com/TevaServices/mach/internal/protocol"
 )
 
 // Global exec policy — the fleet-wide half of mach's command control.

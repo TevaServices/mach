@@ -23,7 +23,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bcross/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/protocol"
 )
 
 // fakePlane approves a pairing immediately, so the QR flow completes without a

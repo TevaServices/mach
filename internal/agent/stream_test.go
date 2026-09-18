@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bcross/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/protocol"
 	"github.com/gorilla/websocket"
 )
 

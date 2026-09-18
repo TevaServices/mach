@@ -10,7 +10,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/bcross/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/protocol"
 )
 
 // streamInputQueue bounds how many stdin frames a session will hold for a

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/bcross/mach/internal/policy"
-	"github.com/bcross/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/policy"
+	"github.com/TevaServices/mach/internal/protocol"
 )
 
 // maxFleetPolicyBytes bounds a ruleset pushed from the control plane.

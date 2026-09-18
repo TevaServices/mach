@@ -30,7 +30,7 @@ import (
 	"html/template"
 	"net/http"
 
-	"github.com/bcross/mach/internal/version"
+	"github.com/TevaServices/mach/internal/version"
 )
 
 // View models. The row types live next to the code that assembles them

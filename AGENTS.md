@@ -38,7 +38,7 @@ This is `mach`: remote CLI access to registered machines, outbound-only
   never fork the matching rules.
 - **One version string.** `internal/version.Version` is the only software
   version in the tree. Builds stamp it with
-  `-ldflags "-X github.com/bcross/mach/internal/version.Version=…"`, and an
+  `-ldflags "-X github.com/TevaServices/mach/internal/version.Version=…"`, and an
   unset version means **no** `-X` rather than an empty one — an empty stamp
   makes every binary report nothing and every agent look skewed. Do not add a
   per-package version constant, and do not conflate it with

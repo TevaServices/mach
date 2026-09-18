@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bcross/mach/internal/protocol"
-	"github.com/bcross/mach/internal/version"
+	"github.com/TevaServices/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/version"
 	"github.com/skip2/go-qrcode"
 )
 

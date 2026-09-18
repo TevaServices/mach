@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bcross/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/protocol"
 )
 
 // TestStreamKillStopsACommandThatIgnoresStdin is the point of the kill path: a
