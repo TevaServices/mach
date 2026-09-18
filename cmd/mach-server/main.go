@@ -31,12 +31,16 @@ func main() {
 			fmt.Fprintln(os.Stderr, "usage: mach-server add-api-key <name> <scopes>\n       scopes: enroll | readonly | exec:* | exec:m1|m2|...")
 			os.Exit(2)
 		}
-		key, err := controlplane.AddAPIKey(args[1], args[2])
+		// Printed are the values that were STORED, not the arguments as typed.
+		// The secret below is shown once, so this line is the operator's only
+		// record of what was minted — and the two can differ, because "admin"
+		// is an alias for exec:* and the name is lowercased.
+		key, storedName, storedScopes, err := controlplane.AddAPIKey(args[1], args[2])
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "mach-server: "+err.Error())
 			os.Exit(1)
 		}
-		fmt.Printf("api key created: name=%q scopes=%q\n", args[1], args[2])
+		fmt.Printf("api key created: name=%q scopes=%q\n", storedName, storedScopes)
 		fmt.Printf("KEY (shown once, store it now): %s\n", key)
 	case "e2e":
 		// mach-server e2e [on|off|inherit] [--org ORG] — whether this control
@@ -116,8 +120,20 @@ func main() {
 			os.Exit(2)
 		}
 		att := ""
-		if len(args) >= 6 && args[4] == "--attestation" {
+		if len(args) >= 5 && args[4] == "--attestation" {
+			// A missing value must not be a quiet "no attestation": that is
+			// exactly how an unattested binary ships. `--attestation "$ATT"`
+			// from a CI job with ATT unset is the same shape and the same
+			// outcome, and the gate it skips is the one that makes "nothing
+			// unattested ships" true.
+			if len(args) < 6 || strings.TrimSpace(args[5]) == "" {
+				fmt.Fprintln(os.Stderr, "mach-server: --attestation needs a file path (an empty value would skip the check rather than fail it)")
+				os.Exit(2)
+			}
 			att = args[5]
+		} else if len(args) > 4 {
+			fmt.Fprintln(os.Stderr, "usage: mach-server push-update <machine> <agent-binary-path> <version> [--attestation FILE]")
+			os.Exit(2)
 		}
 		if err := controlplane.PushUpdate(args[1], args[2], args[3], att); err != nil {
 			fmt.Fprintln(os.Stderr, "mach-server: "+err.Error())

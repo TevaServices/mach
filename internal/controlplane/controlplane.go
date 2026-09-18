@@ -106,11 +106,15 @@ func Serve() {
 }
 
 // AddAPIKey creates a key with a server-generated high-entropy secret.
-// Returns the generated key (shown ONCE).
-func AddAPIKey(name, scopes string) (string, error) {
+// Returns the generated key (shown ONCE) plus the name and scopes it actually
+// stored, because that output is the operator's only record of what was minted:
+// printing the arguments instead made it wrong whenever they were normalized —
+// `add-api-key AuditKey admin` reported "admin" while the row held the exec:*
+// that "admin" is an alias for, under the lowercased name the store keeps.
+func AddAPIKey(name, scopes string) (key, storedName, storedScopes string, err error) {
 	st, err := openStore()
 	if err != nil {
-		return "", err
+		return "", "", "", err
 	}
 	defer st.Close()
 	switch strings.TrimSpace(scopes) {
@@ -123,19 +127,20 @@ func AddAPIKey(name, scopes string) (string, error) {
 	default:
 		// allowlist form: exec:m1|m2|m3 (per-machine)
 		if !strings.HasPrefix(scopes, "exec:") {
-			return "", fmt.Errorf("scopes must be one of: enroll | readonly | exec:* | exec:<m1>|<m2>")
+			return "", "", "", fmt.Errorf("scopes must be one of: enroll | readonly | exec:* | exec:<m1>|<m2>")
 		}
 		// An empty allowlist would create a key that can never exec; that
 		// is always a mistake (usually a truncated machine list).
 		if strings.TrimSpace(strings.TrimPrefix(scopes, "exec:")) == "" {
-			return "", fmt.Errorf("exec: allowlist is empty — list machines (exec:<m1>|<m2>) or use exec:*")
+			return "", "", "", fmt.Errorf("exec: allowlist is empty — list machines (exec:<m1>|<m2>) or use exec:*")
 		}
 	}
-	key := "mach_" + store.RandToken(24) // 192-bit server-generated secret
-	if err := st.CreateAPIKey(strings.ToLower(strings.TrimSpace(name)), key, scopes); err != nil {
-		return "", err
+	storedName = strings.ToLower(strings.TrimSpace(name))
+	key = "mach_" + store.RandToken(24) // 192-bit server-generated secret
+	if err := st.CreateAPIKey(storedName, key, scopes); err != nil {
+		return "", "", "", err
 	}
-	return key, nil
+	return key, storedName, scopes, nil
 }
 
 // E2E reports or changes the control plane's end-to-end-encryption setting:
@@ -282,12 +287,23 @@ func Orgs() []string {
 }
 
 // RevokeMachine marks a machine revoked so its agent self-retires.
+//
+// An unknown name is an error rather than a silent success. Revoking is a
+// security action an operator takes by typing a name, and a typo used to print
+// the success line and exit 0 while nothing was revoked — leaving an active
+// machine the operator believes is retired. DeleteMachine already refuses an
+// unknown name for the same reason.
 func RevokeMachine(name string, purgeAudit bool) error {
 	st, err := openStore()
 	if err != nil {
 		return err
 	}
 	defer st.Close()
+	if m, err := st.MachineByName(name); err != nil {
+		return err
+	} else if m == nil {
+		return fmt.Errorf("unknown machine %q", name)
+	}
 	if err := st.RevokeMachine(name); err != nil {
 		return err
 	}
@@ -410,6 +426,15 @@ func PushUpdate(machine, binPath, version, attestation string) error {
 		return err
 	}
 	defer st.Close()
+	// An unknown machine is refused rather than queued: pending_updates has no
+	// foreign key, so the row would sit there forever while the command printed
+	// that it would be delivered on next connect. A typo would look like a
+	// completed rollout.
+	if m, err := st.MachineByName(machine); err != nil {
+		return err
+	} else if m == nil {
+		return fmt.Errorf("unknown machine %q — nothing was queued", machine)
+	}
 	if err := st.QueueUpdate(machine, manifest.Version, manifest.Sha256, manifest.URL, manifest.DataB64, base64.StdEncoding.EncodeToString(sig)); err != nil {
 		return err
 	}

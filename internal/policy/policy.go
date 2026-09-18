@@ -52,8 +52,8 @@ func (p *Policy) Replace(spec string) {
 
 func parse(spec string) (deny []string, allowOnly bool, allow []string) {
 	for _, line := range strings.Split(spec, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+		line = stripComment(strings.TrimSpace(line))
+		if line == "" {
 			continue
 		}
 		switch {
@@ -70,6 +70,25 @@ func parse(spec string) (deny []string, allowOnly bool, allow []string) {
 		}
 	}
 	return deny, allowOnly, allow
+}
+
+// stripComment removes a trailing #-comment, using the shell's own rule for
+// where one starts: at the beginning of a word (start of line, or after
+// whitespace). Only whole-line comments used to be recognized, so
+// `allowonly # only these` was silently not an allowlist — the line matched no
+// rule and vanished — and `deny:rm -rf # never` became a deny for the substring
+// "rm -rf # never", which matches nothing. Both failed open, which is the
+// direction a guardrail must never fail.
+func stripComment(line string) string {
+	for i := 0; i < len(line); i++ {
+		if line[i] != '#' {
+			continue
+		}
+		if i == 0 || line[i-1] == ' ' || line[i-1] == '\t' {
+			return strings.TrimSpace(line[:i])
+		}
+	}
+	return line
 }
 
 // Empty reports whether the policy has no rules (nothing to enforce).
@@ -130,6 +149,15 @@ func (p *Policy) Evaluate(command string, argv []string) string {
 		return ""
 	}
 
+	// A backtick is stripped by Normalize (it is quoting, and dropping it makes
+	// `r\`m` match a deny rule), so by the time the text is a segment there is no
+	// way to tell that one was there. Checked on the raw command, in shell mode
+	// only, for the same reason as the substitution check below: an allow rule
+	// cannot authorize what it cannot see.
+	if shellMode && strings.ContainsRune(command, '`') {
+		return "denied by command policy (allowlist mode: backtick command substitution, which an allow rule cannot authorize)"
+	}
+
 	segments := []string{joined}
 	if shellMode {
 		segments = splitCommands(joined)
@@ -142,8 +170,32 @@ func (p *Policy) Evaluate(command string, argv []string) string {
 		if !allowedBy(allow, seg) {
 			return "denied by command policy (allowlist mode: no allow: rule matches " + strconv.Quote(seg) + ")"
 		}
+		// An allow rule matches a prefix, and a prefix stops describing what will
+		// run once the shell can start a *second* command inside it. `$(...)`,
+		// backticks and process substitution all do that, and only the first
+		// survives Normalize (which strips backticks as quoting): with
+		// `allowonly` + `allow:kubectl`, `kubectl get pods $(rm -rf /)` and
+		// ``echo `rm -rf /` `` both passed an allowlist whose documented promise
+		// is that every command the shell would run starts with an allow rule.
+		//
+		// This is a refusal, not a parse: the constructs cannot be enumerated, so
+		// an allowlist declines the ones it cannot see through rather than
+		// pretending to judge them. argv mode is untouched — nothing re-parses an
+		// argument vector, so `-- echo '$(date)'` still passes its literal text.
+		if shellMode && hasSubstitution(seg) {
+			return "denied by command policy (allowlist mode: " + strconv.Quote(seg) +
+				" starts a nested command, which an allow rule cannot authorize; use argv mode for a literal)"
+		}
 	}
 	return ""
+}
+
+// hasSubstitution reports whether a normalized command can start a nested one.
+// It runs on the normalized text, where backticks have already been removed —
+// so the caller checks the pre-normalized command for those separately, through
+// hadBacktick, which Normalize cannot report.
+func hasSubstitution(seg string) bool {
+	return strings.Contains(seg, "$(") || strings.Contains(seg, "<(") || strings.Contains(seg, ">(")
 }
 
 // allowedBy reports whether a single command is permitted by the allow

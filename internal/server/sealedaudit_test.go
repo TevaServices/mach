@@ -76,9 +76,24 @@ func (h *sealedHarness) replySealed(t *testing.T, exit *int) {
 	}
 }
 
-func (h *sealedHarness) exec(t *testing.T, key string) (int, string) {
+// run sends one sealed exec request and answers it, the way the relay and a
+// real agent interleave. The request goes out on its own goroutine because the
+// reply has to be produced while it is in flight — and the *testing.T failures
+// stay on the test goroutine, since a T may only be failed from there.
+func (h *sealedHarness) run(t *testing.T, key string, exit *int) (int, string) {
 	t.Helper()
-	return execReq(t, h.s, key, `{"machine":"`+h.mach+`","sealed":"b3BhcXVl","e2e_pub":"ab"}`)
+	type result struct {
+		code int
+		body string
+	}
+	ch := make(chan result, 1)
+	go func() {
+		code, body := execReq(t, h.s, key, `{"machine":"`+h.mach+`","sealed":"b3BhcXVl","e2e_pub":"ab"}`)
+		ch <- result{code, body}
+	}()
+	h.replySealed(t, exit)
+	r := <-ch
+	return r.code, r.body
 }
 
 // A sealed command that exits 42 is recorded as 42. Before the fix this row said
@@ -87,8 +102,7 @@ func TestSealedExecAuditsTheReportedExitStatus(t *testing.T) {
 	h := newSealedHarness(t)
 	key := adminKey(t, h.s, "exec:*")
 
-	go h.replySealed(t, ptr(42))
-	code, body := h.exec(t, key)
+	code, body := h.run(t, key, ptr(42))
 	if code != http.StatusOK {
 		t.Fatalf("sealed exec returned %d, want 200 (%s)", code, body)
 	}
@@ -128,8 +142,7 @@ func TestSealedExecAuditsTheReportedExitStatus(t *testing.T) {
 func TestSealedExecAuditsAReportedZero(t *testing.T) {
 	h := newSealedHarness(t)
 	key := adminKey(t, h.s, "exec:*")
-	go h.replySealed(t, ptr(0))
-	if code, body := h.exec(t, key); code != http.StatusOK {
+	if code, body := h.run(t, key, ptr(0)); code != http.StatusOK {
 		t.Fatalf("sealed exec returned %d, want 200 (%s)", code, body)
 	}
 	entries, err := h.st.AuditList(h.mach, 10)
@@ -146,8 +159,7 @@ func TestSealedExecAuditsAReportedZero(t *testing.T) {
 func TestSealedExecWithoutAReportedStatusAuditsNone(t *testing.T) {
 	h := newSealedHarness(t)
 	key := adminKey(t, h.s, "exec:*")
-	go h.replySealed(t, nil)
-	if code, body := h.exec(t, key); code != http.StatusOK {
+	if code, body := h.run(t, key, nil); code != http.StatusOK {
 		t.Fatalf("sealed exec returned %d, want 200 (%s)", code, body)
 	}
 	entries, err := h.st.AuditList(h.mach, 10)

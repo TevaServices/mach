@@ -73,9 +73,22 @@ func streamConsole(server, apiKey, machine, command string) int {
 	// an agent too old to honour a kill, and for a command that ignores SIGKILL
 	// (nothing does, but the operator needs a way out either way). So does a
 	// grace deadline, so an unattended console cannot wait on a kill forever.
+	// SIGINT is the operator pressing Ctrl-C at a terminal, and means "stop the
+	// remote command". SIGTERM is somebody else deciding this process should go —
+	// a supervisor, a `kill` from another shell — and means exactly that: it must
+	// not be read as a request to kill a command on a remote machine, or the
+	// service manager cannot stop an interactive console.
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sig, os.Interrupt)
 	defer signal.Stop(sig)
+	term := make(chan os.Signal, 1)
+	signal.Notify(term, syscall.SIGTERM)
+	defer signal.Stop(term)
+	go func() {
+		<-term
+		os.Exit(143) // 128+15, what a shell reports for SIGTERM
+	}()
+
 	streamOwnsInterrupt.Store(true)
 	defer streamOwnsInterrupt.Store(false)
 	// killed records that a kill was asked for, so a stream that ends without a
