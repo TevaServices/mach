@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -41,6 +42,17 @@ func Org() string {
 	return "mach"
 }
 
+// serverKeyPath is where the control plane's identity key lives: MACH_SERVER_KEY
+// when set, else the database path with ".key" appended.
+//
+// The database path only means something as a FILE. With MACH_DB set to a
+// Postgres DSN, appending ".key" produced a path that is not a path — it kept the
+// scheme, the host and the password — so every admin command that needs the key
+// failed with "open postgres://user:s3cret@host:5432/mach.key: no such file or
+// directory": the DSN, password included, printed into whatever collected the
+// error, and a Postgres deployment with no explicit MACH_SERVER_KEY could not
+// use push-update, attest or verify-attestation at all. There is nowhere near a
+// DSN to put a key, so the answer is to ask rather than to guess.
 func serverKeyPath() string {
 	if v := os.Getenv("MACH_SERVER_KEY"); v != "" {
 		return v
@@ -48,8 +60,21 @@ func serverKeyPath() string {
 	return dbPath() + ".key"
 }
 
-func newServer(st *store.Store, br *broker.Broker) *server.Server {
-	srv := server.New(st, br, Org(), serverKeyPath())
+// requireServerKeyPath is serverKeyPath for the paths that cannot proceed
+// without a real answer: a DSN and no MACH_SERVER_KEY is a configuration error,
+// not a path to invent.
+func requireServerKeyPath() (string, error) {
+	db := dbPath()
+	if strings.HasPrefix(db, "postgres://") || strings.HasPrefix(db, "postgresql://") {
+		if os.Getenv("MACH_SERVER_KEY") == "" {
+			return "", errors.New("MACH_DB is a Postgres DSN, so the identity key has no path to default to — set MACH_SERVER_KEY to a file on a persistent volume (agents pin the key it holds, and a key that moves breaks every agent's enrollment)")
+		}
+	}
+	return serverKeyPath(), nil
+}
+
+func newServer(st *store.Store, br *broker.Broker, keyPath string) *server.Server {
+	srv := server.New(st, br, Org(), keyPath)
 	if os.Getenv("MACH_TRUST_PROXY") == "1" {
 		// Only behind the known TLS reverse proxy (Caddy/nginx) — enables
 		// X-Forwarded-For for rate limiting. Off by default.
@@ -73,7 +98,14 @@ func Serve() {
 		log.Fatalf("mach-server: open store: %v", err)
 	}
 	defer st.Close()
-	srv := newServer(st, broker.New())
+	// Resolved before anything binds: a DSN with no MACH_SERVER_KEY must fail
+	// here, at startup, rather than creating a directory named after the
+	// database password and a key that will not survive a restart.
+	keyPath, err := requireServerKeyPath()
+	if err != nil {
+		log.Fatalf("mach-server: %v", err)
+	}
+	srv := newServer(st, broker.New(), keyPath)
 	log.Printf("mach control plane listening on %s (public URL %s, org %q, trust-proxy %v)",
 		listen, pubURL, Org(), os.Getenv("MACH_TRUST_PROXY") == "1")
 	// Explicit timeouts: without a ReadHeaderTimeout the public listener is
@@ -363,13 +395,17 @@ type updateManifest struct {
 // signing update manifests). Reads the persisted key file; errors surface
 // through PushUpdate as a normal CLI error, not a panic.
 func loadServerPriv() (ed25519.PrivateKey, error) {
-	raw, err := os.ReadFile(serverKeyPath())
+	path, perr := requireServerKeyPath()
+	if perr != nil {
+		return nil, perr
+	}
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("control plane key missing — run serve once first: %v", err)
 	}
 	b, derr := hex.DecodeString(strings.TrimSpace(string(raw)))
 	if derr != nil || len(b) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("corrupt control plane key at %s", serverKeyPath())
+		return nil, fmt.Errorf("corrupt control plane key at %s", path)
 	}
 	return ed25519.PrivateKey(b), nil
 }

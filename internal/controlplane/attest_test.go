@@ -274,3 +274,42 @@ func TestPushUpdateRejectsUnknownMachine(t *testing.T) {
 		t.Fatal("an update was queued for an unknown machine")
 	}
 }
+
+// The identity key's path is derived from the database path, which only means
+// something as a FILE. With a Postgres DSN, appending ".key" produced a path that
+// is not a path — scheme, host and password included — so push-update, attest and
+// verify-attestation could not find the key at all, and the error printed the DSN
+// (password and all) into whatever collected it. There is nowhere near a DSN to
+// put a key, so the command asks rather than invents one.
+func TestServerKeyPathWithAPostgresDSN(t *testing.T) {
+	const dsn = "postgres://user:s3cretpw@db.internal:5432/mach"
+
+	t.Setenv("MACH_DB", dsn)
+	t.Setenv("MACH_SERVER_KEY", "")
+	path, err := requireServerKeyPath()
+	if err == nil {
+		t.Fatalf("a DSN with no MACH_SERVER_KEY was given the path %q", path)
+	}
+	if strings.Contains(err.Error(), "s3cretpw") {
+		t.Errorf("the DSN, password included, leaked into the error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "MACH_SERVER_KEY") {
+		t.Errorf("the error does not name the variable to set: %v", err)
+	}
+
+	// Set explicitly, it is used verbatim — the DSN is not consulted at all.
+	t.Setenv("MACH_SERVER_KEY", "/keys/mach.key")
+	path, err = requireServerKeyPath()
+	if err != nil || path != "/keys/mach.key" {
+		t.Fatalf("explicit key path = %q (%v)", path, err)
+	}
+
+	// A SQLite path keeps the documented default, which is what the container
+	// relies on.
+	t.Setenv("MACH_DB", "/data/mach.db")
+	t.Setenv("MACH_SERVER_KEY", "")
+	path, err = requireServerKeyPath()
+	if err != nil || path != "/data/mach.db.key" {
+		t.Fatalf("sqlite key path = %q (%v), want /data/mach.db.key", path, err)
+	}
+}
