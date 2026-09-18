@@ -15,8 +15,21 @@
 # is what lets a shipped agent binary be traced to a commit. Build from a
 # clean checkout — a dirty tree is recorded as vcs.modified, and
 # `push-update --attestation` refuses to ship such a build.
-FROM golang:1.26-alpine AS build
+#
+# --platform=$BUILDPLATFORM pins this stage to the machine running the build,
+# with TARGETOS/TARGETARCH naming the image being built. In a multi-platform
+# build that is the difference between minutes and tens of minutes: the
+# alternative (letting the stage take the target platform) compiles Go inside
+# a QEMU-emulated arm64 toolchain, while Go itself cross-compiles natively in
+# the time it takes to compile the host arch.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 WORKDIR /src
+# The image being built, supplied by buildx per platform. Nothing sets these
+# in a plain `docker build` — then they are empty, and building the empty
+# GOOS/GOARCH pair is the host's own, so a single-platform build behaves
+# exactly as before.
+ARG TARGETOS
+ARG TARGETARCH
 # go.sum too, so the layer is verified against the committed hashes rather than
 # letting `go mod download` write a fresh go.sum for whatever the proxy served.
 COPY go.mod go.sum ./
@@ -31,6 +44,7 @@ ARG MACH_VERSION=
 RUN <<EOF
 set -e
 export CGO_ENABLED=0
+export GOOS="$TARGETOS" GOARCH="$TARGETARCH"
 LDFLAGS="-s -w"
 if [ -n "$MACH_VERSION" ]; then
   LDFLAGS="$LDFLAGS -X github.com/bcross/mach/internal/version.Version=$MACH_VERSION"

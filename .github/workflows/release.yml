@@ -176,6 +176,11 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          # Module downloads and the alpine base live in the cache, so the next
+          # tag skips them; mode=max keeps every stage's layers. Own scope,
+          # because the agent image's job runs concurrently with its own cache.
+          cache-from: type=gha,scope=server
+          cache-to: type=gha,mode=max,scope=server
           # Stamps mach-server and the six agent binaries baked into the image,
           # so the GHCR tag, the OCI version label and `mach-server version`
           # inside the container all report the same release for the first time.
@@ -228,6 +233,8 @@ jobs:
           file: Dockerfile.agent
           platforms: linux/amd64,linux/arm64
           push: true
+          cache-from: type=gha,scope=agent
+          cache-to: type=gha,mode=max,scope=agent
           build-args: |
             MACH_VERSION=${{ steps.meta.outputs.version }}
           tags: |
@@ -249,6 +256,12 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+          # The client binaries and their attestations only. Without a pattern
+          # this step downloads every artifact the run produced — and buildx's
+          # gha cache uploads a .dockerbuild build record per container job,
+          # which is neither a release artifact nor something this job should
+          # stall on downloading.
+          pattern: client-*
 
       - name: Assemble the attestation bundle and release body
         run: |
