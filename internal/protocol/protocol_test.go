@@ -3,6 +3,7 @@ package protocol
 import (
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -189,6 +190,9 @@ func TestSealedExecWireFormats(t *testing.T) {
 		t.Errorf("SealedExecCommand JSON has unexpected fields: %s", raw)
 	}
 
+	// An agent that reports no exit status (one older than the field) must not
+	// have one invented for it: the field is omitted, so the relay audits "no
+	// status" rather than a 0 that reads as success.
 	raw, err = json.Marshal(SealedExecResult{SealedB64: "cmVwbHk="})
 	if err != nil {
 		t.Fatalf("marshal result: %v", err)
@@ -202,6 +206,46 @@ func TestSealedExecWireFormats(t *testing.T) {
 	}
 	if _, ok := fields["sealed_b64"]; !ok {
 		t.Errorf("SealedExecResult JSON is missing sealed_b64: %s", raw)
+	}
+	if _, ok := fields["exit_code"]; ok {
+		t.Errorf("an unreported exit code was serialized: %s", raw)
+	}
+
+	// Reported, it rides in the clear beside the ciphertext — this is the one
+	// fact about a sealed command the control plane is meant to learn, and what
+	// its audit row records.
+	zero, fortyTwo := 0, 42
+	raw, err = json.Marshal(SealedExecResult{SealedB64: "cmVwbHk=", ExitCode: &fortyTwo})
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	fields = nil
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	if len(fields) != 2 {
+		t.Errorf("SealedExecResult JSON has unexpected fields: %s", raw)
+	}
+	if got := string(fields["exit_code"]); got != "42" {
+		t.Errorf("exit_code is %s, want 42", got)
+	}
+	// A reported 0 is not the same as an absent one, and must survive.
+	raw, err = json.Marshal(SealedExecResult{SealedB64: "cmVwbHk=", ExitCode: &zero})
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	if !strings.Contains(string(raw), `"exit_code":0`) {
+		t.Errorf("a reported exit 0 was dropped from the JSON: %s", raw)
+	}
+	// Nothing else may join them. An error string would defeat the seal: a policy
+	// refusal quotes the command it refused.
+	var round SealedExecResult
+	if err := json.Unmarshal([]byte(`{"sealed_b64":"x","exit_code":3,"error":"denied: rm -rf"}`), &round); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	reMarshalled, _ := json.Marshal(round)
+	if strings.Contains(string(reMarshalled), "denied") || strings.Contains(string(reMarshalled), "error") {
+		t.Errorf("SealedExecResult carries a field that could leak command text: %s", reMarshalled)
 	}
 }
 

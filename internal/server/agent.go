@@ -520,10 +520,16 @@ type pendingExec struct {
 func (s *Server) completeExec(env protocol.Envelope, fromMachine string) {
 	var res protocol.ExecResult
 	var sealed string
-	// Sealed reply (E2E): {"sealed_b64": "..."} — plaintext otherwise.
+	// The exit status the agent reported in the clear beside a sealed blob. It
+	// stays nil when the agent did not report one (an agent older than the
+	// field), so the audit row records no status rather than a fabricated 0.
+	var sealedExit *int
+	// Sealed reply (E2E): {"sealed_b64": "...", "exit_code": N} — plaintext
+	// otherwise.
 	var sealedMsg protocol.SealedExecResult
 	if json.Unmarshal(env.Payload, &sealedMsg) == nil && sealedMsg.SealedB64 != "" {
 		sealed = sealedMsg.SealedB64
+		sealedExit = sealedMsg.ExitCode
 	} else if err := json.Unmarshal(env.Payload, &res); err != nil {
 		res = protocol.ExecResult{Error: "bad exec_result payload"}
 	}
@@ -539,7 +545,7 @@ func (s *Server) completeExec(env protocol.Envelope, fromMachine string) {
 	s.pendMu.Unlock()
 	if ok {
 		select {
-		case pe.ch <- execReply{Result: res, Sealed: sealed}:
+		case pe.ch <- execReply{Result: res, Sealed: sealed, SealedExit: sealedExit}:
 		default:
 		}
 	}

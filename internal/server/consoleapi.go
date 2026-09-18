@@ -239,10 +239,20 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 	select {
 	case reply := <-pe.ch:
 		if reply.Sealed != "" {
-			// E2E: audit metadata only (never plaintext).
+			// E2E: audit metadata only (never plaintext). The exit status is the
+			// one fact the control plane is documented to learn about a sealed
+			// command, and it rides beside the ciphertext rather than inside it —
+			// the previous code read it out of the (empty) plaintext result and so
+			// recorded 0 for every sealed command, however it actually ended.
+			// When the agent did not report one, the row carries NULL instead of
+			// a number it would be making up.
+			auditExit := sql.NullInt64{}
+			if reply.SealedExit != nil {
+				auditExit = sqlNullInt(*reply.SealedExit)
+			}
 			s.st.AuditInsert(nowRFC3339(), pe.machine, auditSealedLabel, pe.source,
-				sql.NullInt64{Int64: int64(reply.Result.ExitCode), Valid: true}, "", "")
-			writeJSON(w, http.StatusOK, execReplyWire{ExitCode: reply.Result.ExitCode, SealedB64: reply.Sealed})
+				auditExit, "", "")
+			writeJSON(w, http.StatusOK, execReplyWire{ExitCode: reply.SealedExit, SealedB64: reply.Sealed})
 			return
 		}
 		s.auditExec(pe, reply.Result.ExitCode, reply.Result.Stdout, reply.Result.Stderr)
@@ -306,11 +316,17 @@ func (s *Server) handleE2EPub(w http.ResponseWriter, r *http.Request, keyName, s
 type execReply struct {
 	Result protocol.ExecResult
 	Sealed string // base64 sealed ExecResult (E2E mode); empty for plaintext
+	// SealedExit is the exit status the agent reported in the clear alongside a
+	// sealed result. nil when it reported none (an agent older than the field),
+	// which is audited as "no status" rather than as 0.
+	SealedExit *int
 }
 
-// execReplyWire is the HTTP response in E2E mode.
+// execReplyWire is the HTTP response in E2E mode. ExitCode is omitted when the
+// agent did not report one, so a client is never handed a 0 it might read as
+// "the command succeeded".
 type execReplyWire struct {
-	ExitCode  int    `json:"exit_code"`
+	ExitCode  *int   `json:"exit_code,omitempty"`
 	SealedB64 string `json:"sealed_b64"`
 }
 

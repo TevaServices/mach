@@ -290,8 +290,25 @@ type StreamStdin struct {
 
 // SealedExecResult is the agent's reply when E2E is on: the ExecResult JSON
 // sealed to the console's ephemeral public key carried in ExecRequest.E2EPub.
+//
+// ExitCode rides BESIDE the ciphertext, in the clear, and it is the only thing
+// that may. The control plane cannot open the blob, so this is how the relay
+// learns the one fact about a sealed command that is documented as learnable —
+// the exit status — and what its audit row records. Without it the row carried
+// a fabricated 0 for every sealed command, including the ones a machine's own
+// policy had just refused with 126: a record that said "succeeded" for a
+// command that never ran is worse than no record.
+//
+// It is a pointer so "the agent did not report one" is distinguishable from a
+// real 0 — an agent older than this field sends nothing, and the row then shows
+// no exit status rather than inventing one.
+//
+// Nothing else may be added here in the clear. An error string would defeat the
+// seal outright: a policy refusal quotes the command it refused, so relaying it
+// would hand the control plane the text it was never allowed to read.
 type SealedExecResult struct {
 	SealedB64 string `json:"sealed_b64"`
+	ExitCode  *int   `json:"exit_code,omitempty"`
 }
 
 // UpdateCommand pushes a new agent binary from the control plane. The
