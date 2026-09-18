@@ -168,11 +168,26 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 	// and every machine is subject to it. The refusal is a plain HTTP error
 	// (no stream has started) and is audited like any other attempt, so a
 	// blocked command shows up in the record rather than vanishing.
-	if reason := s.execPolicyCheck(req.Command, req.Argv); reason != "" {
-		s.auditExec(&pendingExec{machine: req.Machine, command: display, source: "console:" + keyName},
-			execRefused, "", reason)
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "blocked by the server's global exec policy: " + reason})
-		return
+	//
+	// A sealed request is skipped, because there is no text here to match: the
+	// control plane holds ciphertext and nothing else. Running the rules against
+	// the empty command that remains is not a stricter check, it is a wrong one —
+	// under `allowonly` an empty command fails closed, so EVERY sealed command
+	// was refused with "allowlist mode: empty command" and a deployment that
+	// paired an allow-list with the default E2E posture had no sealed path at
+	// all. The rules are not skipped, they are applied where the plaintext is:
+	// the same ruleset is mirrored onto every agent (see pushFleetPolicy) and
+	// evaluated there, at the point the sealed command is decrypted. That is the
+	// whole reason the mirror exists, and why a refusal on this path is audited
+	// as the sealed placeholder with exit 126 — the control plane can see that
+	// something was refused, but not which rule did it.
+	if req.Sealed == "" {
+		if reason := s.execPolicyCheck(req.Command, req.Argv); reason != "" {
+			s.auditExec(&pendingExec{machine: req.Machine, command: display, source: "console:" + keyName},
+				execRefused, "", reason)
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "blocked by the server's global exec policy: " + reason})
+			return
+		}
 	}
 	// The operator's soft block, checked after authorization and before anything
 	// is dispatched, for the same reason the policy check sits here: it has to

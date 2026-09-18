@@ -200,6 +200,46 @@ func TestAuditRedaction(t *testing.T) {
 	}
 }
 
+// TestAuditRedactionQuotedValues is the case that used to leak: a value that is
+// *immediately* quoted. The unquoted character class excludes quotes, so it
+// matched the empty string at the opening quote and the replacement left the
+// secret sitting in the row — `PASSWORD=[REDACTED]'hunter2'` — which is exactly
+// the value a person writes and exactly what an audit reader must not see.
+//
+// The assertion is on the secret's absence rather than on an exact string: what
+// matters is that the value is gone, not which way the quotes were tidied.
+func TestAuditRedactionQuotedValues(t *testing.T) {
+	for _, in := range []string{
+		`export PGPASSWORD='s3cretpw'`,
+		`export PGPASSWORD="s3cretpw"`,
+		`mysql --password='hunter2' -e 'select 1'`,
+		`mysql --password="hunter2" -e "select 1"`,
+		`echo token='abc123'`,
+		`echo api_key="abc123"`,
+		`curl -H "Authorization: 'Bearer tok123'"`,
+	} {
+		got := RedactScrubs(in)
+		for _, secret := range []string{"s3cretpw", "hunter2", "abc123", "tok123"} {
+			if strings.Contains(got, secret) {
+				t.Errorf("secret survived redaction:\n in %q\n got %q", in, got)
+			}
+		}
+		if !strings.Contains(got, "[REDACTED]") {
+			t.Errorf("nothing was redacted in %q: %q", in, got)
+		}
+	}
+	// A quoted value must not swallow what follows it on the line: the rest of
+	// the command stays readable, which is the point of keeping the keyword in
+	// place rather than dropping the whole line.
+	got := RedactScrubs(`psql "postgres://u:pw@h/db" -c 'echo secret="hunter2"; ls'`)
+	if !strings.Contains(got, "ls") {
+		t.Errorf("redaction ran past the closing quote: %q", got)
+	}
+	if strings.Contains(got, "hunter2") {
+		t.Errorf("secret survived: %q", got)
+	}
+}
+
 func TestAuditInsertList(t *testing.T) {
 	st := testStore(t)
 	if err := st.AuditInsert(now(), "bcross-a", "echo hi", "console:k", sql.NullInt64{Int64: 0, Valid: true}, "hi\n", ""); err != nil {

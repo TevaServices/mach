@@ -989,10 +989,17 @@ func snippet(s string, n int) string {
 }
 
 // RedactScrubs masks values next to secret-bearing keywords while keeping
-// the keyword visible for audit readability. Everything from the separator
-// to end of line after a keyword is masked (covers "password=x",
-// "password: x", "Bearer xyz", multi-word tokens).
-var secretPattern = regexp.MustCompile(`(?i)(password|passwd|secret|token|api[_-]?key|authorization|private key)\s*[=:]\s*([^'"\n]{0,1000})`)
+// the keyword visible for audit readability. Everything from the separator to
+// end of line after a keyword is masked (covers "password=x", "password: x",
+// "Bearer xyz", multi-word tokens).
+//
+// The value has three forms because a quoted one used to defeat the whole
+// control: the unquoted class excludes quotes, so in `PASSWORD='hunter2'` it
+// matched the empty string at the quote and the replacement left the secret in
+// place — `PASSWORD=[REDACTED]'hunter2'` in the row, served to every readonly
+// and exec-scoped key by GET /v1/audit and readable by anyone with DB access.
+// A quoted value is now matched including its quotes, and dropped whole.
+var secretPattern = regexp.MustCompile(`(?i)(password|passwd|secret|token|api[_-]?key|authorization|private key)\s*[=:]\s*(?:'[^'\n]{0,1000}'|"[^"\n]{0,1000}"|[^'"\n]{0,1000})`)
 
 func RedactScrubs(s string) string {
 	s = strings.ReplaceAll(s, "\x00", "")

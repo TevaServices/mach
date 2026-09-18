@@ -594,8 +594,8 @@ func InterruptGuard() {
 	go func() {
 		for range sig {
 			if streamOwnsInterrupt.Load() {
-				// The streaming session handles it, and exits the process itself
-				// if the remote end will not stop.
+				// The streaming session owns this one: it sends the kill, and it
+				// exits on a second Ctrl-C or after its grace deadline.
 				continue
 			}
 			os.Exit(130)

