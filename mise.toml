@@ -49,7 +49,13 @@ ls bin/cross
 
 [tasks.test]
 description = "Run unit tests (all packages, race + cover)"
-run = "go test ./... -v -race -coverprofile=coverage.out"
+run = '''
+# -race is a cgo test: the race runtime links C, and on Linux the toolchain
+# refuses to start it under CGO_ENABLED=0 rather than silently un-checking.
+# The [env] above pins CGO_ENABLED=0 because nothing production should link
+# C — so this one task re-enables it for the race run only.
+CGO_ENABLED=1 go test ./... -v -race -coverprofile=coverage.out
+'''
 
 [tasks.fmt]
 description = "Format every Go file in the tree (writes them)"

@@ -26,13 +26,24 @@
 # .git is deliberately not excluded via .dockerignore: Go stamps the VCS
 # revision into the binary, which is what lets a shipped binary be traced to
 # a commit. Build from a clean checkout.
-FROM golang:1.26-alpine AS build
+#
+# --platform=$BUILDPLATFORM pins this stage to the machine running the build,
+# with TARGETOS/TARGETARCH naming the image being built: in a multi-platform
+# build that keeps the Go toolchain off QEMU — Go cross-compiles natively,
+# the emulated toolchain does not (see the server Dockerfile for the same
+# shape).
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 WORKDIR /src
 # go.sum too, so the layer is verified against the committed hashes rather than
 # letting `go mod download` write a fresh go.sum for whatever the proxy served.
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+# The image being built, supplied by buildx per platform. Empty in a plain
+# `docker build` — where empty GOOS/GOARCH is the host's own, so the
+# single-platform build behaves exactly as before.
+ARG TARGETOS
+ARG TARGETARCH
 # The release workflow passes the tag in (v0.4.0 becomes 0.4.0). A plain
 # `docker build` leaves this empty, and empty has to mean "no override" rather
 # than an empty version — hence the guard below, which never emits -X without a
@@ -42,6 +53,7 @@ ARG MACH_VERSION=
 RUN <<EOF
 set -e
 export CGO_ENABLED=0
+export GOOS="$TARGETOS" GOARCH="$TARGETARCH"
 LDFLAGS="-s -w"
 if [ -n "$MACH_VERSION" ]; then
   LDFLAGS="$LDFLAGS -X github.com/bcross/mach/internal/version.Version=$MACH_VERSION"
