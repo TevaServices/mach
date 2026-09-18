@@ -19,6 +19,30 @@ SERVER_PID=""
 PASS=0
 FAIL=0
 
+# The store has two drivers and one schema, so the suite runs against both.
+# SQLite is the default: a fresh database is a new file in the temp dir. Set
+# MACH_TEST_POSTGRES to a DSN to run the whole suite against Postgres instead —
+# scripts/pgsetup clears the schema and carves out a second database for the
+# web-UI control plane, which must not share tables with the fleet the rest of
+# the run builds. Both are throwaway: point it at a scratch server.
+#
+# Without this the Postgres path would only ever be covered at the SQL-
+# translation level, and the deployment notes would be describing something
+# nobody had run. (MACH_SERVER_KEY is set explicitly because a DSN has no path
+# to derive one from — see controlplane.requireServerKeyPath.)
+if [[ -n "${MACH_TEST_POSTGRES:-}" ]]; then
+  DB="$(go run ./scripts/pgsetup --reset "$MACH_TEST_POSTGRES")" || {
+    echo "pgsetup could not prepare the Postgres database ($MACH_TEST_POSTGRES)" >&2; exit 1; }
+  UI_DB="$(go run ./scripts/pgsetup --create "$MACH_TEST_POSTGRES" mach_e2e_ui)" || {
+    echo "pgsetup could not create the UI database" >&2; exit 1; }
+  export MACH_SERVER_KEY="$WORKDIR/mach.key"
+  echo "store: postgres ($MACH_TEST_POSTGRES)"
+else
+  DB="$WORKDIR/mach.db"
+  UI_DB="$WORKDIR/ui.db"
+  echo "store: sqlite"
+fi
+
 cleanup() {
   [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null
   # The web-UI section runs its own control plane and a fake identity provider on
@@ -72,7 +96,7 @@ step "control plane up"
 # ciphertext, and the block list matches text. That is the documented trade
 # (see SECURITY-NOTES.md), and here it is the configuration under test. A later
 # step turns E2E back on for one org, at runtime, to exercise the sealed path.
-MACH_ORG="$ORG" MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" e2e off >/dev/null
+MACH_ORG="$ORG" MACH_DB="$DB" "$WORKDIR/mach-server" e2e off >/dev/null
 
 # The fleet-wide block list is configured from a FILE for the whole run. It
 # applies to every key and every machine, so it has to be exercised against the
@@ -81,7 +105,7 @@ MACH_ORG="$ORG" MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" e2e off >/dev/
 # only place a sealed command is readable), so editing this file has to reach
 # agents that are already connected.
 printf 'deny:fleet-blocked-marker\n' > "$WORKDIR/fleet.policy"
-MACH_DB="$WORKDIR/mach.db" MACH_LISTEN="127.0.0.1:$PORT" \
+MACH_DB="$DB" MACH_LISTEN="127.0.0.1:$PORT" \
   MACH_PUBLIC_URL="$BASE" MACH_ORG="$ORG" MACH_TRUST_PROXY=1 \
   MACH_EXEC_POLICY_FILE="$WORKDIR/fleet.policy" \
   "$WORKDIR/mach-server" serve >"$WORKDIR/server.log" 2>&1 &
@@ -93,10 +117,10 @@ done
 curl -fsS "$BASE/healthz" >/dev/null; check "healthz responds" $?
 
 step "keys: scoped + admin + enroll"
-ENROLL_KEY=$(MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" add-api-key enroll-key enroll | grep -oE 'mach_[a-f0-9]+')
-CONSOLE_KEY=$(MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" add-api-key console exec:"$ORG-test-01" | grep -oE 'mach_[a-f0-9]+')
-ADMIN_KEY=$(MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" add-api-key admin admin | grep -oE 'mach_[a-f0-9]+')
-RO_KEY=$(MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" add-api-key readonly-key readonly | grep -oE 'mach_[a-f0-9]+')
+ENROLL_KEY=$(MACH_DB="$DB" "$WORKDIR/mach-server" add-api-key enroll-key enroll | grep -oE 'mach_[a-f0-9]+')
+CONSOLE_KEY=$(MACH_DB="$DB" "$WORKDIR/mach-server" add-api-key console exec:"$ORG-test-01" | grep -oE 'mach_[a-f0-9]+')
+ADMIN_KEY=$(MACH_DB="$DB" "$WORKDIR/mach-server" add-api-key admin admin | grep -oE 'mach_[a-f0-9]+')
+RO_KEY=$(MACH_DB="$DB" "$WORKDIR/mach-server" add-api-key readonly-key readonly | grep -oE 'mach_[a-f0-9]+')
 [[ -n "$ENROLL_KEY" && -n "$CONSOLE_KEY" && -n "$ADMIN_KEY" && -n "$RO_KEY" ]]; check "four keys generated" $?
 
 step "console config (admin box)"
@@ -246,7 +270,7 @@ machc exec "$ORG-test-02" "echo nope" >/dev/null 2>&1 || CODE=$?
 [[ "$CODE" -ne 0 ]]; check "exec on unscoped machine refused" $?
 
 step "policy: agent refuses denied command (policy on second machine, exec-all console)"
-ALLKEY=$(MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" add-api-key allkeys 'exec:*' | grep -oE 'mach_[a-f0-9]+')
+ALLKEY=$(MACH_DB="$DB" "$WORKDIR/mach-server" add-api-key allkeys 'exec:*' | grep -oE 'mach_[a-f0-9]+')
 [[ -n "$ALLKEY" ]]; check "exec-all key created" $?
 printf '{"server": "%s", "api_key": "%s"}\n' "$BASE" "$ALLKEY" > "$CONSOLE_DIR/console.json"
 MACH_POLICY="deny:secret-marker" MACH_STATE_DIR="$WORKDIR/agent2" \
@@ -298,11 +322,11 @@ step "e2e: an org-scoped server setting the client is told about and obeys"
 # (Output is captured rather than piped into `grep -q`: with pipefail set, grep
 # quitting at the first match can trip the writer with SIGPIPE and fail a check
 # that passed. Every check that reads a command's output does it this way.)
-OUT=$(MACH_ORG="$ORG" MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" e2e on --org "$ORG" 2>&1)
+OUT=$(MACH_ORG="$ORG" MACH_DB="$DB" "$WORKDIR/mach-server" e2e on --org "$ORG" 2>&1)
 [[ "$OUT" == *"org $ORG: sealed exec on"* ]] || echo "    output was: $OUT"
 [[ "$OUT" == *"org $ORG: sealed exec on"* ]]; check "e2e turned on for one org, live" $?
 # The other org still follows the default, because the setting is per org.
-REPORT=$(MACH_ORG="$ORG" MACH_ORGS="other" MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" e2e 2>&1)
+REPORT=$(MACH_ORG="$ORG" MACH_ORGS="other" MACH_DB="$DB" "$WORKDIR/mach-server" e2e 2>&1)
 [[ "$REPORT" == *"org other: sealed exec off"* ]] || echo "    report was: $REPORT"
 [[ "$REPORT" == *"org other: sealed exec off"* ]]; check "unrelated org keeps the off default" $?
 # The explanation of a setting belongs under the line it explains. Printed at the
@@ -355,7 +379,7 @@ AUDIT=$(machc audit "$MACHINE" 1 2>/dev/null | head -1)
 [[ "$AUDIT" == *"readable-marker-e2e"* ]]; check "--no-e2e stays readable, and is recorded" $?
 # --e2e asks for sealing and will not run without it: with E2E on for the fleet
 # default but off for the other org, a machine in the off org must be refused.
-MACH_ORG="$ORG" MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" e2e off --org "$ORG" >/dev/null
+MACH_ORG="$ORG" MACH_DB="$DB" "$WORKDIR/mach-server" e2e off --org "$ORG" >/dev/null
 OUT=$(machc exec --e2e "$MACHINE" 'echo must-not-run' 2>&1) && CODE=0 || CODE=$?
 [[ "$CODE" -ne 0 ]]; check "--e2e exits rather than sending plaintext" $?
 [[ "$OUT" == *"cannot seal"* ]]; check "--e2e says why it cannot seal" $?
@@ -371,7 +395,7 @@ step "the fleet block list applies to sealed commands too"
 # at connect (and on every change) and evaluated where the plaintext is. Sealing
 # is turned back on for this org, and the blocked command must still be refused:
 # by the machine this time, with the seal intact in both directions.
-MACH_ORG="$ORG" MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" e2e on --org "$ORG" >/dev/null
+MACH_ORG="$ORG" MACH_DB="$DB" "$WORKDIR/mach-server" e2e on --org "$ORG" >/dev/null
 # The agent confirms which ruleset it holds, so "is this machine enforcing the
 # current rules" has an answer rather than an assumption.
 grep -q "fleet exec policy installed" "$WORKDIR/agent1.log"; check "machine installed the mirrored rules" $?
@@ -481,20 +505,20 @@ step "admin commands report what they did, and refuse what they cannot"
 # add-api-key prints the values it STORED. The secret is shown exactly once, so
 # that line is the operator's only record of what was minted — and "admin" is an
 # alias for exec:*, so printing the arguments made it wrong.
-OUT=$(MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" add-api-key AuditKey admin 2>&1)
+OUT=$(MACH_DB="$DB" "$WORKDIR/mach-server" add-api-key AuditKey admin 2>&1)
 [[ "$OUT" == *'scopes="exec:*"'* ]] || echo "    output was: $OUT"
 [[ "$OUT" == *'scopes="exec:*"'* ]]; check "add-api-key prints the scopes it stored" $?
 [[ "$OUT" == *'name="auditkey"'* ]]; check "and the name it stored, not the one typed" $?
 # A typo'd revoke used to print the success line and exit 0 while nothing was
 # revoked — leaving an active machine the operator believes is retired.
 CODE=0
-OUT=$(MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" revoke-machine "$ORG-typo-no-such" 2>&1) || CODE=$?
+OUT=$(MACH_DB="$DB" "$WORKDIR/mach-server" revoke-machine "$ORG-typo-no-such" 2>&1) || CODE=$?
 [[ "$CODE" -ne 0 ]]; check "revoke-machine refuses an unknown name" $?
 [[ "$OUT" == *"unknown machine"* ]]; check "and says which name it did not find" $?
 # --attestation with no value used to skip the attestation gate entirely, which
 # is the one control that makes "nothing unattested ships" true.
 CODE=0
-OUT=$(MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" push-update "$MACHINE" "$WORKDIR/mach" 9.9.9 --attestation 2>&1) || CODE=$?
+OUT=$(MACH_DB="$DB" "$WORKDIR/mach-server" push-update "$MACHINE" "$WORKDIR/mach" 9.9.9 --attestation 2>&1) || CODE=$?
 [[ "$CODE" -ne 0 ]]; check "push-update refuses --attestation with no value" $?
 [[ "$OUT" == *"needs a file path"* ]]; check "and says why rather than shipping unattested" $?
 
@@ -715,15 +739,15 @@ step "release attestation (in-toto) and attested update push"
 # than exercising the revision path (covered by internal/release's tests).
 go build -buildvcs=false -o "$WORKDIR/mach-release" ./cmd/mach || fail "release build failed"
 ATT="$WORKDIR/mach-release.intoto.jsonl"
-MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" attest "$WORKDIR/mach-release" 0.2.1 --out "$ATT" >/dev/null
+MACH_DB="$DB" "$WORKDIR/mach-server" attest "$WORKDIR/mach-release" 0.2.1 --out "$ATT" >/dev/null
 check "attestation written" $?
-MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" verify-attestation "$ATT" "$WORKDIR/mach-release" >/dev/null
+MACH_DB="$DB" "$WORKDIR/mach-server" verify-attestation "$ATT" "$WORKDIR/mach-release" >/dev/null
 check "attestation verifies against the binary" $?
 # Bytes that do not match the subject: the signature is genuine, the file is
 # not the one that was attested.
 cp "$WORKDIR/mach-release" "$WORKDIR/mach-tampered"
 printf '\0' >>"$WORKDIR/mach-tampered"
-MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" verify-attestation "$ATT" "$WORKDIR/mach-tampered" >/dev/null 2>&1
+MACH_DB="$DB" "$WORKDIR/mach-server" verify-attestation "$ATT" "$WORKDIR/mach-tampered" >/dev/null 2>&1
 [[ $? -ne 0 ]]; check "tampered binary rejected" $?
 
 MACH_STATE_DIR="$WORKDIR/agent5" "$WORKDIR/mach" register \
@@ -734,11 +758,11 @@ AGENT_PID=$!
 sleep 2
 # An attestation that does not describe the binary being pushed must stop the
 # push outright — nothing queued, nothing delivered.
-MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" push-update "$MACHINE3" "$WORKDIR/mach" 0.2.1 \
+MACH_DB="$DB" "$WORKDIR/mach-server" push-update "$MACHINE3" "$WORKDIR/mach" 0.2.1 \
   --attestation "$ATT" >/dev/null 2>&1
 [[ $? -ne 0 ]]; check "push refused a binary its attestation does not describe" $?
 # With the attested binary, the update is queued, delivered and applied.
-MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" push-update "$MACHINE3" "$WORKDIR/mach-release" 0.2.1 \
+MACH_DB="$DB" "$WORKDIR/mach-server" push-update "$MACHINE3" "$WORKDIR/mach-release" 0.2.1 \
   --attestation "$ATT" >/dev/null
 check "attested update queued" $?
 sleep 5
@@ -786,7 +810,7 @@ IDP_PID=$!
 # A second control plane with its own database, so this section cannot disturb
 # the fleet the checks above built. Its MACH_PUBLIC_URL is http, which is what
 # grants the http-issuer carve-out — the dev/loopback case, and the only one.
-MACH_DB="$WORKDIR/ui.db" MACH_LISTEN="127.0.0.1:$UI_PORT" \
+MACH_DB="$UI_DB" MACH_LISTEN="127.0.0.1:$UI_PORT" \
   MACH_PUBLIC_URL="$UI_BASE" MACH_ORG="$ORG" \
   MACH_OIDC_ISSUER="$IDP_BASE" MACH_OIDC_CLIENT_ID=mach-ui MACH_OIDC_CLIENT_SECRET=s3cret \
   "$WORKDIR/mach-server" serve >"$WORKDIR/ui-server.log" 2>&1 &
@@ -797,8 +821,8 @@ for i in $(seq 1 30); do
 done
 curl -fsS "$UI_BASE/healthz" >/dev/null; check "second control plane up (UI+OIDC configured)" $?
 
-UI_ENROLL=$(MACH_DB="$WORKDIR/ui.db" "$WORKDIR/mach-server" add-api-key ui-enroll enroll | grep -oE 'mach_[a-f0-9]+')
-UI_ADMIN=$(MACH_DB="$WORKDIR/ui.db" "$WORKDIR/mach-server" add-api-key ui-admin admin | grep -oE 'mach_[a-f0-9]+')
+UI_ENROLL=$(MACH_DB="$UI_DB" "$WORKDIR/mach-server" add-api-key ui-enroll enroll | grep -oE 'mach_[a-f0-9]+')
+UI_ADMIN=$(MACH_DB="$UI_DB" "$WORKDIR/mach-server" add-api-key ui-admin admin | grep -oE 'mach_[a-f0-9]+')
 [[ -n "$UI_ENROLL" && -n "$UI_ADMIN" ]]; check "UI control plane keys generated" $?
 
 # A real agent, so "block keeps the client connected" is observed rather than
@@ -945,7 +969,7 @@ step "cleanup job wired"
 # This asserts only that the subcommand runs and the DB opens; it does NOT
 # exercise the hourly pairing purge, and it never did. Naming it "pairings
 # purge" claimed coverage this line does not provide.
-MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" version >/dev/null
+MACH_DB="$DB" "$WORKDIR/mach-server" version >/dev/null
 ok "server subcommand runs against the run's database"
 
 printf '\n===== e2e: %d passed, %d failed =====\n' "$PASS" "$FAIL"
