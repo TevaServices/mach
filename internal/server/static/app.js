@@ -60,4 +60,44 @@
       btn.textContent = original;
     }, 2000);
   });
+
+  // Refusals are 4xx with an HTML body, retargeted by the server through
+  // HX-Retarget. htmx's default response handling does not swap non-2xx, so
+  // without this a refused action is a silently swallowed response: a duplicate
+  // org, an org removed while it still has machines, and a bad E2E mode all
+  // produced no visible feedback at all, on pages whose whole point is that an
+  // operator can see what happened.
+  //
+  // htmx resolves HX-Retarget/HX-Reswap before firing this event, so opting in
+  // here lets htmx's own swap path do the work — including the out-of-band
+  // processing and the afterSwap hooks — rather than reimplementing target
+  // resolution in this file.
+  //
+  // The gate is the HX-Retarget header rather than the status code: only a
+  // response that names a destination is swapped, so a 500 from some path that
+  // still writes text/plain cannot be pasted into the page as markup.
+  document.addEventListener("htmx:beforeSwap", function (evt) {
+    var d = evt.detail;
+    if (!d || !d.xhr || !d.xhr.getResponseHeader) return;
+    if (d.xhr.status < 400) return;
+    if (!d.xhr.getResponseHeader("HX-Retarget")) return;
+    d.shouldSwap = true;
+    d.isError = false;
+  });
+
+  // A poll that fires in a hidden tab is pure waste: it costs the control plane
+  // a request and the machine a wake-up, and nobody sees the result. htmx has no
+  // visibility handling of its own, so a backgrounded fleet page would poll every
+  // five seconds forever.
+  //
+  // Scoped to the periodic refresh and NOT to every request: an operator can
+  // click Block and switch away in the same moment, and cancelling that request
+  // would silently drop an action they believe they took.
+  document.addEventListener("htmx:beforeRequest", function (evt) {
+    if (!document.hidden) return;
+    var elt = evt.detail && evt.detail.elt;
+    if (!elt || !elt.getAttribute) return;
+    var trigger = elt.getAttribute("hx-trigger") || "";
+    if (trigger.indexOf("every") !== -1) evt.preventDefault();
+  });
 })();

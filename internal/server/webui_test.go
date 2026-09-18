@@ -741,11 +741,49 @@ func TestUIStaticAllowlist(t *testing.T) {
 	if code != http.StatusOK || len(body) < 1000 {
 		t.Fatalf("htmx.min.js did not serve: %d (%d bytes)", code, len(body))
 	}
-	for _, bad := range []string{"/static/app.js.bak", "/static/nope.js", "/static/../go.mod", "/static/", "/static/go.mod"} {
+	// The stylesheet rides the same allowlist, and its content type is load
+	// bearing: a browser refuses to apply a stylesheet delivered as text/plain,
+	// so a missing map entry would render every page unstyled rather than failing
+	// any request loudly.
+	for _, name := range []string{"ui.css", "app.js"} {
+		req := httptest.NewRequest("GET", "/static/"+name, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s did not serve: %d", name, rec.Code)
+		}
+		if rec.Body.String() != string(mustAsset("static/"+name)) {
+			t.Fatalf("%s served bytes that differ from the embedded asset", name)
+		}
+	}
+	if ct := staticContentType(t, h, "/static/ui.css"); ct != "text/css; charset=utf-8" {
+		t.Fatalf("ui.css content-type = %q, want text/css; charset=utf-8", ct)
+	}
+	// A query string is invisible to filepath.Base, which is what lets the shell
+	// cache-bust these URLs. It must not become a way to name a file.
+	if ct := staticContentType(t, h, "/static/ui.css?v="+assetVersion); ct != "text/css; charset=utf-8" {
+		t.Fatalf("a cache-busted ui.css did not serve: content-type %q", ct)
+	}
+	for _, bad := range []string{
+		"/static/app.js.bak", "/static/nope.js", "/static/../go.mod", "/static/", "/static/go.mod",
+		"/static/nope.css", "/static/ui.css.bak",
+	} {
 		if code, _ := bearerJSON(t, h, "GET", bad, "", ""); code == http.StatusOK {
 			t.Fatalf("%s was served, want 404", bad)
 		}
 	}
+}
+
+// staticContentType fetches one static path and returns its Content-Type, failing
+// the test if it did not serve at all.
+func staticContentType(t *testing.T, h http.Handler, path string) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s returned %d, want 200", path, rec.Code)
+	}
+	return rec.Header().Get("Content-Type")
 }
 
 // The fleet page polls, and the poll target is the table — not the whole block.

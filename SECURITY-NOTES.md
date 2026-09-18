@@ -156,10 +156,11 @@ from the broker; nothing protects content from the machine's own operator.
 | Agent privilege drop on linux root (MACH_USER, default nobody) | agent/droppriv_linux.go |
 | X-Forwarded-For honored only with MACH_TRUST_PROXY=1 | server.New + SetTrustProxy |
 | Pair-page security headers (CSP default-src 'none', XFO DENY, nosniff, no-referrer); cross-site POST refused | pairpages.go |
+| **Static assets are an explicit allowlist over an embedded filesystem** — never a directory file server, so a request cannot name a file that was not compiled in; URLs carry a content digest because the response is `immutable` for a year, which would otherwise serve a stale stylesheet or script | server/uihandlers.go knownStaticFiles, assets.go |
 | **Web UI is off unless fully configured**: no `MACH_OIDC_*` means the `/ui` routes are not registered (404, nothing to probe); a partial set is a fatal startup error naming the variable | server/uiconfig.go, server.go Routes |
 | **OIDC sign-in**: discovery-backed ID token verification by `coreos/go-oidc` (signature, issuer, audience, expiry), signing algorithms pinned to RS256/ES256/PS256, nonce compared by us because the library does not, empty subject refused. Discovery is lazy and a failure is not cached | server/uicallback, internal/oidcauth |
 | **Login CSRF**: the callback must carry the same browser's state cookie, and the state is consumed only after that check — so a captured code cannot be replayed and a stray callback cannot burn the operator's state | server/uihandlers handleUICallback |
-| **UI session and CSRF**: in-memory bounded session store (token stored as a digest, 12h TTL, nothing on disk); `HttpOnly`/`SameSite=Lax`/`Secure`-when-https cookies scoped to `/ui`; per-session synchronizer token compared in constant time; `Sec-Fetch-Site` check; no `next` parameter and no reflected text (open redirect / injection) | server/uisession.go, uihandlers.go uiPost |
+| **UI session and CSRF**: in-memory bounded session store (token stored as a digest, 12h TTL, nothing on disk); `HttpOnly`/`SameSite=Lax`/`Secure`-when-https cookies scoped to `/ui`; per-session synchronizer token compared in constant time; `Sec-Fetch-Site` check; no `next` parameter and no reflected text (open redirect / injection) | server/uiconfig.go, uihandlers.go uiPost |
 | **Soft block** (`blocked` on the machine, stored in the database so it survives a restart): every server→agent command path refuses — one-shot exec and the streaming relay's `exec_stream`, `stream_stdin` **and** `stream_kill` — with the refusal audited; live console sessions for the machine are torn down | server/machineadmin.go dispatchRefusal, stream.go |
 | **Non-reserving delete**: removes the machine row and its key, tells a connected agent to retire (so it exits rather than reconnecting), and keeps the audit trail; ordering is delete-then-notify so a failed notice cannot leave a live authenticated socket for a row that is gone | server/machineadmin.go deleteMachine, store.DeleteMachine |
 | **Org management**: orgs stored in the database with `MACH_ORG`/`MACH_ORGS` as a non-removable pin; an org with machines cannot be removed; adding one is validated by the same label rule the naming invariant uses | server/orgadmin.go, orgs.go, store.ValidOrgLabel |
@@ -423,6 +424,20 @@ signature protects delivery, the attestation records provenance.
     from a QR code and it needs no script. The enrollment page is
     unauthenticated, so this is the one place the widening touches an anonymous
     visitor.
+
+    The style relaxation that used to sit alongside this one is **gone**.
+    `style-src` is now `'self'` on both pages, not `'unsafe-inline'`:
+    the shell links `static/ui.css` instead of carrying an inline `<style>`, and
+    htmx's own inline indicator-style injection is switched off with
+    `includeIndicatorStyles:false` in the shell's `htmx-config` meta, since
+    nothing here uses `hx-indicator`. No template writes a `style=` attribute, and
+    the vendored htmx neither reads `.style` nor calls `insertRule` — which is the
+    whole list of ways a style could be introduced. Dropping `'unsafe-inline'` for
+    styles is worth more than it looks: inline styles are reachable from injected
+    markup and are a known CSS-exfiltration channel. **The pair page keeps
+    `'unsafe-inline'` for styles deliberately**, because it inlines the same
+    authored stylesheet rather than fetching it — adding `'self'` to permit a
+    `<link>` would mean a network fetch from an anonymous QR-scanned page.
 11. **Block is a freeze on dispatch, not containment.** A blocked machine is
     still connected and still running whatever already executes on that host; it
     is sent no *new* commands. An in-flight exec is not cancelled, and an

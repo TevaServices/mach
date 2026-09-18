@@ -407,7 +407,7 @@ to run it, and for why the driver difference matters.
   the machine, so an allow-list must not refuse every one of them for having no
   text at the control plane), and checks that a quoted secret in a command is
   redacted out of the audit row.
-  Green = 183 checks.
+  Green = 189 checks.
 - Timing-sensitive e2e checks (streaming) use a real sleep and a real
   background process; if one flakes, make the sleep longer rather than
   weakening the assertion.

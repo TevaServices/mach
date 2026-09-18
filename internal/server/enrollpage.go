@@ -1,7 +1,6 @@
 package server
 
 import (
-	"fmt"
 	"html/template"
 	"net/http"
 	"os"
@@ -99,15 +98,15 @@ var platformRows = []platformRow{
 // colours (#111 background, #555 text), which is unreadable on a dark screen:
 // the page declares `color-scheme: light dark` and so renders dark by default
 // for a viewer who prefers it. They now take their colours from the shared
-// styling (uiBaseCSS) like every other page, which is also what makes this page
-// and the phone-facing pair page look like the same product.
+// stylesheet (static/ui.css) like every other page, which is also what makes this
+// page and the phone-facing pair page look like the same product.
 const enrollPickSource = `{{define "enrollpick"}}
 <div id="enroll-pick">
 {{if .HasDL}}
 <p>Recommended for <b>{{.PrimaryOS}}</b>{{if .Detected}} (detected from your browser){{end}}:</p>
 <p><a class="btn-primary" href="{{.PrimaryDL}}">Download for {{.PrimaryOS}}</a>
 <code class="muted">{{.PrimaryFN}}</code></p>
-<pre id="cmds" class="panel" style="overflow-x:auto;">chmod +x {{.RunAs}}
+<pre id="cmds" class="panel panel-scroll">chmod +x {{.RunAs}}
 {{.RunAs}}   <span class="muted"># then scan the QR it prints</span></pre>
 <p><button type="button" data-copy="#cmds">Copy commands</button></p>
 {{else}}
@@ -119,22 +118,27 @@ const enrollPickSource = `{{define "enrollpick"}}
 // enrollSource is the page body: the fragment above, the platform tabs that
 // replace it, and the full list.
 const enrollSource = `{{define "enroll"}}
-<h2>mach — set up this machine</h2>
 {{template "enrollpick" .}}
-<h3>Choose a platform</h3>
+<h2>Choose a platform</h2>
 <p>
 {{range .Tabs}}
 <button type="button" hx-get="/partials/enroll/{{.OSKey}}/{{.ArchKey}}"
         hx-target="#enroll-pick" hx-swap="outerHTML">{{.Label}}</button>
 {{end}}
 </p>
-<h3>All platforms</h3>
+<h2>All platforms</h2>
+<div class="table-scroll" role="region" aria-label="All platforms" tabindex="0">
 <table>
+<caption class="sr-only">Every build this control plane ships, by platform</caption>
+<thead><tr><th scope="col">OS</th><th scope="col">CPU</th><th scope="col">Binary</th></tr></thead>
+<tbody>
 {{range .All}}
 <tr><td>{{.OS}}</td><td class="muted">{{.Arch}}</td>
 <td><a href="/download/{{.File}}">download</a></td></tr>
 {{end}}
+</tbody>
 </table>
+</div>
 <p class="muted">The binary is static — no other files needed. Enrollment happens
 on the target machine: run <code>mach</code> there and scan the QR it prints (or
 use an API key headlessly).</p>
@@ -181,18 +185,23 @@ type enrollPageData struct {
 // enrollHeaders are for the public enrollment page and its fragments.
 //
 // This page shares the shell with the control-plane UI, so it needs
-// script-src 'self' for the vendored htmx and app.js. The pair page keeps the
-// stricter default-src 'none' it has always had: it is the page a phone reaches
-// from a QR code and it needs no script at all. This is a real, if small,
-// widening on an unauthenticated page, and it is recorded as such in
-// SECURITY-NOTES.md rather than left implicit.
+// script-src 'self' for the vendored htmx and app.js, and style-src 'self' for the
+// linked stylesheet. The pair page keeps the stricter default-src 'none' it has
+// always had: it is the page a phone reaches from a QR code and it needs no script
+// at all. The script relaxation is a real, if small, widening on an
+// unauthenticated page, and it is recorded as such in SECURITY-NOTES.md rather
+// than left implicit.
+//
+// The two headers must be kept in step with uiHeaders: this page renders through
+// the same shell, so a policy that is tighter here than there would break a page
+// the operator UI proves works.
 func enrollHeaders(w http.ResponseWriter) {
 	h := w.Header()
 	h.Set("X-Frame-Options", "DENY")
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("Content-Security-Policy",
-		"default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'")
+		"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'")
 }
 
 func (s *Server) handleEnrollRoot(w http.ResponseWriter, r *http.Request) {
@@ -208,7 +217,10 @@ func (s *Server) handleEnrollRoot(w http.ResponseWriter, r *http.Request) {
 	data := s.enrollDataFor(osKey, arch, pretty)
 	data.Detected = true
 	data.Orgs = s.ListOrgs()
-	s.renderIntoShell(w, http.StatusOK, uiShellData{Title: "mach — set up a machine", Public: true},
+	// One string serves as both the tab title and the page's h1 (see the shell),
+	// so it is written to read as a heading: "set up this machine" addresses the
+	// person on the target host, which "a machine" did not.
+	s.renderIntoShell(w, http.StatusOK, uiShellData{Title: "mach — set up this machine", Public: true},
 		enrollTemplate, "enroll", enrollPageData{enrollData: data, Tabs: enrollTabs})
 }
 
@@ -310,5 +322,3 @@ func (s *Server) handleAgentDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	http.ServeFile(w, r, filepath.Join(agentDirPath(), fn))
 }
-
-var _ = fmt.Sprintf // keep fmt for future page tweaks

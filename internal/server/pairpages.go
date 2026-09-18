@@ -29,29 +29,53 @@ import (
 //     `default-src 'none'` with no script at all: it is reached by scanning a
 //     code, so it must not need a script engine to be safe on a phone.
 //
-// The styling is the control plane's own (uiBaseCSS), embedded rather than
-// fetched. A page reached from a QR code should not look like a different
-// product from the fleet the operator is about to manage, and sharing one CSS
-// source is what keeps them from drifting apart again.
+// The styling is the control plane's own, INLINED rather than fetched, and that
+// is a security decision rather than a convenience. This page cannot link a
+// stylesheet: it keeps `default-src 'none'` with no script at all, so the only
+// style source it allows is 'unsafe-inline'. A <link rel="stylesheet"> would be
+// blocked outright, and adding 'self' to permit one would mean a network fetch
+// from a page an anonymous visitor reached by scanning a QR code — for a page
+// whose whole story is that it needs nothing. Inlining also keeps the response
+// self-contained, with no second request on a phone.
+//
+// The bytes inlined are the same authored file the operator UI links
+// (static/ui.css, held once as uiCSSBytes), not a copy of it. A page reached from
+// a QR code should not look like a different product from the fleet the operator
+// is about to manage, and one source is what stops the two drifting apart again —
+// which is how they looked when each carried its own hardcoded colours. That is
+// why the page is assembled from three parts around those bytes rather than
+// written as one literal with the stylesheet pasted into the middle.
 
-const pairPageTmpl = `<!doctype html>
+const pairPageHead = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>mach — approve machine</title>
-<style>` + uiBaseCSS + `
+<style>`
+
+// pairPageCSS is this page's own layout. It stays here, not in ui.css, because it
+// is one page's narrow-column form styling and not part of the product's
+// component vocabulary. It is unlayered, and therefore outranks every rule in
+// ui.css whatever their specificity — see the layer note at the top of that file.
+const pairPageCSS = `
 .pair { max-width: 30rem; margin-inline: auto; padding-top: 1.5rem; }
-.pair h2 { margin-top: 0; }
+.pair h1 { font-size: 1.35rem; margin-top: 0; }
 .pair .field { display: block; margin: 1.1rem 0; }
+/* The agent-facts table uses row headers, which is the right semantics for a
+   label/value pair — but the shared sheet styles every th as an uppercase column
+   header. Unlayered, so it wins over the layered rule. */
+.pair th { text-transform: none; letter-spacing: normal; font-weight: 400; font-size: .85rem; color: var(--muted); }
 .pair .field > span { display: block; font-size: .85rem; color: var(--muted); margin-bottom: .25rem; }
 .pair input[type=text], .pair select { width: 100%; font-size: 1.05rem; padding: .5rem .55rem; }
 .pair .code { letter-spacing: .18em; text-transform: uppercase; font-size: 1.25rem; }
 .pair .actions { display: flex; gap: .6rem; margin: 1.5rem 0 0; }
 .pair .actions .btn-primary { flex: 1; }
-</style>
+`
+
+const pairPageBody = `</style>
 </head><body>
 <main class="pair">
-<h2>mach — approve machine</h2>
+<h1>mach — approve machine</h1>
 {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
 {{if .Done}}
 <div class="panel">
@@ -65,8 +89,8 @@ const pairPageTmpl = `<!doctype html>
 machine reported about itself — verify out-of-band that a new machine is
 actually being set up.</p>
 <table>
-<tr><td class="muted">reports hostname</td><td>{{.Hostname}}</td></tr>
-<tr><td class="muted">reports platform</td><td>{{.OS}}/{{.Arch}} — agent {{.AgentVer}}</td></tr>
+<tr><th scope="row" class="muted">reports hostname</th><td>{{.Hostname}}</td></tr>
+<tr><th scope="row" class="muted">reports platform</th><td>{{.OS}}/{{.Arch}} — agent {{.AgentVer}}</td></tr>
 </table>
 <form method="POST" action="/pair/{{.Token}}">
 <p class="muted">Type the <b>challenge code shown on the agent's console</b> — the
@@ -96,7 +120,11 @@ personally started enrollment on that machine.</p>
 </main>
 </body></html>`
 
-var pairTmpl = template.Must(template.New("pair").Parse(pairPageTmpl))
+// The authored stylesheet is spliced in at init, so the page ships with one
+// self-contained <style> block and there is exactly one file to edit when the
+// design changes.
+var pairTmpl = template.Must(template.New("pair").Parse(
+	pairPageHead + string(uiCSSBytes) + pairPageCSS + pairPageBody))
 
 type pairPageData struct {
 	Error    string
