@@ -190,6 +190,37 @@ grep -q stream-last "$WORKDIR/stream.out"; [[ $? -ne 0 ]]; check "later output n
 wait "$STREAM_PID"
 grep -q stream-last "$WORKDIR/stream.out"; check "remaining output arrived at exit" $?
 
+step "streaming: Ctrl-C kills the remote command"
+# The console prints "Ctrl-C kills the remote session", so it has to. The kill
+# only closed the command's stdin, which does nothing to a program that is not
+# reading it — so `sleep`, a wedged build, or a hung client ran to completion
+# while the operator watched the console vanish. (The signal also has to reach
+# the stream handler at all: the process's own interrupt guard used to exit on
+# the first one, racing the kill frame and almost always winning.)
+#
+# The command prints after sleeping, so "did it stop" is answerable from the
+# output rather than from a timing race.
+# The binary is invoked directly rather than through the `machc` helper: that
+# helper is a shell function, so backgrounding a pipeline that ends in it gives
+# $! as a subshell's pid and the signal would never reach the console.
+printf 'sleep 30; echo survived-the-kill\n:quit\n' \
+  | MACH_STATE_DIR="$CONSOLE_DIR" "$WORKDIR/mach" console "$MACHINE" \
+      >"$WORKDIR/kill.out" 2>"$WORKDIR/kill.err" &
+KILL_PID=$!
+sleep 2
+kill -0 "$KILL_PID" 2>/dev/null; check "the console is running before the signal" $?
+kill -INT "$KILL_PID" 2>/dev/null
+sleep 3
+kill -0 "$KILL_PID" 2>/dev/null && kill -KILL "$KILL_PID" 2>/dev/null
+# The command prints 30s in, so its absence after 5s is the kill, not the clock.
+grep -q survived-the-kill "$WORKDIR/kill.out"
+[[ $? -ne 0 ]]; check "Ctrl-C stopped the remote command" $?
+grep -q "killed" "$WORKDIR/kill.err"; check "the console reports the command was killed" $?
+sleep 1
+AUDIT=$(machc audit "$MACHINE" 1 2>/dev/null | head -1)
+[[ "$AUDIT" == *"exit=130"* ]] || echo "    audit row was: $AUDIT"
+[[ "$AUDIT" == *"exit=130"* ]]; check "a killed session is audited as killed (130), not as fate-unknown" $?
+
 step "output is data: a machine cannot forge control facts"
 # The command prints something that looks exactly like a protocol exit record
 # and then exits 5. The exit status the caller sees must be 5, and the printed
@@ -274,6 +305,15 @@ OUT=$(MACH_ORG="$ORG" MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" e2e on -
 REPORT=$(MACH_ORG="$ORG" MACH_ORGS="other" MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" e2e 2>&1)
 [[ "$REPORT" == *"org other: sealed exec off"* ]] || echo "    report was: $REPORT"
 [[ "$REPORT" == *"org other: sealed exec off"* ]]; check "unrelated org keeps the off default" $?
+# The explanation of a setting belongs under the line it explains. Printed at the
+# end it read as a comment on the last org and contradicted it — "org X: sealed
+# exec on" followed by "sealed exec is refused" — which is a bad way to describe a
+# control that decides whether commands are readable.
+DEFLINE=$(printf '%s\n' "$REPORT" | grep -n '^default:' | head -1 | cut -d: -f1)
+EXPLINE=$(printf '%s\n' "$REPORT" | grep -n 'sealed exec is refused\|sealed exec is accepted' | head -1 | cut -d: -f1)
+FIRSTORG=$(printf '%s\n' "$REPORT" | grep -n '^org ' | head -1 | cut -d: -f1)
+[[ -n "$DEFLINE" && -n "$EXPLINE" && -n "$FIRSTORG" && "$EXPLINE" -gt "$DEFLINE" && "$EXPLINE" -lt "$FIRSTORG" ]]
+check "the default's explanation sits under the default, not under an org" $?
 # The control signal: the client is told what the server accepts, and the key to
 # seal to when it accepts sealing.
 curl -fsS "$BASE/v1/machines/$MACHINE/e2epub" -H "Authorization: Bearer $ALLKEY" >"$WORKDIR/e2epub.json"
@@ -293,6 +333,20 @@ sleep 1
 AUDIT=$(machc audit "$MACHINE" 1 2>/dev/null | head -1)
 [[ "$AUDIT" == *"[E2E sealed command]"* ]]; check "command was sealed (audit is a placeholder)" $?
 [[ "$AUDIT" != *"sealed-marker-e2e"* ]]; check "the control plane could not read the command" $?
+# The exit status is the one fact about a sealed command the control plane is
+# documented to learn, and it is what its audit row carries — it is not in the
+# ciphertext, so it rides beside it. Asserting only the placeholder is what let
+# it be read out of the wrong struct for so long: every sealed command was
+# recorded as exit 0, including the ones the machine had just refused with 126.
+CODE=0
+machc exec "$MACHINE" 'exit 42' >/dev/null 2>&1 || CODE=$?
+[[ "$CODE" -eq 42 ]]; check "a sealed command's exit status reaches the caller" $?
+sleep 1
+AUDIT=$(machc audit "$MACHINE" 1 2>/dev/null | head -1)
+[[ "$AUDIT" == *"[E2E sealed command]"* ]]; check "the row is still a sealed placeholder" $?
+[[ "$AUDIT" == *"exit=42"* ]] || echo "    audit row was: $AUDIT"
+[[ "$AUDIT" == *"exit=42"* ]]; check "the audit row carries the real exit status, not 0" $?
+[[ "$AUDIT" != *"exit 42"* ]]; check "the command text itself stayed sealed" $?
 # --no-e2e overrides for one call: the operator wants this one readable, so it
 # reaches the block list and the audit log in plaintext.
 machc exec --no-e2e "$MACHINE" 'echo readable-marker-e2e' >/dev/null 2>&1
@@ -373,9 +427,86 @@ done
 [[ "$BLOCKED" -eq 0 ]] || echo "    last output: $OUT"
 [[ "$BLOCKED" -eq 0 ]]; check "a rule added live reached the connected machine" $?
 
+step "fleet allowlist + sealed exec: the rules run where the plaintext is"
+# An allowlist judges text, and a sealed command has none at the control plane:
+# running the rules against the empty command left behind refused EVERY sealed
+# command with "allowlist mode: empty command", so a deployment pairing an
+# allowlist with the default E2E posture had no sealed path at all — and a client
+# obeying the 403 fell back to plaintext, handing the control plane a command it
+# was told to keep. The rules are not skipped for a sealed command; they are
+# applied on the machine, where the seal is opened, which is what the mirror is
+# for. Both directions are checked here: what the allowlist permits runs, what it
+# forbids is refused — by the machine, with the seal intact.
+printf 'allowonly\nallow:echo\n' > "$WORKDIR/fleet.policy"
+APPLIED=1
+for i in $(seq 1 40); do
+  OUT=$(machc exec "$MACHINE" 'cat /etc/passwd' 2>&1) || true
+  if [[ "$OUT" == *"allowlist mode"* ]]; then APPLIED=0; break; fi
+  sleep 1
+done
+[[ "$APPLIED" -eq 0 ]] || echo "    last output: $OUT"
+[[ "$APPLIED" -eq 0 ]]; check "the allowlist reached the machine" $?
+OUT=$(machc exec "$MACHINE" 'echo allowlisted-sealed' 2>&1) && CODE=0 || CODE=$?
+[[ "$CODE" -eq 0 ]] || echo "    output was: $OUT (exit $CODE)"
+[[ "$CODE" -eq 0 ]]; check "a sealed command the allowlist permits still runs" $?
+[[ "$OUT" == *"allowlisted-sealed"* ]]; check "and its output came back through the seal" $?
+OUT=$(machc exec "$MACHINE" 'cat /etc/passwd' 2>&1) && CODE=0 || CODE=$?
+[[ "$CODE" -eq 126 ]]; check "a sealed command the allowlist forbids is refused" $?
+sleep 1
+AUDIT=$(machc audit "$MACHINE" 1 2>/dev/null | head -1)
+[[ "$AUDIT" == *"[E2E sealed command]"* ]]; check "the refusal stayed sealed in the record" $?
+[[ "$AUDIT" != *"/etc/passwd"* ]]; check "the control plane never read it" $?
+# Back to the deny list the rest of the run expects. Later steps only run
+# `echo`, which the allowlist happens to permit too, so this restore is for
+# clarity rather than for their sake.
+printf 'deny:fleet-blocked-marker\ndeny:rotated-marker\n' > "$WORKDIR/fleet.policy"
+
+step "audit redaction: a quoted secret does not reach the row"
+# The deployment checklist tells operators their inserts are already redacted,
+# which is the reason they do not purge audit for a machine whose commands
+# carried a secret. That was not true of the shape people actually write: the
+# value class excluded quotes, so in `PASSWORD='hunter2'` it matched the empty
+# string at the opening quote and the replacement left the secret in place, in a
+# row served to every readonly and exec-scoped key.
+machc exec --no-e2e "$MACHINE" "export PGPASSWORD='e2e-secret-marker' && echo ran" >/dev/null 2>&1
+sleep 1
+AUDIT=$(machc audit "$MACHINE" 5 2>/dev/null)
+[[ "$AUDIT" == *"PGPASSWORD="* ]] || echo "    audit was: $AUDIT"
+[[ "$AUDIT" == *"PGPASSWORD="* ]]; check "the keyword stays visible for readability" $?
+[[ "$AUDIT" != *"e2e-secret-marker"* ]] || echo "    audit was: $AUDIT"
+[[ "$AUDIT" != *"e2e-secret-marker"* ]]; check "a quoted secret is redacted from the audit row" $?
+[[ "$AUDIT" == *"[REDACTED]"* ]]; check "and the row says it was redacted" $?
+
+step "admin commands report what they did, and refuse what they cannot"
+# add-api-key prints the values it STORED. The secret is shown exactly once, so
+# that line is the operator's only record of what was minted — and "admin" is an
+# alias for exec:*, so printing the arguments made it wrong.
+OUT=$(MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" add-api-key AuditKey admin 2>&1)
+[[ "$OUT" == *'scopes="exec:*"'* ]] || echo "    output was: $OUT"
+[[ "$OUT" == *'scopes="exec:*"'* ]]; check "add-api-key prints the scopes it stored" $?
+[[ "$OUT" == *'name="auditkey"'* ]]; check "and the name it stored, not the one typed" $?
+# A typo'd revoke used to print the success line and exit 0 while nothing was
+# revoked — leaving an active machine the operator believes is retired.
+CODE=0
+OUT=$(MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" revoke-machine "$ORG-typo-no-such" 2>&1) || CODE=$?
+[[ "$CODE" -ne 0 ]]; check "revoke-machine refuses an unknown name" $?
+[[ "$OUT" == *"unknown machine"* ]]; check "and says which name it did not find" $?
+# --attestation with no value used to skip the attestation gate entirely, which
+# is the one control that makes "nothing unattested ships" true.
+CODE=0
+OUT=$(MACH_DB="$WORKDIR/mach.db" "$WORKDIR/mach-server" push-update "$MACHINE" "$WORKDIR/mach" 9.9.9 --attestation 2>&1) || CODE=$?
+[[ "$CODE" -ne 0 ]]; check "push-update refuses --attestation with no value" $?
+[[ "$OUT" == *"needs a file path"* ]]; check "and says why rather than shipping unattested" $?
+
 step "readonly key: sees the whole fleet, runs nothing"
 curl -fsS "$BASE/v1/machines" -H "Authorization: Bearer $RO_KEY" >"$WORKDIR/ro.json"
 grep -q "$MACHINE" "$WORKDIR/ro.json"; check "readonly key sees the fleet" $?
+# The E2E public key is the key commands are sealed to, so a key that may not run
+# commands has no use for it: the scope table says a readonly key sees the fleet
+# and the audit trail "and nothing else".
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/machines/$MACHINE/e2epub" \
+  -H "Authorization: Bearer $RO_KEY")
+[[ "$CODE" == "403" ]]; check "readonly key cannot fetch the sealing key" $?
 curl -fsS "$BASE/v1/audit" -H "Authorization: Bearer $RO_KEY" | grep -q "$MACHINE"; check "readonly key sees the audit trail" $?
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/exec" \
   -H "Authorization: Bearer $RO_KEY" -H 'Content-Type: application/json' \
@@ -628,6 +759,20 @@ check "vendored asset serves" $?
 # The static route is an allowlist, never a directory server.
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/static/../go.mod"); [[ "$CODE" != "200" ]]
 check "static route refuses traversal" $?
+# The public enrollment page, which needs no OIDC, must offer every platform it
+# ships a build for: its tabs were set on the embedded struct while the template
+# read the outer field of the same name, so the row rendered empty and an
+# operator whose user agent was guessed wrong could not switch to their actual
+# platform. The fragment the tabs call is checked too, since tabs that point at
+# nothing are decorations.
+ENROLL=$(curl -fsS "$BASE/")
+for want in linux/amd64 darwin/arm64 windows/amd64; do
+  [[ "$ENROLL" == *"partials/enroll/$want"* ]] || echo "    missing tab: $want"
+  [[ "$ENROLL" == *"partials/enroll/$want"* ]]
+  check "enrollment page offers the $want build" $?
+done
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/partials/enroll/linux/amd64"); [[ "$CODE" == "200" ]]
+check "the platform fragment the tabs call answers" $?
 
 step "web UI: OIDC sign-in, block/revoke/delete, org management (loopback)"
 UI_PORT="${MACH_TEST_UI_PORT:-8098}"
