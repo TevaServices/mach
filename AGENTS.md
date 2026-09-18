@@ -338,11 +338,16 @@ to run it, and for why the driver difference matters.
   (`MACH_EXEC_POLICY`, `MACH_E2E`) can be prefixed onto `local:up` to exercise
   it; the playground pins none of those. It does pin one set of variables, the
   `MACH_OIDC_*` block, so the UI is on — see the bullet below.
-- `mise run local:server` / `local:enroll` / `local:reset` — the same playground
+- `mise run local:server` / `local:enroll` / `local:temp` / `local:reset` — the
+  same playground
   split into pieces, for testing enrollment itself. `local:server` starts the
   control plane and stops there: no keys minted, nothing enrolled, so the pair
   page is the only way in. `local:enroll` runs the QR and challenge-code flow in
-  the foreground. **One variable decides the host — `MACH_LOCAL_HOST`** (default
+  the foreground. `local:temp` runs a **temporary** session the same way — bare
+  `mach` against the playground, identity in memory, pairing over the same QR +
+  challenge-code page, retiring the enrollment on exit — into its own state dir
+  (`data/local/temp-agent`), so it never collides with an enrollment from
+  `local:up`. **One variable decides the host — `MACH_LOCAL_HOST`** (default
   `auto`: the IPv4 of the default-route interface), and `LISTEN` and
   `MACH_PUBLIC_URL` are derived from it in one place so they cannot disagree.
   This is one knob rather than two because the QR's URL is built by the
@@ -418,6 +423,11 @@ to run it, and for why the driver difference matters.
 - Control plane runs in Docker (`docker compose up -d --build`); the image
   also carries prebuilt agent binaries for all six OS/arch targets under
   `/opt/mach-agents/` — copy one to a target machine; it never needs Go.
+  A machine that *itself* runs as a container can run `Dockerfile.agent`
+  instead (`ghcr.io/<owner>/mach-agent` on releases): headless enrollment
+  from `MACH_SERVER`/`MACH_API_KEY`/`MACH_NAME`, state in a `/data` volume,
+  and pushed updates refused by design — update it by pulling a new image,
+  not by the control plane's push path.
 - Put Caddy/nginx in front for TLS (agents speak wss://) and set
   `MACH_TRUST_PROXY=1` on the server. Nothing else exposes ports; targets
   dial out only.

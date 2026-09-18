@@ -15,6 +15,7 @@
 #   scripts/localdev.sh up         build, start the control plane, enroll this host, start the agent
 #   scripts/localdev.sh server     build and start the control plane alone — nothing enrolled
 #   scripts/localdev.sh enroll     enroll this host by hand, through the QR / challenge-code flow
+#   scripts/localdev.sh temp       run a TEMPORARY agent against the playground (bare mach, in-memory)
 #   scripts/localdev.sh reset      stop everything and wipe the playground back to a fresh install
 #   scripts/localdev.sh down       stop the agent, the control plane and the identity provider
 #   scripts/localdev.sh status     the fleet listing, through the console CLI
@@ -526,6 +527,50 @@ cmd_enroll() {
 	log "  mise run local:up    (it sees this enrollment and skips straight to running)"
 }
 
+# cmd_temp runs a TEMPORARY agent session in the foreground — bare `mach`, the
+# mode whose identity exists only in memory. It pairs through the same QR /
+# challenge-code flow as `enroll` (approval is operator-gated by design: the
+# code is printed here and typed on the pair page), is recorded on the control
+# plane as temporary, traces every command it is asked to run onto this console,
+# and retires its enrollment when it ends. Ctrl-C is a real shutdown, and
+# running it again takes the same machine name straight back over.
+cmd_temp() {
+	need_bins
+	curl -fsS "$BASE/healthz" >/dev/null 2>&1 ||
+		die "nothing is serving $BASE — start one with: mise run local:server"
+	ensure_playground
+	# Its own state dir, deliberately not the enrolled agent's. A temporary
+	# session writes nothing to its state dir, but bare `mach` refuses on a
+	# state dir that IS enrolled — so pointing this at AGENT_DIR would turn the
+	# whole verb into that refusal the moment `local:up` has run.
+	TEMP_STATE="$DIR/temp-agent"
+	mkdir -p "$TEMP_STATE"
+	# The host comes from the running control plane's own record, as in enroll:
+	# the QR's URL is built by the client from the server URL it was handed, so
+	# this is the moment the two are kept together.
+	resolve_host
+	refuse_host_change
+	echo
+	if is_loopback; then
+		warn "the QR will encode $PUBLIC_URL, which is loopback — open it in a browser on this machine, not on a phone."
+	else
+		log "the QR will encode $PUBLIC_URL — the address this control plane is bound to, and one a phone on this network can reach."
+	fi
+	log "approve on the pair page with the challenge code printed below. The page"
+	log "suggests a name from this hostname — if 'local:up' has run here it is taken"
+	log "($(machine_name)); pick another one on the page."
+	echo
+	# stdin from /dev/null answers the two bracketed prompts with their
+	# environment defaults (MACH_SERVER / MACH_ORG) instead of pausing on an
+	# Enter the flow does not need: the challenge code is typed on the pair
+	# page, never on this console.
+	MACH_STATE_DIR="$TEMP_STATE" MACH_SERVER="$PUBLIC_URL" MACH_ORG="$ORG" \
+		"$BIN_MACH" </dev/null
+	echo
+	log "temporary session ended. If it exited cleanly it retired its enrollment;"
+	log "either way the next run re-enrolls under the same name with no operator action."
+}
+
 cmd_reset() {
 	# Both guards run before anything is stopped or deleted, because
 	# MACH_LOCAL_DIR is caller-controlled and the next step is `rm -rf`.
@@ -634,6 +679,7 @@ case "$sub" in
 up) cmd_up "$@" ;;
 server) cmd_server "$@" ;;
 enroll) cmd_enroll "$@" ;;
+temp) cmd_temp "$@" ;;
 reset) cmd_reset "$@" ;;
 down) cmd_down "$@" ;;
 status) cmd_status "$@" ;;

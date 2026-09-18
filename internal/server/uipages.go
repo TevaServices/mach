@@ -210,8 +210,8 @@ const fleetInnerSource = `{{define "fleettable"}}
         {{if .Online}}<span class="badge online">online</span>
         {{else}}<span class="badge offline">offline</span>{{end}}
       </td>
-      <td class="muted">{{.OS}}/{{.Arch}}</td>
-      <td class="muted">{{.AgentVer}}{{if .AgentSkew}} <span class="badge" title="this agent reports a different version than this control plane">differs</span>{{end}}</td>
+      <td>{{.OS}}/{{.Arch}}</td>
+      <td>{{.AgentVer}}{{if .AgentSkew}} <span class="badge" title="this agent reports a different version than this control plane">differs</span>{{end}}</td>
       <td>
         <div class="row-actions">
         {{if not .Revoked}}
@@ -232,13 +232,13 @@ const fleetInnerSource = `{{define "fleettable"}}
                 hx-confirm="Revoke {{.Name}}? Its agent is told to retire and its key stops working. The machine can come back by enrolling again under this same name — or use Delete to remove it and free the name for a different machine.">
             <input type="hidden" name="machine" value="{{.Name}}">
             <input type="hidden" name="csrf" value="{{$.CSRF}}">
-            <button type="submit">Revoke</button>
+            <button type="submit" class="danger">Revoke</button>
           </form>
         {{end}}
         <form class="inline" method="post" action="/ui/delete" hx-post="/ui/delete" hx-target="#confirm" hx-swap="innerHTML">
           <input type="hidden" name="machine" value="{{.Name}}">
           <input type="hidden" name="csrf" value="{{$.CSRF}}">
-          <button type="submit">Delete</button>
+          <button type="submit" class="danger">Delete</button>
         </form>
         </div>
       </td>
@@ -281,16 +281,13 @@ const fleetSource = `{{define "fleet"}}
 // out of a URL.
 const deleteConfirmSource = `{{define "deleteconfirm"}}
 <div class="panel">
-  <p>This removes <code>{{.Name}}</code> and its key from the database. The name
-  and the key are freed, so this host (or another with the same name) can enroll
-  again. Audit rows are kept.</p>
+  <p>This removes <code>{{.Name}}</code> and its key. The name is freed for
+  re-enrollment; audit rows are kept.</p>
   {{if .Online}}
-  <p class="muted">The agent is connected and will be told to retire. An agent
-  that is offline is not told, and will keep retrying until it is stopped on
-  the host.</p>
+  <p class="muted">The agent is connected and will be told to retire.</p>
   {{else}}
-  <p class="muted">The agent is not connected, so it cannot be told to retire.
-  It will keep retrying until it is stopped on the host.</p>
+  <p class="muted">The agent is offline, so it cannot be told — it will keep
+  retrying until stopped on the host.</p>
   {{end}}
   <form method="post" action="/ui/delete" hx-post="/ui/delete" hx-target="#fleet" hx-swap="outerHTML">
     <input type="hidden" name="machine" value="{{.Name}}">
@@ -321,16 +318,13 @@ const confirmClearedSource = `{{define "confirmcleared"}}{{end}}`
 // both by TestUIDeleteRequiresTypedName.
 const deleteConfirmPageSource = `{{define "deleteconfirmpage"}}
 <div class="panel">
-  <p>This removes <code>{{.Name}}</code> and its key from the database. The name
-  and the key are freed, so this host (or another with the same name) can enroll
-  again. Audit rows are kept.</p>
+  <p>This removes <code>{{.Name}}</code> and its key. The name is freed for
+  re-enrollment; audit rows are kept.</p>
   {{if .Online}}
-  <p class="muted">The agent is connected and will be told to retire. An agent
-  that is offline is not told, and will keep retrying until it is stopped on
-  the host.</p>
+  <p class="muted">The agent is connected and will be told to retire.</p>
   {{else}}
-  <p class="muted">The agent is not connected, so it cannot be told to retire.
-  It will keep retrying until it is stopped on the host.</p>
+  <p class="muted">The agent is offline, so it cannot be told — it will keep
+  retrying until stopped on the host.</p>
   {{end}}
   <form method="post" action="/ui/delete">
     <input type="hidden" name="machine" value="{{.Name}}">
@@ -406,15 +400,21 @@ const orgE2EActionSource = `{{define "orge2eaction"}}{{template "noticeoob" .}}{
 // the control for it lives on the org's own page, where the effective value and
 // where it comes from are both visible, rather than as three buttons whose
 // difference ("on", "off", "inherit") was not obvious from a list row.
+//
+// There is deliberately no Actions column. The one action an org row ever
+// offered was Remove, and removal is an org-level decision, not a row-level
+// reflex: it lives on the org's page (memberSource) next to what removal
+// actually affects, and behind one navigation click rather than sitting in
+// every row of the list.
 const orgsSource = `{{define "orgs"}}
 <div id="orgs">
-<p class="muted">Names are org-prefixed (<code>&lt;org&gt;-&lt;machine&gt;</code>).
-Adding an org makes that prefix enrollable. An org that came from the environment
-is pinned and cannot be removed here. E2E is a per-org setting, on the org's page.</p>
+<p class="muted">Machine names are <code>&lt;org&gt;-&lt;machine&gt;</code>.
+An org that came from the environment is pinned. Settings and removal are on
+each org's page.</p>
 <div class="table-scroll" role="region" aria-label="Orgs" tabindex="0">
 <table>
 <caption class="sr-only">Configured org prefixes, their machine counts, and their sealed-exec setting</caption>
-<thead><tr><th scope="col">Org</th><th scope="col">Machines</th><th scope="col">E2E</th><th scope="col">Actions</th></tr></thead>
+<thead><tr><th scope="col">Org</th><th scope="col">Machines</th><th scope="col">E2E</th></tr></thead>
 <tbody>
 {{range .Rows}}
   <tr>
@@ -425,29 +425,17 @@ is pinned and cannot be removed here. E2E is a per-org setting, on the org's pag
       {{if .E2EEnabled}}<span class="badge online">on</span>{{else}}<span class="badge blocked">off</span>{{end}}
       <div class="muted">{{.E2ESource}}</div>
     </td>
-    <td>
-      <div class="row-actions">
-      {{if not .Pinned}}
-      <form class="inline" method="post" action="/ui/orgs/remove" hx-post="/ui/orgs/remove" hx-target="#orgs" hx-swap="outerHTML"
-            hx-confirm="Remove org {{.Name}}? New machines can no longer enroll under this prefix. Existing machines keep working.">
-        <input type="hidden" name="org" value="{{.Name}}">
-        <input type="hidden" name="csrf" value="{{$.CSRF}}">
-        <button type="submit">Remove</button>
-      </form>
-      {{end}}
-      </div>
-    </td>
   </tr>
 {{end}}
 </tbody></table>
 </div>
 <h2>Add an org</h2>
-<form method="post" action="/ui/orgs/add" hx-post="/ui/orgs/add" hx-target="#orgs" hx-swap="outerHTML">
+<form class="add-org" method="post" action="/ui/orgs/add" hx-post="/ui/orgs/add" hx-target="#orgs" hx-swap="outerHTML">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
-  <input type="text" name="org" placeholder="acme" autocomplete="off" required>
+  <input type="text" name="org" placeholder="acme" autocomplete="off" required aria-label="Org name">
   <button type="submit">Add org</button>
 </form>
-<div class="muted">2-20 characters: letters, digits, hyphen.</div>
+<p class="muted">2-20 characters: letters, digits, hyphen.</p>
 </div>
 {{end}}`
 
@@ -461,15 +449,13 @@ is pinned and cannot be removed here. E2E is a per-org setting, on the org's pag
 // the same setting rather than a statement about where the value comes from.
 const orgE2ESource = `{{define "orge2e"}}
 <div id="orge2e">
-<h2>E2E</h2>
-<p class="muted">End-to-end encrypted commands: this control plane relays them
-without being able to read the command or its output. With E2E off, commands for
-this org run in plaintext, where the control plane can read them and the
-fleet-wide block list applies before anything is dispatched.</p>
+<h2>Sealed exec (E2E)</h2>
+<p class="muted">With E2E on, one-shot commands are end-to-end encrypted: the
+control plane relays them without reading them. With it off, commands run in
+plaintext and the fleet-wide block list applies before dispatch.</p>
 {{if .E2EPinned}}<p class="notice">MACH_E2E pins every org to one value. A setting
 saved here is kept, and takes effect again once that pin is removed.</p>{{end}}
-{{if not .E2EOverridden}}<p class="muted">This org has no setting of its own and
-follows the fleet default.</p>{{end}}
+{{if not .E2EOverridden}}<p class="muted">This org follows the fleet default.</p>{{end}}
 {{/* ONE form with three named submit buttons, not three forms with one hidden
      mode field each. The server contract is unchanged — it reads
      PostFormValue("mode"), and a submit button contributes its own name/value —
@@ -506,10 +492,16 @@ follows the fleet default.</p>{{end}}
 // which is also a better h1 than the old `<h2>Org <code>acme</code></h2>` — a
 // heading whose text is split across an element reads as two fragments to a
 // screen reader listing the page's headings.
+//
+// The Remove action lives here, not in the org list's rows. It is a plain form
+// post on purpose: the htmx branch of /ui/orgs/remove answers with the orgs
+// LIST fragment (for the #orgs target the list page has), and this page has no
+// such target — a successful removal should simply navigate to /ui/orgs, which
+// is exactly what the non-htmx redirect does.
 const memberSource = `{{define "orgmember"}}
 <p><a href="/ui/orgs">&larr; All orgs</a></p>
 {{if .Pinned}}<p class="muted">This org comes from the environment
-(<code>MACH_ORG</code>/<code>MACH_ORGS</code>), so it cannot be removed here.</p>{{end}}
+(<code>MACH_ORG</code>/<code>MACH_ORGS</code>), so it cannot be removed.</p>{{end}}
 
 {{template "orge2e" .}}
 
@@ -524,7 +516,7 @@ const memberSource = `{{define "orgmember"}}
 <td>{{if .Revoked}}<span class="badge revoked">revoked</span>
 {{else if .Blocked}}<span class="badge blocked">blocked</span>{{end}}
 {{if .Online}}<span class="badge online">online</span>{{else}}<span class="badge offline">offline</span>{{end}}</td>
-<td class="muted">{{.OS}}/{{.Arch}}</td></tr>
+<td>{{.OS}}/{{.Arch}}</td></tr>
 {{end}}
 </tbody></table>
 </div>
@@ -537,24 +529,35 @@ const memberSource = `{{define "orgmember"}}
 <caption class="sr-only">API keys whose exec allowlist names a machine in this org</caption>
 <thead><tr><th scope="col">Key</th><th scope="col">Scopes</th><th scope="col">Created</th></tr></thead><tbody>
 {{range .ScopedKeys}}<tr><td><code>{{.Name}}</code></td><td><code>{{.Scopes}}</code></td>
-<td class="muted">{{.CreatedAt}}</td></tr>{{end}}
+<td>{{.CreatedAt}}</td></tr>{{end}}
 </tbody></table>
 </div>
 {{end}}
 
 <h2>Fleet-wide keys ({{len .FleetKeys}})</h2>
-<p class="muted">These are not scoped to an org. An <code>exec:*</code>,
-<code>readonly</code> or <code>enroll</code> key reaches every org, which is why
-they are listed separately rather than counted as members of this one.</p>
+<p class="muted">Not scoped to an org — an <code>exec:*</code>, <code>readonly</code>
+or <code>enroll</code> key reaches every org, so they are listed separately.</p>
 {{if not .FleetKeys}}<p class="muted">None.</p>{{else}}
 <div class="table-scroll" role="region" aria-label="Fleet-wide keys" tabindex="0">
 <table>
 <caption class="sr-only">API keys that reach every org</caption>
 <thead><tr><th scope="col">Key</th><th scope="col">Scopes</th><th scope="col">Created</th></tr></thead><tbody>
 {{range .FleetKeys}}<tr><td><code>{{.Name}}</code></td><td><code>{{.Scopes}}</code></td>
-<td class="muted">{{.CreatedAt}}</td></tr>{{end}}
+<td>{{.CreatedAt}}</td></tr>{{end}}
 </tbody></table>
 </div>
+{{end}}
+
+{{if not .Pinned}}
+<h2>Remove this org</h2>
+<p class="muted">New machines can no longer enroll under the
+<code>{{.Org}}</code>- prefix; existing machines keep working. An org that still
+has machines cannot be removed.</p>
+<form method="post" action="/ui/orgs/remove">
+  <input type="hidden" name="org" value="{{.Org}}">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <button type="submit" class="danger">Remove org</button>
+</form>
 {{end}}
 {{end}}`
 
