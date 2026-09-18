@@ -80,7 +80,16 @@ func handleSealedExec(conn *protocol.WSConn, env protocol.Envelope, sealed proto
 		return
 	}
 	// SealedB64 is base64 of the SealedMessage JSON (console OpenB64 decodes).
-	payload, _ := json.Marshal(protocol.SealedExecResult{SealedB64: stdBase64(sealedRes)})
+	// The exit status goes in the clear beside it — it is the one fact the relay
+	// is meant to learn about a sealed command, and what its audit row records.
+	// The error string deliberately does NOT: a policy refusal quotes the command
+	// it refused, which is the text sealing exists to keep off the control plane.
+	//
+	// Take the address of a copy rather than of res.ExitCode: res is a local, but
+	// sharing it with the struct being marshalled invites a later edit to mutate
+	// one through the other.
+	exitCode := res.ExitCode
+	payload, _ := json.Marshal(protocol.SealedExecResult{SealedB64: stdBase64(sealedRes), ExitCode: &exitCode})
 	_ = conn.WriteEnvelope(protocol.Envelope{Type: "exec_result", ReqID: env.ReqID, Payload: payload})
 }
 
