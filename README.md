@@ -358,8 +358,19 @@ amd64 + arm64, and one in-toto attestation bundle
 (`mach-attestations.intoto.jsonl`, a DSSE envelope per line, one per
 binary). Each statement carries its binary's sha256, so the bundle is the
 release's signed integrity record; the signing key's public half is in the
-release notes. A multi-arch (linux/amd64, linux/arm64) `mach-server`
-container goes to GHCR.
+release notes. Multi-arch (linux/amd64, linux/arm64) `mach-server` and
+`mach-agent` containers go to GHCR.
+
+The agent image is for machines that run as containers: enroll it headlessly
+with `MACH_SERVER`, `MACH_API_KEY` (an enroll-scoped key) and `MACH_NAME`
+(org-prefixed), mount a volume at `/data` for the identity and config, and
+restate the machine's own command policy as `MACH_POLICY`. The key is read
+once, at enrollment, and can be revoked afterwards; a container that has
+already enrolled just needs the volume to keep its enrollment across
+restarts. Pushed updates are refused inside the container (the agent updates
+by rewriting its own executable, which the image's permissions do not allow) —
+pull the next image instead, and the fleet table's `differs` badge is what
+flags any container left behind.
 
 The tag is also the version: `v0.3.0` publishes binaries and an image that
 report `0.3.0` (the leading `v` is stripped). So `mach version` inside a

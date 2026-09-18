@@ -30,3 +30,20 @@ services:
       # Empty means ANY identity the issuer verifies may manage the fleet. Set it
       # unless that is what you mean.
       MACH_OIDC_ALLOWED_DOMAINS: ${MACH_OIDC_ALLOWED_DOMAINS:-}
+
+  # An agent on a machine that runs as a container. Enrolls headlessly on
+  # first start; identity and config live in the mounted volume, so restarts
+  # reconnect instead of re-enrolling. The enroll key is read once and can be
+  # revoked afterwards. MACH_POLICY (the machine's own command policy) passes
+  # through as an ordinary environment variable.
+  # mach-agent:
+  #   image: mach-agent:latest        # or ghcr.io/<owner>/mach-agent
+  #   restart: unless-stopped
+  #   volumes:
+  #     - ./data/agent:/data
+  #   environment:
+  #     MACH_SERVER: https://mach.example.com
+  #     MACH_API_KEY: <enroll-scoped key, read once at enrollment>
+  #     MACH_NAME: acme-container-1     # org-prefixed
+  #     # MACH_POLICY: |                # the machine's own block list
+  #     #   deny:rm -rf

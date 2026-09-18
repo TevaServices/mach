@@ -11,7 +11,8 @@
 #     Envelopes are made with `mach-server attest` and re-verified per matrix
 #     leg — a build from a dirty tree or with no VCS revision fails the release.
 #   - the signing key's public half (hex ed25519) in the release notes
-# and to GHCR: a multi-arch (linux/amd64 + linux/arm64) mach-server container.
+# and to GHCR: multi-arch (linux/amd64 + linux/arm64) mach-server and
+# mach-agent containers.
 #
 # Signing: attestations are signed with an ed25519 key supplied through the
 # MACH_RELEASE_SIGNING_KEY secret (hex-encoded private key; generate one with
@@ -190,10 +191,59 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
+  agent-container:
+    name: multi-arch agent image (ghcr)
+    runs-on: ubuntu-latest
+    needs: gate
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "image=${owner}/mach-agent" >> "$GITHUB_OUTPUT"
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # The agent container is built from Dockerfile.agent (see its header for
+      # why pushed updates are refused inside it). Same MACH_VERSION stamp as
+      # the server image, so `mach version` in either container and the GHCR
+      # tags all report the same release.
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.agent
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            MACH_VERSION=${{ steps.meta.outputs.version }}
+          tags: |
+            ghcr.io/${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ steps.meta.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.title=mach-agent
+            org.opencontainers.image.description=mach agent (outbound-only daemon)
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
   release:
     name: publish GitHub release
     runs-on: ubuntu-latest
-    needs: [binaries, container]
+    needs: [binaries, container, agent-container]
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -230,7 +280,9 @@ jobs:
           fi
           mv ../bundle.jsonl mach-attestations.intoto.jsonl
           cat > ../release-body.md <<EOF
-          **Container image:** \`ghcr.io/${{ needs.container.outputs.image }}:${{ needs.container.outputs.version }}\` (also \`:latest\`), linux/amd64 + linux/arm64 — image digest \`${{ needs.container.outputs.digest }}\`.
+          **Container images** (linux/amd64 + linux/arm64):
+          - \`ghcr.io/${{ needs.container.outputs.image }}:${{ needs.container.outputs.version }}\` (also \`:latest\`) — the control plane; image digest \`${{ needs.container.outputs.digest }}\`
+          - \`ghcr.io/${{ needs.agent-container.outputs.image }}:${{ needs.container.outputs.version }}\` (also \`:latest\`) — the outbound-only agent, for machines that run as containers; image digest \`${{ needs.agent-container.outputs.digest }}\`. Enrolls headlessly from \`MACH_SERVER\` / \`MACH_API_KEY\` / \`MACH_NAME\` and state lives entirely in the \`/data\` volume; pushed updates are refused inside it (see Dockerfile.agent) — update by pulling the next image.
 
           **Client:** the mach binary (agent + console) for linux / darwin / windows, amd64 + arm64.
 

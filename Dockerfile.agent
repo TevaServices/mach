@@ -1,0 +1,105 @@
+# syntax=docker/dockerfile:1
+# Multi-stage build: no Go toolchain needed on the host.
+#
+# The mach-agent image is the outbound-only agent (the `mach` binary's
+# daemon side) for machines that run as containers rather than hosts with an
+# installed service. Enrollment is headless, driven entirely by environment:
+#
+#   docker run -d --name mach-agent \
+#     -e MACH_SERVER=https://mach.example.com \
+#     -e MACH_API_KEY=<enroll-scoped key> \
+#     -e MACH_NAME=acme-container-1 \
+#     -v mach-agent-state:/data \
+#     ghcr.io/bcross/mach-agent
+#
+# On first start the entrypoint enrolls with those credentials; on every start
+# after that it execs `mach run`, which dials out, signs in and reconnects with
+# backoff. Identity, E2E key and config live only in the mounted state
+# directory — nothing is baked into the image. MACH_POLICY (the per-machine
+# command policy) passes through as an ordinary environment variable, the same
+# lever an installed agent gets.
+#
+# The toolchain is pinned to the go directive in go.mod. Keep them in step:
+# the release attestation records which toolchain built each binary, and a
+# mismatch here is exactly the kind of drift the attestation exists to expose.
+#
+# .git is deliberately not excluded via .dockerignore: Go stamps the VCS
+# revision into the binary, which is what lets a shipped binary be traced to
+# a commit. Build from a clean checkout.
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+# go.sum too, so the layer is verified against the committed hashes rather than
+# letting `go mod download` write a fresh go.sum for whatever the proxy served.
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+# The release workflow passes the tag in (v0.4.0 becomes 0.4.0). A plain
+# `docker build` leaves this empty, and empty has to mean "no override" rather
+# than an empty version — hence the guard below, which never emits -X without a
+# value. The version literal itself lives in exactly one file
+# (internal/version/version.go) and is deliberately not repeated here.
+ARG MACH_VERSION=
+RUN <<EOF
+set -e
+export CGO_ENABLED=0
+LDFLAGS="-s -w"
+if [ -n "$MACH_VERSION" ]; then
+  LDFLAGS="$LDFLAGS -X github.com/bcross/mach/internal/version.Version=$MACH_VERSION"
+fi
+go build -trimpath -ldflags "$LDFLAGS" -o /out/mach ./cmd/mach
+EOF
+# The entrypoint is authored here rather than as a repo file so the image
+# carries exactly the script its Dockerfile says it does — the same rule that
+# keeps the server image's binaries compiled in rather than copied.
+COPY --chmod=0755 <<'EOF' /out/entrypoint
+#!/bin/sh
+set -e
+# An explicit command overrides the daemon (docker run IMAGE mach version):
+# standard image convention, and `mach version` in a container is how an
+# operator pins which build they are looking at.
+if [ "$#" -gt 0 ]; then
+  exec "$@"
+fi
+STATE_DIR="${MACH_STATE_DIR:-/data}"
+export MACH_STATE_DIR="$STATE_DIR"
+
+# An existing config is the record that this container has an enrollment it
+# should reconnect to, not re-enroll: enrollment mints a new identity, and a
+# new identity per restart would look like a different machine to the control
+# plane. Only missing credentials is an error — there is nothing to run.
+if [ -f "$STATE_DIR/config.json" ]; then
+  exec mach run
+fi
+
+if [ -z "$MACH_SERVER" ] || [ -z "$MACH_API_KEY" ] || [ -z "$MACH_NAME" ]; then
+  echo "mach-agent: not enrolled and no credentials to enroll with." >&2
+  echo "  Set MACH_SERVER (control plane URL), MACH_API_KEY (an enroll-scoped" >&2
+  echo "  key) and MACH_NAME (org-prefixed machine name), then restart." >&2
+  echo "  The key is read once, at enrollment; it can be revoked afterwards." >&2
+  exit 1
+fi
+
+mach register --server "$MACH_SERVER" --api-key "$MACH_API_KEY" --name "$MACH_NAME"
+exec mach run
+EOF
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates && adduser -D -H -u 6200 mach
+COPY --from=build /out/mach /usr/local/bin/mach
+COPY --from=build /out/entrypoint /usr/local/bin/entrypoint
+# /data is created (and owned) in the image on purpose: a named volume mounted
+# over it inherits this ownership, which is the only reason the `mach` user can
+# write its identity, E2E key and config there on first enroll. (A bind mount
+# has the host directory's owner instead — pre-create it with uid 6200.)
+RUN mkdir -p /data && chown mach:mach /data
+VOLUME /data
+ENV MACH_STATE_DIR=/data
+USER mach
+ENTRYPOINT ["/usr/local/bin/entrypoint"]
+
+# Pushed updates are refused here, on purpose, by filesystem permission: the
+# agent applies an update by rewriting its own executable, and in this image
+# that path is root-owned and the process runs as `mach`. A container's update
+# path is the registry's, not the control plane's — pull the next image and
+# restart the container. The machine then reports the image's version, and the
+# fleet table's `differs` badge is what flags any container left behind.
