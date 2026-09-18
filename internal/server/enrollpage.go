@@ -73,8 +73,6 @@ type enrollData struct {
 	// from an explicit tab click, so the page can say which it was.
 	Detected bool
 	All      []platformRow
-	// Tabs is only set on the full page; the fragment ignores it.
-	Tabs []enrollTab
 }
 
 type platformRow struct {
@@ -169,6 +167,12 @@ var enrollTabs = []enrollTab{
 	{"Windows arm64", "windows", "arm64"},
 }
 
+// enrollPageData is the full page: the recommendation plus the tabs that can
+// replace it. Tabs lives here and NOT on enrollData, because a field on the
+// embedded struct is shadowed by one of the same name on the outer — the page
+// set the inner slice while `{{range .Tabs}}` read the outer nil one, so the
+// "Choose a platform" row rendered empty and an operator whose user agent was
+// guessed wrong could not switch to their actual platform.
 type enrollPageData struct {
 	enrollData
 	Tabs []enrollTab
@@ -204,9 +208,8 @@ func (s *Server) handleEnrollRoot(w http.ResponseWriter, r *http.Request) {
 	data := s.enrollDataFor(osKey, arch, pretty)
 	data.Detected = true
 	data.Orgs = s.ListOrgs()
-	data.Tabs = enrollTabs
 	s.renderIntoShell(w, http.StatusOK, uiShellData{Title: "mach — set up a machine", Public: true},
-		enrollTemplate, "enroll", enrollPageData{enrollData: data})
+		enrollTemplate, "enroll", enrollPageData{enrollData: data, Tabs: enrollTabs})
 }
 
 // handleEnrollPlatform serves one platform's recommendation as a fragment, for

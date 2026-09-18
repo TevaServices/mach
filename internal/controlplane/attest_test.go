@@ -175,6 +175,7 @@ func TestPushUpdateQueuesAttestedBinary(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
+	seedMachine(t, "mach-b")
 	if err := PushUpdate("mach-b", shipped, "1.2.3", att); err != nil {
 		t.Fatalf("push-update: %v", err)
 	}
@@ -205,6 +206,7 @@ func TestPushUpdateRejectsEmptyBinary(t *testing.T) {
 // operator is rolling out a locally built binary and has nothing to attest.
 func TestPushUpdateWithoutAttestationStillWorks(t *testing.T) {
 	_, bin := setup(t)
+	seedMachine(t, "mach-d")
 	if err := PushUpdate("mach-d", bin, "1.2.3", ""); err != nil {
 		t.Fatalf("push-update: %v", err)
 	}
@@ -239,5 +241,36 @@ func TestVerifyRejectsForeignSignature(t *testing.T) {
 	}
 	if err := VerifyAttestation(path, bin); err == nil {
 		t.Fatal("verify-attestation accepted an attestation signed by another key")
+	}
+}
+
+// push-update must seedMachine the target it is told to update. Queueing for a
+// name no machine has ever held is how a typo looks like a completed rollout:
+// pending_updates has no foreign key, so the row would sit there forever while
+// the command printed "delivered on next connect".
+func seedMachine(t *testing.T, name string) {
+	t.Helper()
+	st, err := store.Open(dbPath())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	if err := st.CreateMachine(name, "pub-"+name, "h", "linux", "amd64", "v", "", false); err != nil {
+		t.Fatalf("seed %s: %v", name, err)
+	}
+}
+
+// An unknown machine is refused rather than queued, and nothing is written.
+func TestPushUpdateRejectsUnknownMachine(t *testing.T) {
+	_, bin := setup(t)
+	err := PushUpdate("mach-typo", bin, "1.2.3", "")
+	if err == nil {
+		t.Fatal("push-update queued an update for a machine that does not exist")
+	}
+	if !strings.Contains(err.Error(), "unknown machine") {
+		t.Fatalf("error = %q, want it to name the unknown machine", err)
+	}
+	if _, ok := queued(t, "mach-typo"); ok {
+		t.Fatal("an update was queued for an unknown machine")
 	}
 }
