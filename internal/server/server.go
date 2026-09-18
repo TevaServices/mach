@@ -459,10 +459,20 @@ func hasScope(scopes, want string) bool {
 
 // execAllowlist returns the machines an exec-scoped key may touch.
 // (nil, true) means unrestricted (exec:* or a non-exec scope the caller has
-// already vetted); (names, false) restricts to those machine names,
-// case-insensitively. Accepts both allowlist separators: "exec:m1|m2" and
-// "exec:m1,m2" (the comma form was the documented one in the store, so bare
-// comma segments following an exec: entry are absorbed into its allowlist).
+// already vetted); (names, false) restricts to those machine names.
+// Accepts both allowlist separators: "exec:m1|m2" and "exec:m1,m2" (the comma
+// form was the documented one in the store, so bare comma segments following an
+// exec: entry are absorbed into its allowlist).
+//
+// Names are matched exactly, because that is how the store matches them: the
+// uniqueness constraint, MachineByName and the whole dispatch path are
+// case-sensitive, nothing lowercases the machine part at enrollment, and
+// ValidMachinePart accepts uppercase. Folding case here therefore did not make
+// the allowlist forgiving of a name's spelling — it made a key scoped to
+// `bcross-web` authorize exec (and fleet and audit reads) on a *different*
+// machine, `bcross-Web`, which can be enrolled alongside it. A scope check that
+// admits a name the rest of the control plane treats as another machine is a
+// widening, not a convenience.
 func execAllowlist(scopes string) (allowed []string, all bool) {
 	segs := strings.Split(scopes, ",")
 	for i := 0; i < len(segs); i++ {
@@ -483,7 +493,7 @@ func execAllowlist(scopes string) (allowed []string, all bool) {
 			i = j
 		}
 		for _, m := range splitAny(allow, ",|") {
-			if m = strings.ToLower(strings.TrimSpace(m)); m != "" {
+			if m = strings.TrimSpace(m); m != "" {
 				allowed = append(allowed, m)
 			}
 		}
@@ -501,7 +511,6 @@ func keyCanExecOn(scopes, machine string) bool {
 	if all {
 		return true
 	}
-	machine = strings.ToLower(machine)
 	for _, m := range allowed {
 		if m == machine {
 			return true

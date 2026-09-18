@@ -171,6 +171,19 @@ func (b *Broker) UnbindStream(sessionID string) {
 }
 
 // SendToStream routes a frame to the bound console channel, if any.
+//
+// A full buffer drops an output chunk — that is the documented best-effort trade,
+// and it is what keeps a console that has stopped reading from stalling the agent
+// pump that serves every other command on the connection.
+//
+// The terminal record is the exception, and it is not a nicety. stream_end is how
+// the console learns the exit status, and a console that never receives one waits
+// forever: it has no read deadline (the relay's own pings keep the socket healthy
+// even when nothing else arrives), so a dropped terminal frame is an interactive
+// session that hangs with no output and no status, and an audit row written as
+// "the command's fate on the machine is unknown" for a command that finished
+// cleanly. So it makes room by discarding one already-queued output chunk
+// instead: output is lossy by design and the status is not.
 func (b *Broker) SendToStream(sessionID string, env protocol.Envelope) {
 	b.mu.Lock()
 	bind, ok := b.streams[sessionID]
@@ -180,7 +193,22 @@ func (b *Broker) SendToStream(sessionID string, env protocol.Envelope) {
 	}
 	select {
 	case bind.console <- env:
-	default: // slow console: drop the chunk (documented best-effort)
+		return
+	default:
+	}
+	if env.Type != "stream_end" {
+		return
+	}
+	// Exactly one goroutine writes a given session's channel (the agent's read
+	// pump), so an eviction here cannot race another producer; the only other
+	// actor is the reader, which is what emptied the slot we just freed.
+	select {
+	case <-bind.console:
+	default:
+	}
+	select {
+	case bind.console <- env:
+	default: // lost the race with a refilling producer; better than blocking
 	}
 }
 
