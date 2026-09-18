@@ -14,7 +14,9 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/bcross/mach/internal/protocol"
 	"github.com/gorilla/websocket"
@@ -28,6 +30,12 @@ const (
 	streamDialFailed = 3 // the endpoint could not be reached at all
 	streamLost       = 4 // the stream started, then ended without an exit status
 )
+
+// killGrace bounds how long the console waits for the terminal record after a
+// kill. A killed process goes at once, so reaching this means the machine is not
+// honouring the kill — an agent older than the frame's meaning — and waiting
+// longer would just be a console with no way out.
+const killGrace = 15 * time.Second
 
 // streamConsole connects to the streaming endpoint and runs one command,
 // printing output as it arrives. Returns the remote exit code.
@@ -56,16 +64,44 @@ func streamConsole(server, apiKey, machine, command string) int {
 		return streamDialFailed
 	}
 
-	// Ctrl-C: tell the agent to kill the session.
+	// Ctrl-C belongs to the remote command while it runs: the banner promises a
+	// kill, and this is what delivers it. InterruptGuard stands down for the
+	// window this flag is set, so the signal lands here rather than exiting the
+	// process before the frame is written.
+	//
+	// A second Ctrl-C gives up waiting and disconnects — the honest answer for
+	// an agent too old to honour a kill, and for a command that ignores SIGKILL
+	// (nothing does, but the operator needs a way out either way). So does a
+	// grace deadline, so an unattended console cannot wait on a kill forever.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sig)
+	streamOwnsInterrupt.Store(true)
+	defer streamOwnsInterrupt.Store(false)
+	// killed records that a kill was asked for, so a stream that ends without a
+	// terminal record can say which of the two things happened.
+	var killed atomic.Bool
 	go func() {
-		<-sig
-		_ = ws.WriteMessage(websocket.TextMessage, mustJSON(protocol.Envelope{
-			Type:    "stream_kill",
-			ReqID:   "console",
-			Payload: json.RawMessage("{}"),
-		}))
+		first := true
+		for range sig {
+			if !first {
+				fmt.Fprintln(os.Stderr, "\nmach: disconnecting; the command may still be running on "+machine)
+				os.Exit(130)
+			}
+			first = false
+			killed.Store(true)
+			fmt.Fprintln(os.Stderr, "\nmach: kill sent — press Ctrl-C again to disconnect without waiting")
+			_ = ws.WriteMessage(websocket.TextMessage, mustJSON(protocol.Envelope{
+				Type:    "stream_kill",
+				ReqID:   "console",
+				Payload: json.RawMessage("{}"),
+			}))
+			// Bound the wait for the terminal record. It has to be a read
+			// deadline rather than a timer in this loop: a killed command is
+			// usually a silent one, so the loop sits in ReadMessage and a timer
+			// beside it would never fire.
+			_ = ws.SetReadDeadline(time.Now().Add(killGrace))
+		}
 	}()
 
 	exit := 0
@@ -76,6 +112,11 @@ func streamConsole(server, apiKey, machine, command string) int {
 			// success: the command may still be running on the machine, and its
 			// output was cut off. Reporting 0 here would make a broken relay
 			// look like a command that ran cleanly.
+			if killed.Load() {
+				fmt.Fprintln(os.Stderr,
+					"\nmach: the remote command did not stop after the kill — it may still be running on "+machine)
+				return streamLost
+			}
 			fmt.Fprintln(os.Stderr,
 				"mach: the stream ended without an exit status — the command may still be running on "+machine)
 			return streamLost

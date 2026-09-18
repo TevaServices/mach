@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bcross/mach/internal/protocol"
@@ -79,20 +81,32 @@ func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{
 		end(protocol.StreamEnd{ExitCode: 126, Error: err.Error()})
 		return
 	}
-	// Route stdin/kill frames to this session until it ends.
-	unregister := registerLiveSession(env.ReqID, stdinPipe)
+	// kill stops this session's command. It is idempotent — once() is not
+	// decoration: `close(sess.done)` used to be the whole of it, so a second
+	// stream_kill frame for one session panicked with "close of closed channel".
+	// Nothing recovers a panic in the frame loop, so the agent process died, and
+	// a duplicate (or replayed) frame was enough to do it.
+	var killed atomic.Bool
+	var killOnce sync.Once
+	kill := func() {
+		killOnce.Do(func() {
+			killed.Store(true)
+			// Both halves, in this order. Closing stdin is what lets a command
+			// that reads it see EOF; the group signal is what stops one that does
+			// not, which closing stdin never did.
+			_ = stdinPipe.Close()
+			killProcessTree(c)
+			// CommandContext's own kill covers the platforms where
+			// killProcessTree is a no-op (windows), and makes Wait return.
+			cancel()
+		})
+	}
+	// Route stdin/kill frames to this session until it ends. Writes happen on
+	// this goroutine, never on the frame loop that feeds the queue — see
+	// handleStreamInput.
+	input, unregister := registerLiveSession(env.ReqID, stdinPipe, kill)
 	defer unregister()
-	// Close stdin when the session is killed remotely.
-	go func() {
-		sessionMu.Lock()
-		sess := liveSessions[env.ReqID]
-		sessionMu.Unlock()
-		if sess == nil {
-			return
-		}
-		<-sess.done
-		_ = stdinPipe.Close()
-	}()
+	go pumpSessionInput(input, stdinPipe)
 
 	// Output pumps: chunk → stream_out frames.
 	done := make(chan struct{}, 2)
@@ -142,6 +156,13 @@ func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{
 	errText := ""
 	switch {
 	case runErr == nil:
+	case killed.Load():
+		// Deliberately killed rather than timed out: the two produce the same
+		// runErr (the context was cancelled), and reporting an operator's Ctrl-C
+		// as "timed out" would be a lie about who ended the session. 130 is the
+		// exit status a shell reports for Ctrl-C.
+		exitCode = 130
+		errText = "killed"
 	case ctx.Err() != nil:
 		exitCode = -1
 		errText = "timed out"
