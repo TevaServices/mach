@@ -110,6 +110,33 @@ MACH_DB="$DB" MACH_LISTEN="127.0.0.1:$PORT" \
   MACH_EXEC_POLICY_FILE="$WORKDIR/fleet.policy" \
   "$WORKDIR/mach-server" serve >"$WORKDIR/server.log" 2>&1 &
 SERVER_PID=$!
+# Wait for OUR control plane to be up — not merely for something to answer on
+# the port. A mach-server left over from an earlier run keeps it, the new one
+# fails to bind with nothing but "address already in use" in a log nobody reads,
+# and the stale server — holding a different database — then answers every
+# request. Sign-in still works against it, so the failures look like dozens of
+# unrelated broken assertions rather than one occupied port.
+#
+# Two conditions, because either alone is fooled: the process must still be
+# ALIVE (a failed bind is a log.Fatal, so the process exits), and it must have
+# logged that it is listening. The log line alone proves nothing — it is written
+# before ListenAndServe returns — and liveness alone would pass while the server
+# was still migrating.
+for i in $(seq 1 40); do
+  kill -0 "$SERVER_PID" 2>/dev/null || break
+  grep -q "listening on" "$WORKDIR/server.log" 2>/dev/null && break
+  sleep 0.25
+done
+if ! kill -0 "$SERVER_PID" 2>/dev/null || ! grep -q "listening on" "$WORKDIR/server.log" 2>/dev/null; then
+  echo
+  echo "FATAL: this run's control plane is not the one answering on $BASE."
+  echo "       It exited, or never bound — almost always another mach-server holding"
+  echo "       the port, whose database is not the one under test. Every result from"
+  echo "       this run would have been about that one."
+  echo "       Check with: lsof -nP -iTCP:$PORT -sTCP:LISTEN"
+  sed -n '1,5p' "$WORKDIR/server.log" 2>/dev/null | sed 's/^/       server log: /'
+  exit 1
+fi
 for i in $(seq 1 20); do
   curl -fsS "$BASE/healthz" >/dev/null 2>&1 && break
   sleep 0.3
@@ -819,6 +846,17 @@ for i in $(seq 1 30); do
   curl -fsS "$UI_BASE/healthz" >/dev/null 2>&1 && break
   sleep 0.3
 done
+# Same guard as the primary (see "control plane up"): this section runs its own
+# control plane on its own port, and a stale one from a previous run answers in
+# its place. Here that is worse than a confusing failure — sign-in would appear
+# to work, against a database that is not the one under test.
+if ! kill -0 "$UI_SERVER_PID" 2>/dev/null || ! grep -q "listening on" "$WORKDIR/ui-server.log" 2>/dev/null; then
+  echo
+  echo "FATAL: this run's UI control plane is not the one answering on $UI_BASE."
+  echo "       Check with: lsof -nP -iTCP:$UI_PORT -sTCP:LISTEN"
+  sed -n '1,5p' "$WORKDIR/ui-server.log" 2>/dev/null | sed 's/^/       server log: /'
+  exit 1
+fi
 curl -fsS "$UI_BASE/healthz" >/dev/null; check "second control plane up (UI+OIDC configured)" $?
 
 UI_ENROLL=$(MACH_DB="$UI_DB" "$WORKDIR/mach-server" add-api-key ui-enroll enroll | grep -oE 'mach_[a-f0-9]+')
