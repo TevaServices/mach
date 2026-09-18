@@ -171,7 +171,7 @@ jobs:
       # excluding it). Note: the agent binaries baked into the image are not
       # attested — push-update --attestation covers runtime pushes only.
       - id: push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -227,7 +227,7 @@ jobs:
       # the server image, so `mach version` in either container and the GHCR
       # tags all report the same release.
       - id: push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.agent
