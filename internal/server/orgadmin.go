@@ -28,6 +28,9 @@ type orgRow struct {
 type orgsData struct {
 	Rows []orgRow
 	CSRF string
+	// Notice is the fixed sentence for the action that just happened, rendered
+	// out of band by the *action* defines. See fleetData.Notice.
+	Notice string
 }
 
 // memberData is one org's membership view.
@@ -55,6 +58,9 @@ type memberData struct {
 	// this org can take effect and the page says so instead of offering a control
 	// that does nothing.
 	E2EPinned bool
+	// Notice is the fixed sentence for the action that just happened, rendered
+	// out of band by the *action* defines. See fleetData.Notice.
+	Notice string
 }
 
 func (s *Server) orgRows() ([]orgRow, error) {
@@ -147,19 +153,19 @@ func keyFleetWide(scopes string) bool {
 func (s *Server) handleUIOrgAdd(w http.ResponseWriter, r *http.Request, sess uiSession) {
 	org := strings.ToLower(strings.TrimSpace(r.PostFormValue("org")))
 	if !store.ValidOrgLabel(org) {
-		s.uiRefuse(w, http.StatusBadRequest, "an org must be 2-20 characters: letters, digits and hyphen")
+		s.uiFail(w, r, http.StatusBadRequest, "an org must be 2-20 characters: letters, digits and hyphen")
 		return
 	}
 	if s.orgRegistered(org) {
-		s.uiRefuse(w, http.StatusConflict, "org is already configured")
+		s.uiFail(w, r, http.StatusConflict, "org is already configured")
 		return
 	}
 	if err := s.st.CreateOrg(org, sess.Ident.Subject); err != nil {
 		if errors.Is(err, store.ErrOrgExists) {
-			s.uiRefuse(w, http.StatusConflict, "org is already configured")
+			s.uiFail(w, r, http.StatusConflict, "org is already configured")
 			return
 		}
-		s.uiRefuse(w, http.StatusInternalServerError, "store error")
+		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 		return
 	}
 	// Logged with the operator's subject: org changes are not per-machine, so
@@ -172,12 +178,19 @@ func (s *Server) handleUIOrgAdd(w http.ResponseWriter, r *http.Request, sess uiS
 func (s *Server) handleUIOrgRemove(w http.ResponseWriter, r *http.Request, sess uiSession) {
 	org := strings.ToLower(strings.TrimSpace(r.PostFormValue("org")))
 	if s.orgPinned(org) {
-		s.uiRefuse(w, http.StatusConflict,
-			"org "+org+" comes from MACH_ORG/MACH_ORGS and cannot be removed from here")
+		// A FIXED sentence, with no echo of the submitted value — every other
+		// refusal in the UI is a fixed literal, and this one used to interpolate
+		// the posted org. The echo was bounded rather than arbitrary: reaching this
+		// branch at all requires orgPinned, so the value could only ever be a name
+		// that is already printed in the org list. It is still request text
+		// reaching a rendered page, and removing the whole class is cheaper than
+		// reasoning about how narrow it is.
+		s.uiFail(w, r, http.StatusConflict,
+			"That org comes from the environment (MACH_ORG/MACH_ORGS) and cannot be removed from here.")
 		return
 	}
 	if !s.orgRegistered(org) {
-		s.uiRefuse(w, http.StatusNotFound, "unknown org")
+		s.uiFail(w, r, http.StatusNotFound, "No org by that name.")
 		return
 	}
 	// Refused while machines exist, deliberately. Removing an org does not revoke
@@ -186,16 +199,16 @@ func (s *Server) handleUIOrgRemove(w http.ResponseWriter, r *http.Request, sess 
 	// their existing names, which is a confusing state to discover later.
 	machines, err := s.st.ListMachines()
 	if err != nil {
-		s.uiRefuse(w, http.StatusInternalServerError, "store error")
+		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 		return
 	}
 	if n := countMachinesInOrg(machines, org); n > 0 {
-		s.uiRefuse(w, http.StatusConflict,
+		s.uiFail(w, r, http.StatusConflict,
 			"org "+org+" still has "+strconv.Itoa(n)+" machine(s); block, revoke or delete them first")
 		return
 	}
 	if err := s.st.DeleteOrg(org); err != nil {
-		s.uiRefuse(w, http.StatusInternalServerError, "store error")
+		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 		return
 	}
 	s.logf("ui: org removed: %q (by %q)", org, sess.Ident.Subject)
@@ -206,7 +219,7 @@ func (s *Server) handleUIOrgE2E(w http.ResponseWriter, r *http.Request, sess uiS
 	org := strings.ToLower(strings.TrimSpace(r.PostFormValue("org")))
 	mode := strings.ToLower(strings.TrimSpace(r.PostFormValue("mode")))
 	if !s.orgRegistered(org) {
-		s.uiRefuse(w, http.StatusNotFound, "unknown org")
+		s.uiFail(w, r, http.StatusNotFound, "No org by that name.")
 		return
 	}
 	var err error
@@ -218,11 +231,11 @@ func (s *Server) handleUIOrgE2E(w http.ResponseWriter, r *http.Request, sess uiS
 	case "inherit":
 		err = ClearE2E(s.st, org)
 	default:
-		s.uiRefuse(w, http.StatusBadRequest, "mode must be on, off or inherit")
+		s.uiFail(w, r, http.StatusBadRequest, "mode must be on, off or inherit")
 		return
 	}
 	if err != nil {
-		s.uiRefuse(w, http.StatusInternalServerError, "store error")
+		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 		return
 	}
 	// MACH_E2E still wins over a stored row; say so rather than reporting a write
@@ -238,11 +251,12 @@ func (s *Server) handleUIOrgE2E(w http.ResponseWriter, r *http.Request, sess uiS
 		if r.Header.Get("HX-Request") != "" {
 			data, err := s.orgMembership(org)
 			if err != nil {
-				http.Error(w, "store error", http.StatusInternalServerError)
+				s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 				return
 			}
 			data.CSRF = sess.CSRF
-			s.renderFragment(w, sess, uiTmpl, "orge2e", data)
+			data.Notice = uiNoticeText("e2eset")
+			s.renderFragment(w, sess, uiTmpl, "orge2eaction", data)
 			return
 		}
 		// Built from the org we just validated against the configured list, never
@@ -257,10 +271,12 @@ func (s *Server) refreshOrgs(w http.ResponseWriter, r *http.Request, sess uiSess
 	if r.Header.Get("HX-Request") != "" {
 		rows, err := s.orgRows()
 		if err != nil {
-			http.Error(w, "store error", http.StatusInternalServerError)
+			s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 			return
 		}
-		s.renderFragment(w, sess, uiTmpl, "orgs", orgsData{Rows: rows, CSRF: sess.CSRF})
+		s.renderFragment(w, sess, uiTmpl, "orgsaction", orgsData{
+			Rows: rows, CSRF: sess.CSRF, Notice: uiNoticeText(noticeCode),
+		})
 		return
 	}
 	http.Redirect(w, r, "/ui/orgs?n="+noticeCode, http.StatusSeeOther)

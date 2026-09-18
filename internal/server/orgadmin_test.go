@@ -31,7 +31,10 @@ func TestUIOrgE2EOffTheListAndOntoTheOrgPage(t *testing.T) {
 			t.Errorf("the orgs list still carries %q; the control belongs on the org page", gone)
 		}
 	}
-	if !strings.Contains(list, "<th>E2E</th>") {
+	// scope="col" is part of the assertion on purpose: the header cell has to say
+	// which cells it heads, which is what lets a screen reader read the E2E column
+	// as a column rather than as a list of loose values.
+	if !strings.Contains(list, `<th scope="col">E2E</th>`) {
 		t.Error("the orgs list no longer shows the E2E column header")
 	}
 

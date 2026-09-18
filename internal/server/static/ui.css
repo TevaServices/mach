@@ -1,0 +1,282 @@
+/* ui.css — the visual language of every page this control plane serves.
+ *
+ * Three pages share it: the signed-in operator UI, the public enrollment page
+ * (which renders through the same shell), and the phone-facing pair page.
+ *
+ * The pair page cannot use the shell — it is reached from a QR code by an
+ * anonymous visitor and keeps its strict `default-src 'none'`, so it must not
+ * load htmx or app.js — but it still needs to look like the same product. It
+ * therefore does not link this file: it is built at init from these same bytes
+ * and inlined into its own <style>. One authored stylesheet, two delivery
+ * mechanisms, so the two cannot drift apart — which is how they looked when each
+ * carried its own hardcoded colours.
+ *
+ * COLOUR GOES THROUGH CUSTOM PROPERTIES, NEVER LITERALS, outside @layer tokens.
+ * Every page honours the viewer's light/dark preference (`color-scheme: light
+ * dark`), and a hardcoded #111 background is unreadable in one of the two —
+ * which is exactly how the enrollment page's download button and command block
+ * read on a dark screen before this. A test enforces it.
+ *
+ * LAYER ORDER, AND THE ONE THING TO KNOW ABOUT IT: an UNLAYERED rule outranks
+ * every layered rule, whatever their specificity. That is why the pair page can
+ * append its own small block after this file and have it win without fighting
+ * specificity — and it is also the trap: a rule added to this file outside a
+ * @layer block would silently beat the entire stylesheet. Keep everything in a
+ * layer.
+ */
+@layer tokens, base, layout, components, utilities;
+
+@layer tokens {
+  :root {
+    color-scheme: light dark;
+
+    --fg: #16181d; --bg: #ffffff;
+    --muted: #6b7280; --line: #8883; --panel: #8881;
+    --accent-bg: #16181d; --accent-fg: #ffffff;
+    --ok: #1a7f37; --warn: #a06000; --bad: #b3261e;
+    /* The focus ring has to clear both the page and the control it sits on, so
+     * it is its own token rather than a reuse of --accent-bg (which is nearly
+     * the same as the body text colour and vanishes against a dark background).
+     */
+    --focus: #2563eb;
+
+    --space-1: .25rem; --space-2: .5rem; --space-3: .8rem;
+    --space-4: 1rem; --space-5: 1.5rem; --space-6: 3rem;
+    --radius-1: .2rem; --radius-2: .3rem; --radius-3: .4rem;
+    --radius-pill: .6rem;
+    /* One measure for the whole product: the operator UI and the two public
+     * pages share a column so a screenshot of any of them reads as the same
+     * app. The pair page narrows it locally, on purpose (see pairpages.go).
+     */
+    --measure: 64rem;
+    --font-sans: -apple-system, system-ui, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e6e8ec; --bg: #14161a;
+      --muted: #9aa1ab; --line: #8884; --panel: #8882;
+      --accent-bg: #e6e8ec; --accent-fg: #14161a;
+      --ok: #4ac26b; --warn: #d29922; --bad: #f85149;
+      --focus: #6ea8fe;
+    }
+  }
+}
+
+@layer base {
+  * { box-sizing: border-box; }
+
+  body {
+    font-family: var(--font-sans);
+    margin: 0;
+    padding: 0 var(--space-4) var(--space-6);
+    max-width: var(--measure);
+    margin-inline: auto;
+    line-height: 1.45;
+    background: var(--bg);
+    color: var(--fg);
+  }
+
+  /* Every interactive element gets a ring. There was none anywhere before, so
+   * a keyboard user had the browser default — which is invisible against this
+   * page in dark mode — or, on the buttons, nothing distinguishable at all.
+   */
+  a:focus-visible,
+  button:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible,
+  summary:focus-visible,
+  [tabindex]:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+  }
+
+  code {
+    font-family: var(--font-mono);
+    background: var(--panel);
+    padding: .05rem .3rem;
+    border-radius: var(--radius-1);
+  }
+
+  table { border-collapse: collapse; width: 100%; }
+  th, td {
+    text-align: left;
+    padding: .45rem .6rem;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  th {
+    font-size: .8rem;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    color: var(--muted);
+  }
+
+  button {
+    font: inherit;
+    padding: .3rem .7rem;
+    cursor: pointer;
+    border-radius: var(--radius-2);
+    border: 1px solid var(--line);
+    background: transparent;
+    color: inherit;
+  }
+
+  input[type=text], select { font: inherit; padding: .3rem .4rem; }
+
+  form.inline { display: inline; }
+}
+
+@layer layout {
+  .site-header nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-4);
+    align-items: center;
+    padding: var(--space-4) 0;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: var(--space-5);
+  }
+
+  /* The two halves of the nav row. .nav-right is the one that is pushed to the
+   * end, and it is a group rather than a single element on purpose: the account
+   * block used to carry margin-left:auto itself, so the version span beside it
+   * became the rightmost thing on the page and the account controls sat to its
+   * left. Grouping them makes the account actions rightmost, which is where they
+   * are looked for.
+   */
+  .nav-links { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-4); }
+  .nav-links a { text-decoration: none; color: inherit; font-weight: 600; }
+  .nav-links a[aria-current] { text-decoration: underline; }
+  .nav-right {
+    margin-left: auto;
+    display: flex; flex-wrap: wrap; align-items: center;
+    justify-content: flex-end; gap: var(--space-3);
+  }
+  .nav-right .who { font-size: .85rem; color: var(--muted); }
+
+  /* Off-screen until focused, then dropped into the top-left corner. Only a
+   * keyboard can reach it, so :focus rather than :focus-visible — the two are
+   * the same thing here, and :focus cannot silently stop matching.
+   */
+  .skip-link {
+    position: absolute;
+    left: -10000px;
+    top: 0;
+    z-index: 10;
+    padding: var(--space-2) var(--space-3);
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-2);
+  }
+  .skip-link:focus { left: var(--space-4); top: var(--space-2); }
+
+  /* A table wider than a phone is scrolled, never squashed. The wrapper is
+   * focusable so a keyboard user can reach the scroll region — a scroll
+   * container that cannot be focused is unreachable without a pointer.
+   */
+  .table-scroll { overflow-x: auto; overscroll-behavior-x: contain; }
+  .table-scroll:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+}
+
+@layer components {
+  .badge {
+    display: inline-block;
+    font-size: .75rem;
+    padding: .05rem .4rem;
+    border: 1px solid currentColor;
+    border-radius: var(--radius-pill);
+    margin-right: var(--space-1);
+  }
+  .online { color: var(--ok); }
+  .offline { color: var(--muted); }
+  .blocked { color: var(--warn); }
+  .revoked { color: var(--bad); }
+  .pinned { color: var(--muted); }
+
+  .error { color: var(--bad); font-weight: 600; }
+
+  .panel {
+    border: 1px solid var(--line);
+    border-radius: var(--radius-3);
+    padding: .9rem 1.1rem;
+    margin: var(--space-4) 0;
+    background: var(--panel);
+  }
+
+  .notice {
+    padding: .6rem .8rem;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-2);
+    margin-bottom: var(--space-4);
+  }
+
+  /* A link that looks like a button. Used where an action navigates rather than
+   * submits — a <button> that only navigates is wrong for a keyboard user, who
+   * expects a link to be openable in a new tab.
+   */
+  .btn {
+    display: inline-block;
+    padding: .3rem .7rem;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-2);
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .btn-primary {
+    display: inline-block;
+    font-size: 1.05rem;
+    font-weight: 600;
+    padding: .6rem 1.2rem;
+    border: 0;
+    border-radius: var(--radius-2);
+    background: var(--accent-bg);
+    color: var(--accent-fg);
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  .seg {
+    display: inline-flex;
+    vertical-align: middle;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-2);
+    overflow: hidden;
+  }
+  .seg button {
+    border: 0;
+    border-radius: 0;
+    padding: .35rem .95rem;
+    background: transparent;
+  }
+  /* Keyed off the accessible state, not a parallel .active class, so what is
+   * announced and what is shown cannot disagree. */
+  .seg button[aria-pressed=true] { background: var(--accent-bg); color: var(--accent-fg); font-weight: 600; }
+
+  .row-actions { display: flex; flex-wrap: wrap; gap: .3rem; }
+  .e2e-row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
+}
+
+@layer utilities {
+  .muted { color: var(--muted); font-size: .85rem; }
+  /* Visually hidden but present for a screen reader. Not `display: none`,
+   * which would remove it from the accessibility tree as well.
+   */
+  .sr-only {
+    position: absolute;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  .nowrap { white-space: nowrap; }
+  /* For a <pre> that must scroll rather than widen the page — the enrollment
+   * page's copy-paste block. It replaced an inline style attribute, which the
+   * pages' CSP no longer permits.
+   */
+  .panel-scroll { overflow-x: auto; }
+}

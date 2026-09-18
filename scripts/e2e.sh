@@ -966,6 +966,36 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$UI_BASE/ui/orgs/e2e" -b 
 OUT=$(curl -sS "$UI_BASE/v1/machines" -H "Authorization: Bearer $UI_ADMIN" 2>&1)
 [[ "$OUT" == *'"e2e":"off"'* ]]; check "the per-org sealed-exec setting reaches the fleet listing" $?
 
+step "web UI: refusals are visible and actions are confirmed"
+# Both halves of a bug that was invisible from every other angle: htmx does not
+# swap non-2xx responses, and the uiNotices sentences were reachable only through
+# the ?n= redirect that a scripting-off browser follows. So with htmx on — the
+# normal case — a refused action did nothing at all and a successful one said
+# nothing at all. Neither produced an error anywhere.
+#
+# The header is matched case-insensitively because Go canonicalises it to
+# Hx-Retarget on the wire; htmx's getResponseHeader is case-insensitive, so the
+# browser behaviour is unaffected either way.
+HDRS=$(curl -sS -D - -o "$WORKDIR/ui-refusal.html" -X POST "$UI_BASE/ui/orgs/add" -b "$JAR" \
+  -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' --data-urlencode 'org=acme' 2>&1)
+OUT=$(printf '%s' "$HDRS" | grep -i 'hx-retarget: *#ui-error' | head -1)
+[[ -n "$OUT" ]]; check "a refusal names a destination so htmx will swap it" $?
+OUT=$(grep -o 'already configured' "$WORKDIR/ui-refusal.html" | head -1)
+[[ "$OUT" == "already configured" ]]; check "and carries its sentence as markup, not as JSON" $?
+CODE=$(curl -s -o "$WORKDIR/ui-refusal-page.html" -w '%{http_code}' -X POST "$UI_BASE/ui/orgs/add" -b "$JAR" \
+  -H "X-CSRF-Token: $CSRF" --data-urlencode 'org=acme')
+[[ "$CODE" == "409" ]]; check "a refusal without htmx keeps its status" $?
+OUT=$(grep -o '<main id="main">' "$WORKDIR/ui-refusal-page.html" | head -1)
+[[ "$OUT" == '<main id="main">' ]]; check "and arrives as a styled page rather than raw JSON" $?
+# The notice rides out of band, into the live region rather than replacing it.
+OUT=$(curl -sS -X POST "$UI_BASE/ui/block" -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' \
+  --data-urlencode "machine=$UI_MACHINE" 2>&1)
+[[ "$OUT" == *'hx-swap-oob="innerHTML:#ui-notice"'* ]]; check "a successful action carries its confirmation out of band" $?
+[[ "$OUT" == *"Machine blocked."* ]]; check "and the confirmation is the same sentence the no-JS path shows" $?
+# Restore, so the steps below see the machine as they expect it.
+curl -s -o /dev/null -X POST "$UI_BASE/ui/unblock" -b "$JAR" -H "X-CSRF-Token: $CSRF" \
+  -H 'HX-Request: true' --data-urlencode "machine=$UI_MACHINE"
+
 step "web UI: delete is confirmed by name and frees the name"
 CODE=$(curl -s -o "$WORKDIR/ui-del1.html" -w '%{http_code}' -X POST "$UI_BASE/ui/delete" -b "$JAR" \
   -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' --data-urlencode "machine=$UI_MACHINE")

@@ -11,7 +11,6 @@ package server
 import (
 	"context"
 	"crypto/subtle"
-	"embed"
 	"errors"
 	"net/http"
 	"path/filepath"
@@ -32,13 +31,21 @@ import (
 // 'unsafe-eval' and are not used anywhere in these pages. form-action 'self' is
 // required because default-src 'none' falls back to it, and without it every
 // form on the page is silently blocked.
+//
+// style-src is 'self' and NOT 'unsafe-inline'. It used to need the relaxation for
+// the shell's inline <style> block; the styling is now a linked stylesheet
+// (static/ui.css) and htmx's own indicator-style injection is switched off in the
+// shell's htmx-config meta, so nothing on these pages writes a style this policy
+// would refuse. That is a real narrowing rather than a tidy-up: 'unsafe-inline'
+// for styles is reachable from injected markup, and it is what would let a
+// stylesheet-based exfiltration trick work.
 func uiHeaders(w http.ResponseWriter) {
 	h := w.Header()
 	h.Set("X-Frame-Options", "DENY")
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("Content-Security-Policy",
-		"default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'")
+		"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'")
 }
 
 // sameSiteRequest is the same defense-in-depth test the pair page applies to its
@@ -100,11 +107,11 @@ func (s *Server) uiPost(next func(w http.ResponseWriter, r *http.Request, sess u
 			return
 		}
 		if !sameSiteRequest(r) {
-			s.uiRefuse(w, http.StatusForbidden, "cross-site request refused")
+			s.uiFail(w, r, http.StatusForbidden, "cross-site request refused")
 			return
 		}
 		if err := r.ParseForm(); err != nil {
-			s.uiRefuse(w, http.StatusBadRequest, "malformed form")
+			s.uiFail(w, r, http.StatusBadRequest, "malformed form")
 			return
 		}
 		tok := r.Header.Get("X-CSRF-Token")
@@ -112,15 +119,44 @@ func (s *Server) uiPost(next func(w http.ResponseWriter, r *http.Request, sess u
 			tok = r.PostFormValue("csrf")
 		}
 		if subtle.ConstantTimeCompare([]byte(tok), []byte(sess.CSRF)) != 1 {
-			s.uiRefuse(w, http.StatusForbidden, "missing or invalid csrf token")
+			s.uiFail(w, r, http.StatusForbidden, "missing or invalid csrf token")
 			return
 		}
 		next(w, r, sess)
 	}
 }
 
-func (s *Server) uiRefuse(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+// uiFail answers a refusal the way its caller can consume it.
+//
+// htmx gets the sentence as a fragment plus HX-Retarget, so it lands in the
+// #ui-error live region and the operator actually sees it: htmx does not swap
+// non-2xx responses by default, and app.js opts in only for a response that
+// names a destination (see the htmx:beforeSwap listener there). Gating on the
+// header rather than on the status is deliberate — it means a 500 from some path
+// that still writes text/plain cannot be pasted into the page as markup.
+//
+// Everything else — a form post with scripting off, which is how these pages are
+// meant to work without htmx — gets the same sentence on a real page through the
+// shell. That replaces raw JSON dumped into the browser window, which is what a
+// refusal used to look like to anyone without script.
+//
+// The status code is the caller's, unchanged in both branches. Making a refusal
+// visible is not a reason to stop calling it a refusal, and scripts/e2e.sh
+// asserts on these codes.
+//
+// The session is looked up rather than threaded through every call site: it is
+// present for essentially every refusal (the guards in uiPost run after the
+// session check), and having it means the page renders with the operator's nav
+// and version instead of as anonymous chrome.
+func (s *Server) uiFail(w http.ResponseWriter, r *http.Request, status int, msg string) {
+	if r.Header.Get("HX-Request") != "" {
+		w.Header().Set("HX-Retarget", "#ui-error")
+		w.Header().Set("HX-Reswap", "innerHTML")
+		s.renderFragmentStatus(w, uiSession{}, status, uiTmpl, "uierror", struct{ Msg string }{msg})
+		return
+	}
+	sess, _ := s.uiSessionFrom(r)
+	s.renderPage(w, status, sess, "", "That did not work", uiTmpl, "uierrorpage", struct{ Msg string }{msg})
 }
 
 // ---- pages ----
@@ -128,7 +164,7 @@ func (s *Server) uiRefuse(w http.ResponseWriter, status int, msg string) {
 func (s *Server) handleUIFleet(w http.ResponseWriter, r *http.Request, sess uiSession) {
 	rows, err := s.fleetRows()
 	if err != nil {
-		http.Error(w, "store error", http.StatusInternalServerError)
+		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 		return
 	}
 	notice := uiNoticeText(r.URL.Query().Get("n"))
@@ -144,7 +180,7 @@ func (s *Server) handleUIFleet(w http.ResponseWriter, r *http.Request, sess uiSe
 func (s *Server) handleUIMachines(w http.ResponseWriter, r *http.Request, sess uiSession) {
 	rows, err := s.fleetRows()
 	if err != nil {
-		http.Error(w, "store error", http.StatusInternalServerError)
+		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 		return
 	}
 	s.renderFragment(w, sess, uiTmpl, "fleettable", fleetData{Rows: rows, CSRF: sess.CSRF})
@@ -161,7 +197,7 @@ func (s *Server) handleUIConfirmClear(w http.ResponseWriter, r *http.Request, se
 func (s *Server) handleUIOrgs(w http.ResponseWriter, r *http.Request, sess uiSession) {
 	rows, err := s.orgRows()
 	if err != nil {
-		http.Error(w, "store error", http.StatusInternalServerError)
+		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 		return
 	}
 	notice := uiNoticeText(r.URL.Query().Get("n"))
@@ -184,7 +220,7 @@ func (s *Server) handleUIOrgMember(w http.ResponseWriter, r *http.Request, sess 
 	}
 	data, err := s.orgMembership(org)
 	if err != nil {
-		http.Error(w, "store error", http.StatusInternalServerError)
+		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 		return
 	}
 	data.CSRF = sess.CSRF
@@ -204,11 +240,11 @@ func (s *Server) handleUIUnblock(w http.ResponseWriter, r *http.Request, sess ui
 func (s *Server) uiSetBlock(w http.ResponseWriter, r *http.Request, sess uiSession, blocked bool) {
 	name := r.PostFormValue("machine")
 	if err := s.blockMachine(name, blocked); err != nil {
-		status, msg := http.StatusInternalServerError, "store error"
+		status, msg := http.StatusInternalServerError, "The database could not be read. Nothing was changed."
 		if errors.Is(err, errNoSuchMachine) {
-			status, msg = http.StatusNotFound, "unknown machine"
+			status, msg = http.StatusNotFound, "No machine by that name."
 		}
-		s.uiRefuse(w, status, msg)
+		s.uiFail(w, r, status, msg)
 		return
 	}
 	action := "unblock"
@@ -224,13 +260,13 @@ func (s *Server) handleUIRevoke(w http.ResponseWriter, r *http.Request, sess uiS
 	name := r.PostFormValue("machine")
 	m, err := s.st.MachineByName(name)
 	if err != nil || m == nil {
-		s.uiRefuse(w, http.StatusNotFound, "unknown machine")
+		s.uiFail(w, r, http.StatusNotFound, "No machine by that name.")
 		return
 	}
 	// No purge_audit from the UI: erasing another machine's command history stays
 	// an explicit CLI act, exactly as it is for delete.
 	if err := s.revokeMachine(name, false); err != nil {
-		s.uiRefuse(w, http.StatusInternalServerError, "store error")
+		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 		return
 	}
 	s.auditUIAction(name, "revoke", sess.Ident, "revoked via the web UI — name and key stay reserved")
@@ -242,24 +278,36 @@ func (s *Server) handleUIDelete(w http.ResponseWriter, r *http.Request, sess uiS
 	name := r.PostFormValue("machine")
 	m, err := s.st.MachineByName(name)
 	if err != nil || m == nil {
-		s.uiRefuse(w, http.StatusNotFound, "unknown machine")
+		s.uiFail(w, r, http.StatusNotFound, "No machine by that name.")
 		return
 	}
 
 	// Typed-name confirmation. A dialog would be one click through; delete is the
 	// action that removes the tombstone stopping a stolen key from re-enrolling,
 	// and it must not be reachable by a misclick on the wrong row.
+	//
+	// The confirmation is a fragment for htmx and a PAGE for everyone else. It
+	// used to be the fragment unconditionally, so with scripting off the browser
+	// navigated to a bare panel with no shell, no navigation and no way back —
+	// the Delete button, the one action that must not be reachable by a misclick,
+	// was the one that stranded you. TestUIDeleteRequiresTypedName only ever
+	// exercised the htmx path, which is why it stayed green.
 	confirmName := r.PostFormValue("confirm_name")
 	if r.PostFormValue("confirm") != "1" || confirmName != name {
-		s.renderFragment(w, sess, uiTmpl, "deleteconfirm", deleteConfirmData{
+		data := deleteConfirmData{
 			Name: name, Online: m.Name != "" && s.agentOnline(name), CSRF: sess.CSRF,
-		})
+		}
+		if r.Header.Get("HX-Request") != "" {
+			s.renderFragment(w, sess, uiTmpl, "deleteconfirm", data)
+			return
+		}
+		s.renderPage(w, http.StatusOK, sess, "", "Delete "+name, uiTmpl, "deleteconfirmpage", data)
 		return
 	}
 
 	// The row goes first, then the notice, then the close: see deleteMachine.
 	if err := s.deleteMachine(name); err != nil {
-		s.uiRefuse(w, http.StatusInternalServerError, "store error")
+		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 		return
 	}
 	// Audited after the row is gone, deliberately: audit has no foreign key to
@@ -274,14 +322,23 @@ func (s *Server) handleUIDelete(w http.ResponseWriter, r *http.Request, sess uiS
 // the refreshed table to swap in, a plain form post gets a redirect. The htmx
 // attributes are an enhancement, not a requirement — these pages work with
 // scripting unavailable.
+//
+// The htmx branch renders "fleetaction" rather than "fleet": that is the same
+// container plus the out-of-band notice. Without it the eight sentences in
+// uiNotices were reachable only by a scripting-off browser, so with htmx on — the
+// normal case — a successful block, revoke or delete produced no confirmation at
+// all. Both branches take their sentence from uiNoticeText, so the two paths
+// cannot say different things.
 func (s *Server) refreshOrRedirect(w http.ResponseWriter, r *http.Request, sess uiSession, noticeCode string) {
 	if r.Header.Get("HX-Request") != "" {
 		rows, err := s.fleetRows()
 		if err != nil {
-			http.Error(w, "store error", http.StatusInternalServerError)
+			s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 			return
 		}
-		s.renderFragment(w, sess, uiTmpl, "fleet", fleetData{Rows: rows, CSRF: sess.CSRF})
+		s.renderFragment(w, sess, uiTmpl, "fleetaction", fleetData{
+			Rows: rows, CSRF: sess.CSRF, Notice: uiNoticeText(noticeCode),
+		})
 		return
 	}
 	http.Redirect(w, r, "/ui?n="+noticeCode, http.StatusSeeOther)
@@ -453,20 +510,14 @@ func (s *Server) renderSignInMessage(w http.ResponseWriter, status int, title, r
 
 // ---- static assets ----
 
-// staticFiles holds the two vendored scripts. htmx is pinned: it is a single file
-// with no dependencies and no build step, which is why the pages can be
-// interactive without adding npm, a bundler, or a third-party origin to the
-// control plane's critical path. A CDN would break the CSP and make the only
-// publicly reachable component depend on someone else's uptime.
-//
-//go:embed static/htmx.min.js static/app.js
-var staticFiles embed.FS
-
 // knownStaticFiles is a strict allowlist, mirroring knownAgentFiles for agent
 // downloads: an explicit map, never a file server over a directory.
+//
+// The embed itself and the cache-busting digest live in assets.go.
 var knownStaticFiles = map[string]string{
 	"htmx.min.js": "text/javascript; charset=utf-8",
 	"app.js":      "text/javascript; charset=utf-8",
+	"ui.css":      "text/css; charset=utf-8",
 }
 
 func (s *Server) handleUIStatic(w http.ResponseWriter, r *http.Request) {
