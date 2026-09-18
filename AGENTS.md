@@ -305,9 +305,12 @@ the Dockerfile's `MACH_VERSION` build arg (which the compose file and the releas
 workflow both pass), and the tag the release workflow derives. A plain build
 reports `devel`.
 
-`MACH_TEST_POSTGRES` (test-only): a Postgres DSN for `internal/store`'s
-end-to-end test. Without it that test skips, so the Postgres path is otherwise
-only covered at the SQL-translation level.
+`MACH_TEST_POSTGRES` (test-only): a Postgres DSN. It switches `internal/store`'s
+Postgres tests on (the end-to-end one and the concurrency set) and switches
+`scripts/e2e.sh` to run its whole suite against Postgres instead of SQLite.
+Without it everything Postgres skips, so that path is otherwise only covered at
+the SQL-translation level — see the working note at the end of this file for how
+to run it, and for why the driver difference matters.
 
 ## Testing
 
@@ -552,6 +555,16 @@ rule that would have prevented it.
   answers every request — with a different database. Sign-in still works, so the
   failures look like 21 unrelated broken assertions rather than one occupied
   port. Check the ports before believing a wholesale UI failure.
+
+  The suite no longer leaves this to the reader: both servers are checked after
+  startup, and a run whose own control plane did not bind stops with a FATAL
+  naming the port instead of reporting failures about somebody else's database.
+  Reproduced deliberately to be sure of the diagnosis — with a stale server on
+  8099 the suite reported 77 failures, every one of them about the other database.
+  The check is two conditions because either alone is fooled: the process must
+  still be alive (a failed bind is a `log.Fatal`) *and* its own log must say it is
+  listening. The log line alone proves nothing, because it is written before
+  `ListenAndServe` returns — it is present even in the bind-failure log.
 - **A scripted edit can silently not apply.** Agents edit by string substitution
   across many files, and a replacement that does not match the file's actual text
   fails without saying so. One did, in this repo: the policy-file
@@ -611,7 +624,27 @@ rule that would have prevented it.
   reconciled in `c620a16`; the decisions that look odd in isolation (one-shot exec
   buffered while the console streams, E2E per org and refusable, the block list
   running on the machine) are recorded there with their reasoning.
-- **The Postgres path is not exercised by default.** There is neither a Postgres
-  server nor a Docker daemon in this environment, so `TestPostgresStoreEndToEnd`
-  skips unless you set `MACH_TEST_POSTGRES`. Do not describe that path as verified
-  end to end when it has only been checked at the SQL-translation level.
+- **The Postgres path is not exercised by default — and saying so is the point.**
+  With no `MACH_TEST_POSTGRES`, `TestPostgresStoreEndToEnd` and the
+  `postgres_concurrency_test.go` set skip, and the Postgres path is covered only
+  at the SQL-translation level. Do not describe it as verified when that is what
+  ran.
+
+  It CAN be run, and should be when you touch the store: the two drivers are not
+  the same concurrency model (SQLite opens with `MaxOpenConns(1)`, Postgres with
+  25), so a statement that is correct only because nothing interleaves is correct
+  on one driver and not the other. One variable runs everything:
+
+  ```
+  docker run -d --name mach-pg -e POSTGRES_PASSWORD=… -e POSTGRES_USER=mach \
+      -e POSTGRES_DB=mach -p 55432:5432 postgres:17-alpine
+  export MACH_TEST_POSTGRES='postgres://mach:…@127.0.0.1:55432/mach?sslmode=disable'
+  mise run test          # includes the Postgres-only store tests
+  mise run e2e           # the WHOLE suite, against Postgres
+  ```
+
+  `scripts/e2e.sh` switches drivers on that variable: `scripts/pgsetup` clears the
+  schema and creates a second database for the web-UI control plane (two control
+  planes must not share tables), and `MACH_SERVER_KEY` is set for it because a DSN
+  has no path to derive an identity key from. Both are destructive — point them at
+  a throwaway server.

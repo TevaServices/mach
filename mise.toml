@@ -77,6 +77,36 @@ run = "go vet ./..."
 description = "End-to-end test: spins up control plane + agents on 127.0.0.1 (script builds its own binaries)"
 run = "bash scripts/e2e.sh"
 
+# The store has two drivers and one schema, and they are not the same concurrency
+# model (SQLite opens with MaxOpenConns(1), Postgres with 25) — so the same suite
+# runs against both, and a change that is correct only because nothing can
+# interleave shows up only here. See the Postgres working note in AGENTS.md.
+[tasks."pg:up"]
+description = "Start a throwaway Postgres for the store tests and the e2e (then export MACH_TEST_POSTGRES)"
+run = '''
+docker rm -f mach-pg >/dev/null 2>&1
+docker run -d --name mach-pg -e POSTGRES_USER=mach -e POSTGRES_PASSWORD=machtest \
+  -e POSTGRES_DB=mach -p 55432:5432 postgres:17-alpine >/dev/null
+for i in $(seq 1 60); do docker exec mach-pg pg_isready -U mach -d mach >/dev/null 2>&1 && break; sleep 1; done
+docker exec mach-pg pg_isready -U mach -d mach || { echo "postgres did not come up" >&2; exit 1; }
+echo "export MACH_TEST_POSTGRES='postgres://mach:machtest@127.0.0.1:55432/mach?sslmode=disable'"
+'''
+
+[tasks."pg:down"]
+description = "Stop and remove the throwaway Postgres"
+run = "docker rm -f mach-pg"
+
+[tasks."e2e:postgres"]
+description = "The whole e2e suite against Postgres (needs MACH_TEST_POSTGRES; see pg:up)"
+run = '''
+if [ -z "${MACH_TEST_POSTGRES:-}" ]; then
+  echo "set MACH_TEST_POSTGRES, e.g. from \`mise run pg:up\`" >&2
+  exit 2
+fi
+# Destructive: the script clears the schema and creates a second database.
+bash scripts/e2e.sh
+'''
+
 [tasks.attest]
 description = "Cross-compile the agents and write a signed in-toto attestation for each (uses the control plane's identity key: MACH_DB/MACH_SERVER_KEY)"
 run = '''
