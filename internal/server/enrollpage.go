@@ -139,11 +139,9 @@ const enrollSource = `{{define "enroll"}}
 </tbody>
 </table>
 </div>
-<p class="muted">The binary is static — no other files needed. Enrollment happens
-on the target machine: run <code>mach</code> there and scan the QR it prints (or
-use an API key headlessly).</p>
-<p class="muted">Org prefixes available on this control plane:
-{{range .Orgs}}<code>{{.}}</code> {{end}}— machine names will be
+<p class="muted">Enrollment happens on the target machine: run <code>mach</code>
+there and scan the QR it prints. Orgs on this control plane:
+{{range .Orgs}}<code>{{.}}</code> {{end}}— names will be
 <code>&lt;org&gt;-&lt;machine&gt;</code>.</p>
 {{end}}`
 

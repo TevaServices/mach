@@ -149,6 +149,10 @@ run = "scripts/localdev.sh server"
 description = "Enroll this host by hand: prints the QR and challenge code and waits for approval (reuses the running server's host)"
 run = "scripts/localdev.sh enroll"
 
+[tasks."local:temp"]
+description = "Run a TEMPORARY agent session against the local playground: bare mach, identity in memory, QR + challenge-code pairing, retires its enrollment on exit (builds first if the tree is newer than bin/)"
+run = "scripts/localdev.sh temp"
+
 [tasks."local:reset"]
 description = "Stop the playground and wipe it back to a fresh install (deletes data/local/)"
 run = "scripts/localdev.sh reset"

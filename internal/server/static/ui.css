@@ -31,7 +31,13 @@
     color-scheme: light dark;
 
     --fg: #16181d; --bg: #ffffff;
-    --muted: #6b7280; --line: #8883; --panel: #8881;
+    /* Muted is for genuinely secondary text (a hostname under a machine name),
+     * not for data columns. Both values clear 4.5:1 against their background at
+     * the sizes secondary text renders at — the previous pair (#6b7280 light,
+     * #9aa1ab dark) sat close to the floor, and the dark one on the near-black
+     * page background was the text operators squinted at.
+     */
+    --muted: #5c6370; --line: #8883; --panel: #8881;
     --accent-bg: #16181d; --accent-fg: #ffffff;
     --ok: #1a7f37; --warn: #a06000; --bad: #b3261e;
     /* The focus ring has to clear both the page and the control it sits on, so
@@ -55,7 +61,7 @@
   @media (prefers-color-scheme: dark) {
     :root {
       --fg: #e6e8ec; --bg: #14161a;
-      --muted: #9aa1ab; --line: #8884; --panel: #8882;
+      --muted: #a9b2bd; --line: #8884; --panel: #8882;
       --accent-bg: #e6e8ec; --accent-fg: #14161a;
       --ok: #4ac26b; --warn: #d29922; --bad: #f85149;
       --focus: #6ea8fe;
@@ -99,31 +105,62 @@
     border-radius: var(--radius-1);
   }
 
+  /* One heading scale, so pages share a rhythm instead of each h2 landing
+   * wherever the paragraph before it happened to end.
+   */
+  h1 { font-size: 1.35rem; line-height: 1.2; margin: 0 0 var(--space-4); }
+  h2 { font-size: 1rem; margin: var(--space-5) 0 var(--space-2); }
+  p { margin: 0 0 var(--space-3); }
+  p:last-child { margin-bottom: 0; }
+
   table { border-collapse: collapse; width: 100%; }
   th, td {
     text-align: left;
-    padding: .45rem .6rem;
+    padding: .55rem .75rem;
     border-bottom: 1px solid var(--line);
-    vertical-align: top;
+    /* Middle, uniformly. `top` made single-line rows float above their
+     * neighbours' two-line ones, which is most of what "the alignment is all
+     * over the place" was.
+     */
+    vertical-align: middle;
   }
   th {
-    font-size: .8rem;
+    font-size: .78rem;
+    font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: .04em;
+    letter-spacing: .05em;
     color: var(--muted);
+    border-bottom-width: 2px;
+    white-space: nowrap;
   }
 
   button {
     font: inherit;
-    padding: .3rem .7rem;
+    padding: .32rem .75rem;
     cursor: pointer;
     border-radius: var(--radius-2);
     border: 1px solid var(--line);
     background: transparent;
     color: inherit;
+    white-space: nowrap;
   }
 
-  input[type=text], select { font: inherit; padding: .3rem .4rem; }
+  input[type=text], select { font: inherit; padding: .35rem .5rem; }
+
+  /* A label owns its field: the input drops under the label text instead of
+   * floating after it on the same line, where the two baselines never agree.
+   * (The pair page's narrow-column labels are its own unlayered rules, so they
+   * still win where they speak.)
+   */
+  label { display: block; }
+  label > input[type=text], label > select {
+    display: block;
+    margin-top: var(--space-1);
+  }
+  /* The typed-name confirmation box should not pretend to be a search field
+   * spanning the page.
+   */
+  .panel input[type=text] { max-width: 24rem; }
 
   form.inline { display: inline; }
 }
@@ -184,10 +221,12 @@
   .badge {
     display: inline-block;
     font-size: .75rem;
-    padding: .05rem .4rem;
+    font-weight: 500;
+    padding: .05rem .45rem;
     border: 1px solid currentColor;
     border-radius: var(--radius-pill);
     margin-right: var(--space-1);
+    white-space: nowrap;
   }
   .online { color: var(--ok); }
   .offline { color: var(--muted); }
@@ -238,6 +277,15 @@
     cursor: pointer;
   }
 
+  /* Destructive actions (Revoke, Delete, Remove org) carry their consequence in
+   * their colour rather than looking like every other button on the row.
+   */
+  button.danger {
+    color: var(--bad);
+    border-color: currentColor;
+  }
+  button.danger:hover { background: var(--panel); }
+
   .seg {
     display: inline-flex;
     vertical-align: middle;
@@ -255,12 +303,18 @@
    * announced and what is shown cannot disagree. */
   .seg button[aria-pressed=true] { background: var(--accent-bg); color: var(--accent-fg); font-weight: 600; }
 
-  .row-actions { display: flex; flex-wrap: wrap; gap: .3rem; }
+  .row-actions { display: flex; flex-wrap: wrap; gap: .35rem; }
   .e2e-row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
+
+  /* The add-org form is one row: field and submit side by side, not an input
+   * of default browser width with a button drifting after it.
+   */
+  .add-org { display: flex; flex-wrap: wrap; gap: .5rem; max-width: 26rem; }
+  .add-org input[type=text] { flex: 1; min-width: 8rem; }
 }
 
 @layer utilities {
-  .muted { color: var(--muted); font-size: .85rem; }
+  .muted { color: var(--muted); font-size: .9rem; }
   /* Visually hidden but present for a screen reader. Not `display: none`,
    * which would remove it from the accessibility tree as well.
    */

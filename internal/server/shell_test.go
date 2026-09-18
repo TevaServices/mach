@@ -232,7 +232,13 @@ func TestUISegmentedControlIsAccessible(t *testing.T) {
 	if strings.Count(page, `id="orge2e"`) != 1 {
 		t.Fatal("the org page does not render exactly one E2E control")
 	}
+	// Bounded at the next section heading rather than at end-of-page: the org
+	// page now also carries the Remove-org form (memberSource), which is a form
+	// but not part of this control.
 	block := page[strings.Index(page, `id="orge2e"`):]
+	if end := strings.Index(block, "<h2>Machines"); end >= 0 {
+		block = block[:end]
+	}
 
 	if !strings.Contains(block, `role="group"`) {
 		t.Error("the segmented control is not exposed as a group")
