@@ -15,6 +15,7 @@ import (
 	"errors"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/bcross/mach/internal/oidcauth"
@@ -168,7 +169,15 @@ func (s *Server) handleUIOrgs(w http.ResponseWriter, r *http.Request, sess uiSes
 }
 
 func (s *Server) handleUIOrgMember(w http.ResponseWriter, r *http.Request, sess uiSession) {
-	org := r.PathValue("org")
+	// Normalized exactly once, and up front, because orgRegistered lowercases
+	// while the rest of this path is case-sensitive. Passing the raw path value
+	// through meant `/ui/orgs/BCROSS` was accepted as a registered org and then
+	// described a *different* one: no machines (nothing is named "BCROSS-…") and
+	// the E2E setting of an org that does not exist, which falls back to the
+	// default — so the page could report sealed commands as on for an org where
+	// they are off. Its own On/Off buttons post the org the POST handler
+	// lowercases, so the display and the action disagreed.
+	org := strings.ToLower(strings.TrimSpace(r.PathValue("org")))
 	if !s.orgRegistered(org) {
 		http.NotFound(w, r)
 		return

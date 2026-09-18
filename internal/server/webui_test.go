@@ -815,3 +815,35 @@ func renderTemplate(t *testing.T, define string, data any) string {
 	}
 	return buf.String()
 }
+
+// The enrollment page's platform tabs must render. They were set on the EMBEDDED
+// struct while the template read the OUTER field of the same name, so the row
+// rendered empty: an operator whose user agent was guessed wrong (or who was on
+// an OS the guess does not cover) had no way to switch to their actual platform,
+// even though the fragment the tabs call worked and was untested.
+func TestEnrollPageRendersPlatformTabs(t *testing.T) {
+	clearOIDCEnv(t)
+	s := newTestServer(t)
+	code, body := bearerJSON(t, s.Routes(), "GET", "/", "", "")
+	if code != http.StatusOK {
+		t.Fatalf("enrollment page: %d", code)
+	}
+	if !strings.Contains(body, "Choose a platform") {
+		t.Fatalf("the platform section is missing from the page")
+	}
+	for _, want := range []string{"partials/enroll/linux/amd64", "partials/enroll/darwin/arm64"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("platform tab %q did not render — the tabs are shadowed or unset", want)
+		}
+	}
+	// Every tab in the table is offered, not just the first.
+	for _, tab := range enrollTabs {
+		if !strings.Contains(body, "/partials/enroll/"+tab.OSKey+"/"+tab.ArchKey) {
+			t.Errorf("tab %s/%s missing from the page", tab.OSKey, tab.ArchKey)
+		}
+	}
+	// The fragment the tabs point at must answer, or the tabs are decorative.
+	if code, _ := bearerJSON(t, s.Routes(), "GET", "/partials/enroll/linux/amd64", "", ""); code != http.StatusOK {
+		t.Errorf("the platform fragment returned %d", code)
+	}
+}

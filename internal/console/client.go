@@ -49,7 +49,16 @@ func LoadConfig() (*Config, error) {
 	path := filepath.Join(dir, "console.json")
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, errNotConfigured{dir: dir}
+		// Absent and unreadable are different answers, and conflating them is
+		// dangerous here: "not configured" sends plain `mach` down the enrollment
+		// path, so a console.json that exists but cannot be read (restored with
+		// the wrong owner, a bad mount, a restrictive umask) turned an admin box
+		// into a machine enrolling itself as a target. The pin store makes the
+		// same distinction for the same reason.
+		if os.IsNotExist(err) {
+			return nil, errNotConfigured{dir: dir}
+		}
+		return nil, fmt.Errorf("could not read %s: %w", path, err)
 	}
 	var c Config
 	if err := json.Unmarshal(raw, &c); err != nil {
@@ -512,6 +521,15 @@ func (c *client) Console(machine string) int {
 		fmt.Print("mach> ")
 		if !sc.Scan() {
 			fmt.Println()
+			// Scan stops for two different reasons, and reporting both as a clean
+			// exit 0 made them indistinguishable: a line longer than the scanner's
+			// buffer (a pasted script, a base64 blob) was silently dropped and the
+			// console exited 0, exactly as Ctrl-D does — so a caller piping a long
+			// command in saw success and no command ever ran.
+			if err := sc.Err(); err != nil {
+				fmt.Fprintln(os.Stderr, "mach: reading your input: "+err.Error())
+				return 2
+			}
 			return 0
 		}
 		line := strings.TrimSpace(sc.Text())

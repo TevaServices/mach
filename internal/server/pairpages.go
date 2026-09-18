@@ -228,10 +228,16 @@ func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store
 		return
 	}
 	if r.FormValue("deny") == "1" {
+		// Terminal, and rendered the way every other terminal state is. Without
+		// the flag the template fell through to its form branch, so a denial
+		// answered with the approve form again: the operator could not tell the
+		// denial had taken effect, and the form it was shown posts to a path with
+		// no token, which does not route. The name is included so the page can say
+		// which pairing was denied.
 		if changed, err := s.st.DenyPairing(p.ID); err == nil && changed {
-			renderPair(w, pairPageData{State: "denied"})
+			renderPair(w, terminalPair("denied", p.Name))
 		} else {
-			renderPair(w, pairPageData{State: s.st.PairingState(p)})
+			renderPair(w, terminalPair(s.st.PairingState(p), p.Name))
 		}
 		return
 	}

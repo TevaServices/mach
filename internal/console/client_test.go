@@ -864,3 +864,35 @@ func TestExecDoesNotRetryWhenTheSealedReplyIsLost(t *testing.T) {
 		t.Errorf("--e2e sent %d requests, want only the sealed attempt", n)
 	}
 }
+
+// An unreadable console.json is not the same thing as no console.json. Treating
+// every ReadFile error as "not configured" sent plain `mach` down the enrollment
+// path, so an admin box whose config was restored with the wrong owner silently
+// offered to enroll itself as a target machine — and `mach list` blamed a
+// missing file that was right there. (The pin store already makes this
+// distinction: an unreadable pin file is an error, never an empty pin set.)
+func TestLoadConfigDistinguishesUnreadableFromAbsent(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MACH_STATE_DIR", dir)
+
+	// Absent: the "not configured" answer, which is what drives setup.
+	if _, err := LoadConfig(); err == nil {
+		t.Fatal("a missing console.json was accepted")
+	} else if _, ok := err.(NotConfiguredError); !ok {
+		t.Fatalf("missing config error = %T (%v), want NotConfiguredError", err, err)
+	}
+
+	// Present but unreadable: a real error, and specifically not "not configured".
+	path := filepath.Join(dir, "console.json")
+	if err := os.WriteFile(path, []byte(`{"server":"https://x","api_key":"mach_k"}`), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if _, err := LoadConfig(); err == nil {
+		t.Fatal("an unreadable console.json was accepted")
+	} else if _, ok := err.(NotConfiguredError); ok {
+		t.Fatal("an unreadable console.json was reported as not configured — plain `mach` would enroll this box")
+	}
+}

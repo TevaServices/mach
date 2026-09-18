@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bcross/mach/internal/protocol"
 )
@@ -283,5 +284,46 @@ func TestPairPageKeepsTypedValuesOnARetry(t *testing.T) {
 	}
 	if !strings.Contains(page, `<option value="bcross" selected>`) || !strings.Contains(page, `value="web-01"`) {
 		t.Errorf("the retry form lost what the operator had typed:\n%s", page)
+	}
+}
+
+// Denying a pairing must render a terminal page. It rendered the approve form
+// instead — the state went to "denied" in the store, but the page showed the code
+// box and a submit button again, so the operator could not tell the denial had
+// taken effect, and the form it was shown posts to a path with no token (which
+// does not route). Every other terminal state goes through terminalPair; this
+// one now does too.
+func TestPairDenyRendersTerminalPage(t *testing.T) {
+	s, st := newAuthTestServer(t)
+	_, token, _, err := st.CreatePairing("pub", "agent-host", "linux", "amd64", "v", 10*time.Minute)
+	if err != nil {
+		t.Fatalf("create pairing: %v", err)
+	}
+	form := url.Values{"deny": {"1"}}
+	req := httptest.NewRequest("POST", "/pair/"+token, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("deny returned %d", rec.Code)
+	}
+	body := rec.Body.String()
+	// The row really is denied, not merely rendered that way.
+	pair, err := st.PairingByToken(token)
+	if err != nil || pair == nil {
+		t.Fatalf("reload pairing: %v", err)
+	}
+	if got := st.PairingState(pair); got != "denied" {
+		t.Fatalf("pairing state = %q, want denied", got)
+	}
+	// Terminal: no code field, no submit button.
+	if strings.Contains(body, `name="code"`) {
+		t.Error("the deny response still renders the code field — the operator is invited to try again")
+	}
+	if strings.Contains(body, `name="deny"`) {
+		t.Error("the deny response still renders the deny button")
+	}
+	if !strings.Contains(body, "denied") {
+		t.Errorf("the deny response does not say the pairing was denied: %s", body)
 	}
 }
