@@ -64,20 +64,18 @@ func streamConsole(server, apiKey, machine, command string) int {
 		return streamDialFailed
 	}
 
-	// Ctrl-C belongs to the remote command while it runs: the banner promises a
-	// kill, and this is what delivers it. InterruptGuard stands down for the
-	// window this flag is set, so the signal lands here rather than exiting the
-	// process before the frame is written.
+	// Two signals, two meanings, and conflating them broke both.
 	//
-	// A second Ctrl-C gives up waiting and disconnects — the honest answer for
-	// an agent too old to honour a kill, and for a command that ignores SIGKILL
-	// (nothing does, but the operator needs a way out either way). So does a
-	// grace deadline, so an unattended console cannot wait on a kill forever.
-	// SIGINT is the operator pressing Ctrl-C at a terminal, and means "stop the
-	// remote command". SIGTERM is somebody else deciding this process should go —
-	// a supervisor, a `kill` from another shell — and means exactly that: it must
-	// not be read as a request to kill a command on a remote machine, or the
-	// service manager cannot stop an interactive console.
+	// SIGINT is the operator pressing Ctrl-C at a terminal: it belongs to the
+	// remote command while one runs, because the banner promises a kill and this
+	// is what delivers it. InterruptGuard stands down for the window the flag
+	// below is set, so the signal lands here instead of exiting the process
+	// before the kill frame is written.
+	//
+	// SIGTERM is somebody else deciding this process should go — a supervisor, a
+	// `kill` from another shell — and means exactly that. Reading it as a request
+	// to kill a command on a remote machine meant a service manager could not
+	// stop an interactive console.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
 	defer signal.Stop(sig)
@@ -93,6 +91,10 @@ func streamConsole(server, apiKey, machine, command string) int {
 	defer streamOwnsInterrupt.Store(false)
 	// killed records that a kill was asked for, so a stream that ends without a
 	// terminal record can say which of the two things happened.
+	//
+	// A second Ctrl-C gives up waiting and disconnects — the honest answer for an
+	// agent too old to honour a kill — and so does the grace deadline armed with
+	// the kill, so an unattended console cannot wait on one forever.
 	var killed atomic.Bool
 	go func() {
 		first := true
