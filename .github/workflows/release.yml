@@ -130,7 +130,7 @@ jobs:
       # Only the client binary, its attestation and the pubkey file are
       # published — the `mach-server` built above is this job's tool, not a
       # release artifact, so the glob here stops at the client's own name.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: client-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
