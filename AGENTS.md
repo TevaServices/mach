@@ -95,6 +95,22 @@ This is `mach`: remote CLI access to registered machines, outbound-only
    a stream against a block list), and because the relay *can* read the command
    it is the one path where the fleet-wide policy is enforced server-side.
    Stdin reaches a machine only through a command an operator already started.
+
+   **`stream_kill` stops the command, and it is what Ctrl-C sends.** Closing the
+   command's stdin was the whole of it, which does nothing to a program that is
+   not reading it — `sleep`, a wedged build, a hung client — while the console
+   says "Ctrl-C kills the remote session". It closes stdin *and* signals the
+   process group, reports "killed" with exit 130 (not "timed out": the two share
+   a cancelled context and the operator should not be told the machine decided),
+   and is idempotent — a second frame for one session used to panic the agent,
+   which nothing recovers. Stdin is written by the session's own goroutine, never
+   on the frame loop, because a write to a full pipe blocks and that loop
+   dispatches every other frame too. One session carries one command: the agent
+   tags output and the terminal record with the session id, so a second
+   `exec_stream` before the first ends is refused rather than allowed to
+   overwrite the audit row's identity. And on the console side, SIGINT is the
+   operator asking to kill the remote command while SIGTERM is somebody stopping
+   *this process* — the interrupt guard stands down only for the first.
 9. **Output caps are per path, and there are TWO of them on the one-shot path**
    — different numbers, on purpose. `protocol.MaxOutputBytes` (8 MiB) bounds what
    the *agent* carries back per stream, truncated with a visible marker;
@@ -142,6 +158,22 @@ This is `mach`: remote CLI access to registered machines, outbound-only
     `reloadFile`) and the broadcast is what makes them current everywhere;
     neither is a sandbox — keep `SECURITY-NOTES.md` honest about that rather
     than overselling it.
+
+    **The control plane's own check is skipped for a sealed request, and that is
+    the same rule rather than an exception to it.** There is no text to match, and
+    running the grammar against the empty command left behind is not a stricter
+    check but a wrong one: under `allowonly` an empty command fails closed, so
+    every sealed command was refused and a console obeying the 403 fell back to
+    plaintext with a command it had been told to keep sealed. The rules reach the
+    machine through the mirror, which is the only place the plaintext exists.
+    Related, in `internal/policy`: an allow rule matches a prefix, and a prefix
+    stops describing what will run once the shell can start a second command
+    inside it — so `allowonly` refuses command substitution (`$(...)`, backticks,
+    process substitution) instead of authorizing it by accident. argv mode is
+    unaffected: nothing re-parses an argument vector, so a literal `$(date)` is
+    its own text. And a machine name in an exec allowlist is matched *exactly*:
+    the store, the lookups and the dispatch path are all case-sensitive, so
+    folding case here would let a key scoped to `web` reach `Web`.
 13. **Release attestations**: `mach-server attest` signs an in-toto statement
     with the identity key agents pin; `push-update --attestation` verifies the
     subject digest before queueing and refuses a modified-tree build. Signature
@@ -366,7 +398,13 @@ only covered at the SQL-translation level.
   and drives the temporary session's whole lifecycle: bare `mach` enrolling over
   the real pair page, being recorded temporary, retiring itself on SIGTERM, and
   the next run taking that name back over with no operator action.
-  Green = 154 checks.
+  It also kills a streamed command with Ctrl-C and checks the machine stopped it
+  (exit 130 in the audit row, not "fate unknown"), runs the fleet block list in
+  `allowonly` mode against sealed commands (the rules judge a sealed command on
+  the machine, so an allow-list must not refuse every one of them for having no
+  text at the control plane), and checks that a quoted secret in a command is
+  redacted out of the audit row.
+  Green = 183 checks.
 - Timing-sensitive e2e checks (streaming) use a real sleep and a real
   background process; if one flakes, make the sleep longer rather than
   weakening the assertion.

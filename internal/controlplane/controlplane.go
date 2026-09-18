@@ -210,6 +210,14 @@ func printE2EReport(st *store.Store, org string) {
 
 	defMode, defSource := server.E2EMode(st, "")
 	fmt.Printf("default: sealed exec %s (%s)\n", defMode, defSource)
+	// The explanation belongs directly under the line it explains. Printed after
+	// the org list it read as a comment on the LAST org, and contradicted it:
+	// an operator with `default off` and `org acme on` saw "org acme: sealed
+	// exec on" followed by a paragraph beginning "sealed exec is refused". The
+	// per-org lines carry their own mode in the same line, so they need no
+	// trailing paragraph.
+	explainE2E(defMode)
+	warnE2EOverride()
 
 	// Configured orgs first, then any org with a stored override that this
 	// shell's MACH_ORG/MACH_ORGS does not mention (the server may run with a
@@ -233,8 +241,6 @@ func printE2EReport(st *store.Store, org string) {
 			fmt.Printf("org %s: sealed exec %s (stored override; not in this shell's MACH_ORG/MACH_ORGS)\n", o, mode)
 		}
 	}
-	explainE2E(defMode)
-	warnE2EOverride()
 }
 
 func explainE2E(mode string) {

@@ -37,6 +37,18 @@ size, source key, exit status) — command and output content stay opaque to it,
 and the audit row records `[E2E sealed command]`. Machines advertise an X25519
 key (`pub_e2e`) at enrollment.
 
+The **exit status is the one thing that travels in the clear beside the
+ciphertext**, because it cannot travel inside it: the control plane holds the
+blob and nothing else, and the exit status is the one fact it is documented to
+learn. It is a pointer in `protocol.SealedExecResult` so that "the agent did not
+report one" (an agent older than the field) is distinguishable from a real 0 —
+the row then shows no status rather than inventing one. Nothing else may join it
+there: an error string would defeat the seal outright, since a policy refusal
+quotes the command it refused. Without this the relay read the status out of the
+plaintext result struct that a sealed reply leaves empty, and every sealed
+command was audited as exit 0 — a machine-refused command that never ran,
+recorded as having succeeded.
+
 It is a server-side setting, per org — `mach-server e2e on|off|inherit --org X`,
 with a default for orgs that have no setting of their own, and `MACH_E2E` as a
 deployment-wide pin that overrides every org. The control plane is the authority
@@ -129,13 +141,13 @@ from the broker; nothing protects content from the machine's own operator.
 | Per-machine command policy on the agent itself (`MACH_POLICY` / `policy.txt`), evaluated where no upstream can override it, on both paths | agent/policy.go, internal/policy |
 | E2E sealing of one-shot exec: X25519 + ChaCha20-Poly1305, ephemeral sender key per command, AEAD key derived with HKDF (recipient and format version bound into the info string), AAD = the sender's ephemeral pubkey, format version checked on the way in | internal/e2e, agent/e2eexec.go |
 | **Trust-on-first-use pinning of each machine's E2E key** on the console: a changed key refuses to seal (naming both fingerprints and the remedy) instead of sealing to whatever the control plane now advertises | console/pins.go, client.go runExec |
-| `readonly` keys refused on the streaming endpoint (it is command execution, not observation) | stream.go handleConsoleStreamWS |
+| `readonly` keys refused on the streaming endpoint (it is command execution, not observation), and on `/e2epub` too — that endpoint hands out the key commands are sealed to, so a key that may not run commands has no use for it | stream.go handleConsoleStreamWS, consoleapi.go handleE2EPub |
 | Confinement of remote commands: own process group (unix), SIGKILL as a tree on timeout (Windows: timeout + caps only) | agent/confine*.go |
 | Output caps per path, with visible truncation markers; streamed frames dropped rather than stalling an agent whose console stopped reading | agent/run.go, agent/streamexec.go |
 | Machine output is data, never input: nothing in the agent reads it back, and the console labels it rather than parsing a control fact out of text | agent/run.go, console/client.go, console/stream.go |
 | **One command is one execution, and a sealed command is never downgraded automatically**: the only plaintext fallback is a `403`, which the control plane returns before anything is dispatched. A lost or oversized sealed reply is reported instead — re-sending it would be a second execution of a command that may already have run, and the plaintext retry would hand the control plane and the audit log the text of a command the operator sent sealed | console/client.go sealedExec, apiError |
 | **Command output is bytes**: carried base64 alongside the JSON text form whenever that form would be lossy (a JSON string must be valid UTF-8, so Go's encoder replaced every invalid byte with U+FFFD), so binary output survives `mach exec` intact instead of coming back mangled and longer | protocol.ExecResult SetOutput/Output, agent/run.go, console/client.go |
-| Audit log with secret-value redaction; every dispatched command recorded on both paths; refusals audited too; a stream that dies without an exit status recorded as `-1`; optional purge on revoke | store.RedactScrubs/AuditInsert/RemoveMachineAudit, server/stream.go |
+| Audit log with secret-value redaction — quoted values included, which is the shape people actually write (`PGPASSWORD='…'`) and the one that used to leave the secret in the row; every dispatched command recorded on both paths; refusals audited too; a stream that dies without an exit status recorded as `-1`; a killed session recorded as `130` rather than as fate-unknown; one command per stream session, so a pipelined second one is refused rather than allowed to overwrite the row's identity; optional purge on revoke | store.RedactScrubs/AuditInsert/RemoveMachineAudit, server/stream.go |
 | Signed in-toto attestations for released agent binaries, verified before an update can be queued | internal/release, controlplane/attest.go |
 | Revocation: self-retiring agents, names and keys stay reserved. **A revoked OR temporary machine can be taken over by re-enrolling it — and only one of those two**: the guard is the `WHERE revoked=1 OR temporary=1` in `store.reenroll`, so an actively enrolled **permanent** machine's name and key can never be taken by an enrollment | store.RevokeMachine/reenroll, server enrollmentRefusal, agent errRevoked |
 | **Temporary session** (plain `mach` on a target): enrolls and serves with the identity key, E2E key and config held **in memory only**, so Ctrl-C is a real shutdown and running it again re-enrolls. It cannot read, write or delete the persistent state, so an installed host's enrollment is untouchable from it — and bare `mach` there refuses rather than starting a second identity | agent/ephemeral.go, registerQRCore/registerAPIKeyCore, cmd/mach bootStrap |
@@ -175,8 +187,16 @@ covers one of them is a suggestion.
    anything is dispatched, for every key, every scope, and every machine. This
    is the layer that answers "block this command across the whole fleet". A
    blocked attempt is audited with exit code 126 rather than silently dropped.
-   Because it matches text, it cannot judge a sealed command — which is why
-   sealing is refused while this layer is configured (see "Trust model").
+   Because it matches text, it cannot judge a sealed command, and it does not
+   pretend to: the check is **skipped for a sealed request**, because the grammar
+   applied to the empty command left behind is not a stricter check but a wrong
+   one — under `allowonly` an empty command fails closed, so every sealed command
+   was refused and a console obeying the 403 fell back to plaintext with a command
+   it had been told to keep sealed. The rules are not skipped, they are applied
+   where the plaintext is: on the machine, through the mirror below. (An earlier
+   revision of this document described a "sealing is refused while a policy is
+   configured" rule; that is not the behaviour and must not be reintroduced — the
+   per-org E2E setting is the single decision point.)
 
 The fleet-wide rules are **also mirrored onto every machine** and evaluated
 there, because that is the only place a sealed command's text exists: a control
@@ -203,11 +223,30 @@ must satisfy the allowlist independently; argv (`--`) mode is never split,
 because an argument list is one command and a semicolon inside an argument is
 a character, not a boundary.
 
+Two properties of `allowonly` that a prefix match does not give you for free,
+and that it now enforces rather than assumes:
+
+- **What it permits is what runs.** An allow rule is anchored at the start of a
+  command, and a prefix stops describing the command once the shell can start a
+  *second* one inside it. `allowonly` + `allow:kubectl` used to permit
+  `kubectl get pods $(rm -rf /)` and ``echo `rm -rf /` `` — and the shell ran the
+  inner command. Substitution and process substitution are now refused in
+  allowlist mode. This is a refusal, not a parser: the constructs cannot be
+  enumerated, so an allowlist declines what it cannot see through, and argv mode
+  remains the way to pass one as literal text.
+- **A `#` starts a comment at the beginning of a word.** Only whole-line
+  comments used to be stripped, so `allowonly # only these` matched no rule and
+  vanished — the operator had no allowlist at all while the file said otherwise
+  — and `deny:rm -rf # never` became a substring nothing contains, an inert rule.
+  Both failed open.
+
 **This is a block list for mistakes and policy violations, not a confinement
 boundary.** It matches text. Text can be obfuscated in ways a normalizer
-cannot enumerate (`$(printf ...)`, base64 through a second program, a program
-that does the dangerous thing itself), and no amount of pattern work fixes
-that. Use OS-level confinement — containers, systemd sandboxing, SELinux/AppArmor,
+cannot enumerate (base64 through a second program, an interpreter invoked with
+the payload as an argument, a program that does the dangerous thing itself),
+and no amount of pattern work fixes that. The allowlist's refusal of
+substitution is the same kind of control at a different altitude: it closes the
+cheap shapes, not the idea of obfuscation. Use OS-level confinement — containers, systemd sandboxing, SELinux/AppArmor,
 network policy — when the threat is a determined attacker rather than an
 operator, a script, or an LLM that reached for the wrong command. Do not read
 the rules above as anything more than a seatbelt.
