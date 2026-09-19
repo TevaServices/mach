@@ -145,7 +145,9 @@ Put Caddy/nginx in front for TLS (agents speak wss://).
 - Pairing tokens are single-use, ~10-minute TTL; pair-start is rate-limited
   and a token grants nothing until phone approval, which requires the
   challenge code read off the machine's own console. The code gates the pair
-  page's deny button as well as its approve button.
+  page's deny button as well as its approve button, and the machine completes
+  the pairing by signing the pairing token with the key it is enrolling — so a
+  token holder cannot claim it on the machine's behalf.
 - **Command policy, in two layers:** each agent can hold its own block list
   (`MACH_POLICY`) that nothing upstream can override, and the control plane
   can hold a fleet-wide one (`MACH_EXEC_POLICY` / `MACH_EXEC_POLICY_FILE`)

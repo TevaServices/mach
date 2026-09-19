@@ -2,6 +2,8 @@ package agent
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -219,12 +221,18 @@ func registerQRCore(server, org string, id *Identity, e2eKey *E2EKeyPair, tempor
 approved:
 	// The phone verified the challenge code; claim creates the machine and
 	// burns the one-time token. Response carries the server's public key.
+	// The claim carries a signature over the pairing token, so the control plane
+	// knows the machine presenting the token also holds the identity key the
+	// pairing was opened for — and not merely someone who read the QR and knows
+	// this machine's public key (see protocol.ClaimMessage).
+	claimSig := ed25519.Sign(id.Priv, []byte(protocol.ClaimMessage(start.Token)))
 	claim, err := postJSON2[struct {
 		OK        string `json:"ok"`
 		Machine   string `json:"machine"`
 		ServerKey string `json:"server_key"`
 	}](server, "/v1/pair/claim", protocol.PairClaimRequest{
 		PubKey: id.PubHex, PubE2E: e2eKey.PublicKeyHex(), Token: start.Token, Temporary: temporary,
+		Auth: "v1 " + base64.StdEncoding.EncodeToString(claimSig),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("pair claim: %w", err)

@@ -14,6 +14,10 @@ package server
 // approved.
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -24,15 +28,23 @@ import (
 	"time"
 
 	"github.com/TevaServices/mach/internal/protocol"
+	"github.com/TevaServices/mach/internal/store"
 )
 
 func TestPairApprovalWorksOverHTTP(t *testing.T) {
 	s, st := newAuthTestServer(t)
 	h := s.Routes()
 
-	// The agent asks to pair.
+	// The agent asks to pair, with a real keypair — the claim has to be signed
+	// by the private half, so a placeholder would not reach the interesting
+	// part of this test.
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	pubHex := hex.EncodeToString(pub)
 	code, body := bearerJSON(t, h, "POST", "/v1/pair/start", "",
-		`{"pub_key":"`+strings.Repeat("ab", 32)+`","hostname":"h","os":"linux","arch":"amd64"}`)
+		`{"pub_key":"`+pubHex+`","hostname":"h","os":"linux","arch":"amd64"}`)
 	if code != http.StatusOK {
 		t.Fatalf("pair start: %d (%s)", code, body)
 	}
@@ -83,9 +95,10 @@ func TestPairApprovalWorksOverHTTP(t *testing.T) {
 		t.Fatalf("pairing name = %q, want bcross-web-01", p.Name)
 	}
 
-	// The agent completes it, and the machine exists.
-	claim := fmt.Sprintf(`{"pub_key":%q,"token":%q,"name":%q}`,
-		strings.Repeat("ab", 32), start.Token, "bcross-web-01")
+	// The agent completes it, proving it holds the key it claims.
+	sig := ed25519.Sign(priv, []byte(protocol.ClaimMessage(start.Token)))
+	claim := fmt.Sprintf(`{"pub_key":%q,"token":%q,"name":%q,"auth":%q}`,
+		pubHex, start.Token, "bcross-web-01", "v1 "+base64.StdEncoding.EncodeToString(sig))
 	if code, body := bearerJSON(t, h, "POST", "/v1/pair/claim", "", claim); code != http.StatusOK {
 		t.Fatalf("claim: %d (%s)", code, body)
 	}
@@ -447,4 +460,95 @@ func TestPairDenyWithoutTheCodeIsRefused(t *testing.T) {
 	if p == nil || s.st.PairingState(p) != "denied" {
 		t.Fatalf("state = %q, want denied", s.st.PairingState(p))
 	}
+}
+
+// The claim is a statement by the machine, not by whoever holds the token.
+//
+// The machine's *public* key is not a secret once it has been used anywhere, so
+// a caller holding the token and that key could claim the pairing first and
+// choose the row's `pub_e2e` and `temporary`. The real agent's claim still
+// succeeded — it takes the idempotent "already enrolled" path — so the damage
+// was quiet: sealed commands sealed to a key the machine cannot open, every
+// console pinning that key, and a row marked temporary that the next enrollment
+// may take over. Requiring a signature over the pairing token closes it.
+func TestPairClaimRequiresProofOfPossession(t *testing.T) {
+	s, st := newAuthTestServer(t)
+	h := s.Routes()
+
+	// The real agent: it holds the private key for the pairing's public key.
+	agentPub, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	agentPubHex := hex.EncodeToString(agentPub)
+	// The attacker: the token, and the machine's public key — nothing else.
+	_, attackerPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+
+	_, token, code, err := st.CreatePairing(agentPubHex, "h", "linux", "amd64", "v", 10*time.Minute)
+	if err != nil {
+		t.Fatalf("create pairing: %v", err)
+	}
+	// Approved by the operator, with the code from the machine's console.
+	if ok, why, err := st.ApprovePairing(mustPairingID(t, st, token), code, "bcross-web"); err != nil || !ok {
+		t.Fatalf("approve: ok=%v why=%q err=%v", ok, why, err)
+	}
+
+	claim := func(auth string) string {
+		return fmt.Sprintf(`{"pub_key":%q,"token":%q,"e2e_pub":"ab","temporary":true,"auth":%q}`,
+			agentPubHex, token, auth)
+	}
+	// Each of these must be refused, and must create nothing.
+	for _, attempt := range []struct {
+		name string
+		auth string
+	}{
+		{"no signature at all", ""},
+		{"a signature by a different key", "v1 " + base64.StdEncoding.EncodeToString(
+			ed25519.Sign(attackerPriv, []byte(protocol.ClaimMessage(token))))},
+		{"a valid signature over something else", "v1 " + base64.StdEncoding.EncodeToString(
+			ed25519.Sign(agentPriv, []byte("some other message")))},
+		{"a signature over another pairing's token", "v1 " + base64.StdEncoding.EncodeToString(
+			ed25519.Sign(agentPriv, []byte(protocol.ClaimMessage("someone-elses-token"))))},
+		{"not even base64", "v1 !!!!"},
+	} {
+		code, body := bearerJSON(t, h, "POST", "/v1/pair/claim", "", claim(attempt.auth))
+		if code != http.StatusForbidden {
+			t.Fatalf("%s: claim returned %d, want 403 (%s)", attempt.name, code, body)
+		}
+		if m, _ := st.MachineByName("bcross-web"); m != nil {
+			t.Fatalf("%s: a machine was created by an unsigned claim", attempt.name)
+		}
+	}
+	// The pairing survived every one of them: an attacker must not be able to
+	// burn a legitimate enrollment just by trying.
+	if p, _ := st.PairingByToken(token); p == nil || st.PairingState(p) != "approved" {
+		t.Fatal("a refused claim consumed or altered the pairing")
+	}
+
+	// The machine's own signature is accepted, and claims the row.
+	sig := ed25519.Sign(agentPriv, []byte(protocol.ClaimMessage(token)))
+	if code, body := bearerJSON(t, h, "POST", "/v1/pair/claim", "", claim("v1 "+base64.StdEncoding.EncodeToString(sig))); code != http.StatusOK {
+		t.Fatalf("the machine's own signed claim returned %d (%s)", code, body)
+	}
+	m, err := st.MachineByName("bcross-web")
+	if err != nil || m == nil {
+		t.Fatalf("the signed claim did not create the machine: %v", err)
+	}
+	if m.PubKey != agentPubHex {
+		t.Fatalf("machine key = %q, want the machine's own", m.PubKey)
+	}
+}
+
+// mustPairingID resolves a pairing's row id from its token, which is all the
+// page-level flow naturally has in hand.
+func mustPairingID(t *testing.T, st *store.Store, token string) string {
+	t.Helper()
+	p, err := st.PairingByToken(token)
+	if err != nil || p == nil {
+		t.Fatalf("pairing missing: %v", err)
+	}
+	return p.ID
 }

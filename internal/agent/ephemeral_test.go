@@ -14,6 +14,9 @@ package agent
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -29,9 +32,15 @@ import (
 // fakePlane approves a pairing immediately, so the QR flow completes without a
 // phone. It records the pubkeys the agent presented, so the test can prove the
 // in-memory identity is the one that was enrolled.
-func fakePlane(t *testing.T) (*httptest.Server, *struct{ pub, pubE2E, name string }) {
+func fakePlane(t *testing.T) (*httptest.Server, *struct {
+	pub, pubE2E, name string
+	claimSigned       bool
+}) {
 	t.Helper()
-	got := &struct{ pub, pubE2E, name string }{}
+	got := &struct {
+		pub, pubE2E, name string
+		claimSigned       bool
+	}{}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/pair/start", func(w http.ResponseWriter, r *http.Request) {
@@ -52,6 +61,12 @@ func fakePlane(t *testing.T) (*httptest.Server, *struct{ pub, pubE2E, name strin
 		var req protocol.PairClaimRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		got.name = req.Name
+		// Verify the claim's signature the way the control plane does, against
+		// the key the agent presented at pair/start and with the shared message.
+		// This is the seam that matters: the agent half of the signature is only
+		// exercised end to end here and in scripts/e2e.sh, so a change to either
+		// side has to fail in one of them.
+		got.claimSigned = claimSignatureVerifies(got.pub, req)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"ok": "enrolled", "machine": "bcross-web", "server_key": "deadbeef",
@@ -92,6 +107,13 @@ func TestTemporaryEnrollmentKeepsEverythingInMemory(t *testing.T) {
 	}
 	if got.pubE2E != e2eKey.PublicKeyHex() {
 		t.Fatalf("registered an E2E key that is not the in-memory one")
+	}
+	// And the claim proved possession of that identity: the same in-memory
+	// private key the control plane will later authenticate this machine's
+	// connection with. Without it the control plane refuses the claim, so a
+	// temporary session that could not sign would never enroll at all.
+	if !got.claimSigned {
+		t.Fatal("the temporary session completed a pairing without proving it holds the key")
 	}
 
 	// And the state directory is untouched — the point of the whole mode.
@@ -241,4 +263,19 @@ func captureStdout(t *testing.T, fn func()) string {
 	var buf bytes.Buffer
 	_, _ = io.Copy(&buf, r)
 	return buf.String()
+}
+
+// claimSignatureVerifies is the control plane's half of the claim check,
+// written out here so the agent's half is tested against the same rule rather
+// than against its own idea of it.
+func claimSignatureVerifies(pubHex string, req protocol.PairClaimRequest) bool {
+	pub, err := hex.DecodeString(pubHex)
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		return false
+	}
+	sig, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(req.Auth, "v1 "))
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		return false
+	}
+	return ed25519.Verify(ed25519.PublicKey(pub), []byte(protocol.ClaimMessage(req.Token)), sig)
 }

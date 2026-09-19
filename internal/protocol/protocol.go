@@ -377,6 +377,11 @@ type PairClaimRequest struct {
 	PubE2E string `json:"pub_e2e,omitempty"` // X25519 public key for E2E exec (hex)
 	Token  string `json:"token"`
 	Name   string `json:"name"`
+	// Auth proves possession of the private key for PubKey: "v1 <base64
+	// ed25519 signature>" over ClaimMessage(Token). It is required, and it is
+	// what makes the claim a statement by the machine rather than by whoever
+	// holds the token — see ClaimMessage and SECURITY-NOTES.md.
+	Auth string `json:"auth"`
 	// Temporary marks an enrollment that belongs to a session rather than to a
 	// machine: plain `mach` on a target, which keeps nothing on disk and revokes
 	// itself on the way out. It is recorded so the enrollment can be taken over
@@ -395,6 +400,23 @@ type PairStartReq struct {
 	Arch     string `json:"arch,omitempty"`
 	AgentVer string `json:"agent_version,omitempty"`
 }
+
+// ClaimMessage is the exact string an agent signs to complete a pairing.
+//
+// The token is the whole message because it is already the thing that names
+// this pairing: 256 bits of server-generated entropy, single-use, and known only
+// to the agent that started the pairing and to whoever read the QR. Signing it
+// therefore proves the signer holds the identity key *for this pairing*, and
+// cannot be replayed into another one.
+//
+// The prefix is a domain separator, not decoration. The same identity key signs
+// the connection hello (`name|challenge`), and without a distinct prefix a
+// signature from one context would be a valid signature in the other for
+// whatever string happened to line up. It lives here, in the wire package, so
+// the agent and the control plane cannot disagree about the spelling — the two
+// halves of the hello message are written once on each side, and this is the
+// shape that drifts.
+func ClaimMessage(token string) string { return "mach-pair-claim|" + token }
 
 // PairStatusReq is the agent's poll while waiting for phone approval.
 type PairStatusReq struct {

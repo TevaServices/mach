@@ -136,7 +136,8 @@ from the broker; nothing protects content from the machine's own operator.
 | Control-plane identity key persisted & pinned by agents; signed update manifests (sig over version\|sha256) | server/serverkey.go, agent/run.go handleUpdate |
 | Pairing tokens: 256-bit, single-use, ~10 min TTL | store.CreatePairing |
 | Challenge codes: 12 chars, agent-console-only, typed blind on phone; 5 wrong attempts expire the pairing. **Never placed in the QR, the URL or the pair page** — the QR carries the org and a suggested machine name, and the code stays on the agent's console. It gates **every** action on the page, approve and deny alike, so a photographed QR cannot approve, cannot deny, and cannot learn a name | store.NewChallengeCode, server/pairpages.go pairPageHandler/requirePairingCode, agent/register.go pairPrefill |
-| Pair-start rate limit (5 per IP / 10 min) and auth-failure rate limit (20 / 10 min) | server.go, consoleapi.go |
+| Pair-start rate limit (5 per IP / 10 min) and auth-failure rate limit (20 / 10 min), which every bearer surface now uses — including `/v1/register/apikey` and `/v1/agent/ws` (failed dials only, so a fleet behind one address spends nothing by connecting) | server.go, consoleapi.go, agent.go |
+| **The pair claim proves possession of the key it claims**: the agent signs the pairing token with its identity key (`protocol.ClaimMessage`), so a caller holding the token and the machine's *public* key cannot claim the pairing first and choose the row's `pub_e2e` or `temporary` | server/agent.go handlePairClaim/verifyClaimAuth, agent/register.go |
 | Org-prefixed machine names, conflicts error, and every submitted name validated regardless of what the QR suggested. The pair page pre-fills the org and a hostname-derived machine name **as editable defaults under a line saying the agent supplied them** (the `org` and `name` query parameters on the pair link); a suggested value is shown only if it satisfies `store.ValidMachinePart` (the store's own rule, not a second one) and is re-validated on submit, and nothing acts on it | store.ValidOrgName/ValidMachinePart, server/orgs.go, pairpages.go suggestedOrg/suggestedNamePart, agent/register.go suggestMachinePart |
 | Scoped API keys (enroll / readonly / exec:* / exec:m1\|m2), server-generated 192-bit secrets, stretched salted hashes | controlplane.AddAPIKey, store |
 | Read-only keys see the whole fleet and the whole audit trail, and nothing else | server/consoleapi.go canRead/readScope |
@@ -521,17 +522,7 @@ signature protects delivery, the attestation records provenance.
     "nothing upstream can loosen the local rules" claim is about the *agent*,
     not about a command that can edit the file. Privilege separation between the
     agent user and the command user is the fix; there is none today.
-19. **The pair claim proves the token, not possession of the key it claims.**
-    `/v1/pair/claim` matches `pub_key` by string equality against the pairing
-    row. An attacker holding both the token *and* the machine's public key can
-    therefore win the claim race and choose `temporary` and `pub_e2e` for the
-    row. The preconditions are strong — the public key is in neither the QR nor
-    the pair page, and the token is only in the QR — and the impact is squatting
-    (the real agent's claim then fails) or a machine whose sealed commands
-    cannot be opened, not disclosure. A signature over `name|token` at claim
-    time would close it; that is a protocol change both ends have to make, so it
-    is recorded here rather than half-done.
-20. **A sealed frame has no freshness binding.** The AEAD binds the recipient's
+19. **A sealed frame has no freshness binding.** The AEAD binds the recipient's
     key and the format version, but not a request id or a timestamp, so a
     captured sealed frame that is replayed re-executes. The control plane is the
     only source of frames on that path and it already holds dispatch authority,
@@ -539,54 +530,54 @@ signature protects delivery, the attestation records provenance.
     directly — and "one command is one execution" is enforced in the console,
     not on the wire. Bind the dispatch `ReqID` into the HKDF info or the AAD if
     that ever needs to change.
-21. **Updates have no anti-rollback.** A manifest signed earlier replays
+20. **Updates have no anti-rollback.** A manifest signed earlier replays
     forever: an agent that has already applied `1.4.0` will accept `1.2.0`
     again if an attacker can present that manifest. Subsumed by the control
     plane being the signer (gap #2) — a malicious database can already push any
     correctly signed binary — but a monotonic version check on the agent would
     narrow it, and does not exist.
-22. **No PKCE on the OIDC exchange.** The UI is a confidential client with a
+21. **No PKCE on the OIDC exchange.** The UI is a confidential client with a
     client secret, which is the case where PKCE is optional rather than
     required, and the login CSRF is covered by the state cookie. It is a
     one-line BCP upgrade away and is not done.
-23. **Windows runs no privilege drop, and the task requests the highest
+22. **Windows runs no privilege drop, and the task requests the highest
     privileges available.** `installWindows` creates the scheduled task with
     `/RL HIGHEST`, so an agent installed by an administrator runs commands with
     that administrator's full token. `MACH_USER` and the drop are Linux-only.
     This is the same-uid gap (#18) taken to its conclusion, and it is a Windows
     deployment's own decision what account the task runs as.
-24. **A daemonizing command escapes the tree kill.** The process-group kill
+23. **A daemonizing command escapes the tree kill.** The process-group kill
     reaches children and grandchildren that stayed in the group; a `setsid` or
     double-forking daemon leaves it and survives, by design of the mechanism
     rather than by oversight. Same family as the string-matcher carve-out: use
     OS-level confinement when a command is the threat.
-25. **The E2E pin file has no cross-process locking.** Two consoles on one host
+24. **The E2E pin file has no cross-process locking.** Two consoles on one host
     sealing to the same machine for the first time can both read the pin file,
     both find no entry, and the later write wins — losing one pin, once. It is
     first-use only and shared-user only, and the file is an error rather than
     "no pins" when it cannot be parsed, so the failure is narrow rather than
     silent.
-26. **There are no per-command resource limits.** A command can spin a CPU or
+25. **There are no per-command resource limits.** A command can spin a CPU or
     fill a disk for as long as its timeout allows (and the timeout is a cap on
     how long the *console* waits, not a kill the machine honours forever). The
     confinement is a process group and a SIGKILL, not rlimits; see the
     `internal/agent/confine.go` package comment.
 
-27. **The org list is public.** The enrollment page prints every configured org
+26. **The org list is public.** The enrollment page prints every configured org
     to an anonymous visitor, and the pair page offers them in a dropdown. That
     is deliberate — the operator has to pick one, and an agent cannot enroll
     without being told which prefix it is under — but it is half of the
     name-space: the other half is the machine part, which is now the only thing
     an unauthenticated caller cannot get (see the pair page and the agent socket
     above). Do not treat an org name as a secret.
-28. **The bounded stores can be filled.** Two in-memory stores refuse rather
+27. **The bounded stores can be filled.** Two in-memory stores refuse rather
     than grow: the UI's in-flight sign-in states (a distributed source that
     fills it blocks *other* operators' sign-ins until the entries age out, up
     to the state TTL) and the fleet's rate limiters (per-IP, so a wide source
     escapes them, and a restart clears them — gaps #6 and #12 are the same
     family). Both are refusals rather than anything worse, and both are the
     cost of a store that cannot be made to grow without bound.
-29. **An unpinned agent trusts TLS alone.** An agent enrolled before server-key
+28. **An unpinned agent trusts TLS alone.** An agent enrolled before server-key
     pinning has no `server_key`, so it cannot verify the control plane's
     identity and logs a warning at every connect instead of refusing. Updates
     still refuse (a manifest must verify against a pin), so integrity holds;

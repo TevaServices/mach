@@ -75,7 +75,9 @@ This is `mach`: remote CLI access to registered machines, outbound-only
    stays on the machine's own screen, read by a person standing at it, and it
    gates **every** action on the pair page — deny as well as approve — because a
    token holder who cannot read the console must not be able to stop an
-   enrollment either. What a token holder can still do (read the machine's
+   enrollment either. The machine then completes the pairing by **signing the
+   pairing token with the key it is enrolling** (`protocol.ClaimMessage`), so the
+   claim is a statement by the machine and not by whoever holds the token. What a token holder can still do (read the machine's
    self-reported details, and burn the pairing by exhausting its attempts) is
    documented in SECURITY-NOTES.md rather than claimed away.
 5. **Names are org-prefixed** (`<org>-<machine>`, validated by
@@ -537,6 +539,18 @@ to run it, and for why the driver difference matters.
   time — unsealed — under output that looked correct. **One command is one
   execution**: a lost reply is reported, never resent. Do not make a downgrade
   silent, and do not widen this to "retry on error".
+- **The pair claim is signed, and the message lives in `protocol`.** The agent
+  signs the pairing token with its identity key to complete a pairing
+  (`protocol.ClaimMessage`), which is what makes the claim a statement by the
+  machine rather than by whoever holds the token: a token holder also needs the
+  machine's *public* key, which is not a secret, so without the signature they
+  could claim first and choose the row's `pub_e2e` and `temporary` while the
+  real agent's claim quietly took the idempotent "already enrolled" path. The
+  message is a function in `protocol` rather than a string written twice,
+  because the hello's equivalent (`name|challenge`) *is* written twice — once in
+  `server/agent.go` and once in `agent/run.go` — and that is the shape that
+  drifts. If you ever unify those, this is the pattern to follow.
+
 - **Audit in E2E mode** writes a `[E2E sealed command]` placeholder with
   exit code only. Needing command content in audit is a deliberate
   policy change to propose — not silently implement.

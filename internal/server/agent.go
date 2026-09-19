@@ -503,6 +503,25 @@ func verifyAgentHello(pubHex string, hr protocol.HelloRequest, nonce string) err
 
 func helloMessage(name, nonce string) string { return name + "|" + nonce }
 
+// verifyClaimAuth reports whether a claim is signed by the key it presents.
+//
+// The signature is checked against the key *in the request*, not against the
+// pairing's — that is what makes it a proof of possession rather than a
+// comparison of public strings. The caller then requires the two to be the same
+// key, which is the separate question of whether this signer is the one the
+// pairing was opened for.
+func verifyClaimAuth(req protocol.PairClaimRequest) bool {
+	pub, err := hex.DecodeString(req.PubKey)
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		return false
+	}
+	sig, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(req.Auth, "v1 "))
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		return false
+	}
+	return ed25519.Verify(ed25519.PublicKey(pub), []byte(protocol.ClaimMessage(req.Token)), sig)
+}
+
 func mustJSON(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
@@ -519,6 +538,26 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 	p, err := s.st.PairingByToken(req.Token)
 	if err != nil || p == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown pairing"})
+		return
+	}
+	// Proof of possession, before anything that could act on the pairing.
+	//
+	// The claim used to be a statement by whoever held the token: the machine's
+	// *public* key is not a secret once it has been used anywhere, so an
+	// attacker holding the token and that public key could claim the pairing
+	// first and choose the row's `pub_e2e` and `temporary`. The real agent's
+	// claim then still succeeded (it takes the idempotent "already enrolled"
+	// path), so the damage was quiet rather than loud: sealed commands sealed to
+	// a key the machine cannot open, every console pinning that key, and a row
+	// marked temporary that the next enrollment may take over. Requiring a
+	// signature over the pairing token makes the claim a statement by the
+	// machine, and nothing a token holder can forge.
+	//
+	// Before the pubkey match below, because possession is the stronger fact:
+	// a caller who signs correctly and still does not match the row is a real
+	// conflict, while a caller who cannot sign has nothing to say about it.
+	if !verifyClaimAuth(req) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "claim is not signed by the key it claims"})
 		return
 	}
 	if p.PubKey != req.PubKey {
