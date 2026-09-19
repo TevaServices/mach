@@ -1020,9 +1020,10 @@ func snippet(s string, n int) string {
 }
 
 // RedactScrubs masks values next to secret-bearing keywords while keeping
-// the keyword visible for audit readability. Everything from the separator to
-// end of line after a keyword is masked (covers "password=x", "password: x",
-// "Bearer xyz", multi-word tokens).
+// the keyword visible for audit readability.
+//
+// Everything from the separator to end of line after a keyword is masked
+// (covers "password=x", "password: x", "Bearer xyz", multi-word tokens).
 //
 // The value has three forms because a quoted one used to defeat the whole
 // control: the unquoted class excludes quotes, so in `PASSWORD='hunter2'` it
@@ -1030,12 +1031,51 @@ func snippet(s string, n int) string {
 // place — `PASSWORD=[REDACTED]'hunter2'` in the row, served to every readonly
 // and exec-scoped key by GET /v1/audit and readable by anyone with DB access.
 // A quoted value is now matched including its quotes, and dropped whole.
-var secretPattern = regexp.MustCompile(`(?i)(password|passwd|secret|token|api[_-]?key|authorization|private key)\s*[=:]\s*(?:'[^'\n]{0,1000}'|"[^"\n]{0,1000}"|[^'"\n]{0,1000})`)
-
+//
+// Three shapes are handled, and each exists because its absence leaked a secret
+// into a row the audit trail keeps:
+//
+//   - keyword<separator>value, where the keyword may carry a suffix. Requiring
+//     the separator to follow the keyword *immediately* is what let
+//     `AWS_SECRET_ACCESS_KEY=…` through: environment variable names are built
+//     from underscores, and an access key is routinely exported on the command
+//     line. The whole name is captured, so the row still reads as what it was.
+//   - a long option that separates its value with whitespace rather than '=',
+//     because `--password hunter2` was recorded verbatim.
+//   - credentials inside a URL, because `postgres://mach:S3cret@host/db` is the
+//     shape this project's own MACH_TEST_POSTGRES uses — so a pasted DSN leaked
+//     its password into the audit log.
+//
+// Only the last of the three is bounded by something other than end of line, so
+// it runs first and cannot be swallowed by the others. Over-redaction is
+// possible in one direction only (an unquoted value runs to end of line), which
+// is the direction a guardrail has to fail in.
 func RedactScrubs(s string) string {
 	s = strings.ReplaceAll(s, "\x00", "")
+	s = urlCredentialPattern.ReplaceAllString(s, "$1:[REDACTED]@")
+	s = flagSecretPattern.ReplaceAllString(s, "$1 [REDACTED]")
 	return secretPattern.ReplaceAllString(s, "$1=[REDACTED]")
 }
+
+// secretValue is what may follow a separator: a quoted value including its
+// quotes, or an unquoted run to end of line. Capped so a pathological line
+// cannot make the match quadratic.
+const secretValue = `(?:'[^'\n]{0,1000}'|"[^"\n]{0,1000}"|[^'"\n]{0,1000})`
+
+// secretKeyword is a word that introduces a secret, plus any suffix of
+// name characters — see RedactScrubs for why the suffix is there.
+const secretKeyword = `(?:password|passwd|secret|token|api[_-]?key|authorization|private[ _]key)[a-z0-9_-]*`
+
+var (
+	// The keyword-value pair: `password=x`, `password: x`, `AWS_SECRET_ACCESS_KEY=…`.
+	secretPattern = regexp.MustCompile(`(?i)(` + secretKeyword + `)\s*[=:]\s*` + secretValue)
+	// A long option whose value follows a space: `--password hunter2`. The
+	// flag must be a long one — a bare `-p` is far too ambiguous to match.
+	flagSecretPattern = regexp.MustCompile(`(?i)(--` + secretKeyword + `)\s+` + secretValue)
+	// Credentials in a URL's userinfo. The scheme is required, so ordinary
+	// `user@host` text is untouched.
+	urlCredentialPattern = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://[^/\s:@]+):([^@\s]+)@`)
+)
 
 // Setting reads a control-plane setting. An absent key is not an error: it
 // means "never set", and the caller's default applies.

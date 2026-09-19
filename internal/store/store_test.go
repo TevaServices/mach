@@ -240,6 +240,45 @@ func TestAuditRedactionQuotedValues(t *testing.T) {
 	}
 }
 
+// Three shapes that carried a secret straight into the row. Each is a shape
+// people actually type, and each defeated the keyword rule for a different
+// reason: the separator was whitespace rather than '=' or ':' (a long option),
+// the keyword was not followed immediately by a separator (an env name built
+// from underscores), or the secret was not next to a keyword at all (a URL's
+// userinfo — including the DSN shape this project's own MACH_TEST_POSTGRES
+// uses, so a pasted connection string leaked its password to every readonly
+// key's audit view).
+func TestAuditRedactionCoversRealSecretShapes(t *testing.T) {
+	for _, in := range []string{
+		`psql postgres://mach:S3cret@127.0.0.1:5432/mach`,
+		`pg_dump -d "postgresql://mach:hunter2@db.internal/mach"`,
+		`AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI`,
+		`export AWS_SECRET_ACCESS_KEY='wJalrXUtnFEMI'`,
+		`MY_APP_API_TOKEN=abc123`,
+		`mysql --password hunter2 -e "select 1"`,
+		`curl --api-key abc123 https://example.com`,
+	} {
+		got := RedactScrubs(in)
+		for _, secret := range []string{"S3cret", "hunter2", "wJalrXUtnFEMI", "abc123"} {
+			if strings.Contains(got, secret) {
+				t.Errorf("secret survived redaction:\n in %q\n got %q", in, got)
+			}
+		}
+		if !strings.Contains(got, "[REDACTED]") {
+			t.Errorf("nothing was redacted in %q: %q", in, got)
+		}
+	}
+	// Redaction is a mask, not a deletion: the host and the rest of the line
+	// stay readable, which is the point of keeping the keyword in place.
+	if got := RedactScrubs(`pg_dump postgres://mach:S3cret@db.internal/mach`); !strings.Contains(got, "db.internal") {
+		t.Errorf("redaction ate the host: %q", got)
+	}
+	// And a credential-free URL is not a secret: it must come through untouched.
+	if got := RedactScrubs("curl https://example.com/health"); got != "curl https://example.com/health" {
+		t.Errorf("a credential-free URL was mangled: %q", got)
+	}
+}
+
 func TestAuditInsertList(t *testing.T) {
 	st := testStore(t)
 	if err := st.AuditInsert(now(), "bcross-a", "echo hi", "console:k", sql.NullInt64{Int64: 0, Valid: true}, "hi\n", ""); err != nil {
