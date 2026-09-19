@@ -23,30 +23,45 @@ type E2EKeyPair struct {
 	Public  [32]byte
 }
 
-// LoadOrCreateE2EKey reads (or creates) the agent's E2E X25519 keypair in
-// stateDir. Mirrors agent identity key handling (0600 file).
+// LoadOrCreateE2EKey reads (or first-run creates) the agent's E2E X25519
+// keypair in stateDir.
+//
+// It mirrors the identity key's handling (LoadOrCreate), including the two
+// things that shape is for. Any *read* error used to fall through to "create a
+// fresh key", so an EACCES or an I/O fault silently re-keyed the machine — the
+// wrong answer twice over, since it discards the key the control plane and every
+// console have on record, and it does so at the moment something is already
+// wrong with the filesystem. And the file never re-tightened to 0600 on load the
+// way agent.key does, so a key restored from a backup could stay loose.
 func LoadOrCreateE2EKey(stateDir string) (*E2EKeyPair, error) {
 	keyPath := filepath.Join(stateDir, "e2e.key")
-	if raw, err := os.ReadFile(keyPath); err == nil {
-		b, derr := hex.DecodeString(string(raw))
-		if derr != nil || len(b) != 32 {
-			return nil, errors.New("corrupt e2e key at " + keyPath + " — delete it and re-enroll")
+	if _, err := os.Stat(keyPath); errors.Is(err, os.ErrNotExist) {
+		kp, err := generateE2EKeyPair()
+		if err != nil {
+			return nil, err
 		}
-		kp := &E2EKeyPair{}
-		copy(kp.Private[:], b)
-		if err := kp.derivePublic(); err != nil {
+		if err := os.MkdirAll(stateDir, 0o700); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(keyPath, []byte(hex.EncodeToString(kp.Private[:])), 0o600); err != nil {
 			return nil, err
 		}
 		return kp, nil
 	}
-	kp, err := generateE2EKeyPair()
+	raw, err := os.ReadFile(keyPath)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return nil, err
+	if st, serr := os.Stat(keyPath); serr == nil && st.Mode().Perm() != 0o600 {
+		_ = os.Chmod(keyPath, 0o600)
 	}
-	if err := os.WriteFile(keyPath, []byte(hex.EncodeToString(kp.Private[:])), 0o600); err != nil {
+	b, derr := hex.DecodeString(string(raw))
+	if derr != nil || len(b) != 32 {
+		return nil, errors.New("corrupt e2e key at " + keyPath + " — delete it and re-enroll")
+	}
+	kp := &E2EKeyPair{}
+	copy(kp.Private[:], b)
+	if err := kp.derivePublic(); err != nil {
 		return nil, err
 	}
 	return kp, nil

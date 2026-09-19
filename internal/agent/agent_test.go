@@ -2,6 +2,7 @@ package agent
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -194,5 +195,72 @@ func TestE2EKeyPersistence(t *testing.T) {
 	}
 	if kp2.PublicKeyHex() != hex1 {
 		t.Fatal("E2E key not persisted across loads")
+	}
+}
+
+// The agent's E2E key is the one every console pins on first use, so a load
+// that quietly mints a replacement does not look like a broken key — it looks
+// like every console refusing to seal, with the machine reporting itself
+// healthy. Any read error used to fall into "create a fresh key", which threw
+// the old one away at the moment something was already wrong with the
+// filesystem, and the file never re-tightened to 0600 the way agent.key does.
+func TestE2EKeyIsNeverSilentlyReplaced(t *testing.T) {
+	dir := t.TempDir()
+
+	kp, err := LoadOrCreateE2EKey(dir)
+	if err != nil {
+		t.Fatalf("first load: %v", err)
+	}
+	first := kp.PublicKeyHex()
+
+	// A restart is the same key.
+	again, err := LoadOrCreateE2EKey(dir)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if again.PublicKeyHex() != first {
+		t.Fatal("a restart minted a different E2E key")
+	}
+
+	// A loose mode is tightened on load, like the identity key's.
+	keyPath := filepath.Join(dir, "e2e.key")
+	if err := os.Chmod(keyPath, 0o644); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if _, err := LoadOrCreateE2EKey(dir); err != nil {
+		t.Fatalf("reload after a loose mode: %v", err)
+	}
+	if st, err := os.Stat(keyPath); err != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("e2e.key mode = %v (%v), want 600", st.Mode().Perm(), err)
+	}
+
+	// A corrupt file is refused, not replaced, and left for the operator.
+	if err := os.WriteFile(keyPath, []byte("not a key"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := LoadOrCreateE2EKey(dir); err == nil {
+		t.Fatal("a corrupt e2e.key was silently replaced")
+	}
+	if raw, _ := os.ReadFile(keyPath); string(raw) != "not a key" {
+		t.Fatalf("the corrupt key was overwritten: %q", raw)
+	}
+
+	// An unreadable one is refused too — a directory here, so the answer does
+	// not depend on which user the test runs as.
+	bad := t.TempDir()
+	if err := os.Mkdir(filepath.Join(bad, "e2e.key"), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if _, err := LoadOrCreateE2EKey(bad); err == nil {
+		t.Fatal("an unreadable e2e.key was silently replaced")
+	}
+	if st, err := os.Stat(filepath.Join(bad, "e2e.key")); err != nil || !st.IsDir() {
+		t.Fatalf("the unreadable key path was overwritten: %v %v", st, err)
+	}
+
+	// An absent file is still a first run, not a failure.
+	fresh := t.TempDir()
+	if _, err := LoadOrCreateE2EKey(fresh); err != nil {
+		t.Fatalf("an absent e2e.key was treated as a failure: %v", err)
 	}
 }
