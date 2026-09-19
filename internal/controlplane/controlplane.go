@@ -166,6 +166,19 @@ func AddAPIKey(name, scopes string) (key, storedName, storedScopes string, err e
 		if strings.TrimSpace(strings.TrimPrefix(scopes, "exec:")) == "" {
 			return "", "", "", fmt.Errorf("exec: allowlist is empty — list machines (exec:<m1>|<m2>) or use exec:*")
 		}
+		// A literal `*` *among* machine names is refused rather than stored.
+		// `exec:web|*` is always a typo for `exec:*`: no machine is named `*`,
+		// so the key could exec on nothing real — while the control plane's
+		// admin check read the entry as "all machines" and handed it
+		// block/revoke/delete over the fleet. `exec:*` on its own is the way to
+		// say every machine, and it is not affected by this.
+		if allow := strings.TrimSpace(strings.TrimPrefix(scopes, "exec:")); allow != "*" {
+			for _, m := range strings.Split(allow, "|") {
+				if strings.TrimSpace(m) == "*" {
+					return "", "", "", fmt.Errorf("`*` is not a machine name — use exec:* for every machine, or list real names (exec:<m1>|<m2>)")
+				}
+			}
+		}
 	}
 	storedName = strings.ToLower(strings.TrimSpace(name))
 	key = "mach_" + store.RandToken(24) // 192-bit server-generated secret

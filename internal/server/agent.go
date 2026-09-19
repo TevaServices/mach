@@ -131,6 +131,16 @@ func (s *Server) handlePairStatus(w http.ResponseWriter, r *http.Request) {
 // ---- POST /v1/register/apikey  (headless enrollment; requires an enroll-scoped key) ----
 
 func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
+	// Every other bearer surface counts failed attempts against the source
+	// (see authConsole); this one did not, so the documented "auth-failure rate
+	// limit" control simply did not cover it. The keys are 192-bit and guessing
+	// one is not a real attack, but a limit that a caller cannot rely on being
+	// everywhere is one an operator has to remember the exceptions to.
+	ip := s.clientIP(r)
+	if s.authFails.blocked(ip) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many failed auth attempts"})
+		return
+	}
 	var req protocol.RegisterAPIKeyReq
 	if err := readJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json"})
@@ -142,6 +152,7 @@ func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ok || !hasScope(scopes, "enroll") {
+		s.authFails.record(ip)
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid api key"})
 		return
 	}

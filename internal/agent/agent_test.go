@@ -264,3 +264,25 @@ func TestE2EKeyIsNeverSilentlyReplaced(t *testing.T) {
 		t.Fatalf("an absent e2e.key was treated as a failure: %v", err)
 	}
 }
+
+// confinementNote goes into the log and the audit row, so it must describe what
+// the agent actually does. It claimed prlimit CPU and file-size caps for years
+// and nothing ever applied them — a mechanism that was described and never
+// written, which is worse than its absence, because an operator reading the
+// note would have believed a runaway command could not outlive its timeout.
+func TestConfinementNoteClaimsNothingItDoesNotDo(t *testing.T) {
+	note := confinementNote()
+	if strings.Contains(note, "prlimit") || strings.Contains(note, "cpu") || strings.Contains(note, "fsize") {
+		t.Fatalf("confinementNote claims resource limits: %q", note)
+	}
+	switch runtimeGOOSConfine() {
+	case "linux", "darwin":
+		if !strings.Contains(note, "pgroup-kill") {
+			t.Errorf("%s note = %q, want the process-group kill it does do", runtimeGOOSConfine(), note)
+		}
+	default:
+		if !strings.Contains(note, "output-caps") {
+			t.Errorf("note = %q, want what it actually does", note)
+		}
+	}
+}

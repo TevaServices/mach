@@ -41,7 +41,14 @@ type refusal struct {
 // on the unrestricted exec:* key. Enroll-scoped keys live in provisioning
 // pipelines and must never reach any of them.
 func adminScopeOK(scopes string) bool {
-	return hasScope(scopes, "exec") && keyCanExecOn(scopes, "*")
+	// Unrestricted exec means the `exec:*` scope and nothing else — not an
+	// allowlist that happens to contain a literal `*`. `exec:web|*` mints a key
+	// that can exec on no real machine (nothing is named `*`), and reading its
+	// allowlist as "all machines" handed that key block, revoke and delete over
+	// the whole fleet. Minting now refuses a `*` entry as well; this is the
+	// check that has to be right even for scopes written before it.
+	_, all := execAllowlist(scopes)
+	return all
 }
 
 // dispatchRefusal reports why a command may not be dispatched to this machine,
@@ -112,6 +119,15 @@ func (s *Server) revokeMachine(name string, purgeAudit bool) error {
 		_ = ac.Conn.WriteEnvelope(protocol.Envelope{Type: "revoked"})
 		ac.Conn.Close()
 	}
+	// Live console sessions end with it. The machine's own connection going
+	// away strands them — every frame they send afterwards has nowhere to go —
+	// so this is a timeliness wart rather than a capability anyone keeps, but a
+	// session that looks alive in the UI while the machine is out of the fleet
+	// is exactly the kind of thing an operator acts on. Block does this; revoke
+	// and delete should not be the quieter pair.
+	if n := s.killStreamsForMachine(name, "machine revoked by the operator"); n > 0 {
+		s.logf("machine revoked: %q, ended %d live console session(s)", name, n)
+	}
 	if purgeAudit {
 		return s.st.RemoveMachineAudit(name)
 	}
@@ -144,6 +160,11 @@ func (s *Server) deleteMachine(name string) error {
 	if ac := s.br.Get(name); ac != nil {
 		_ = ac.Conn.WriteEnvelope(protocol.Envelope{Type: "deleted"})
 		ac.Conn.Close()
+	}
+	// Same as revoke: the machine is gone, so a console session pointed at it
+	// has nothing left to talk to and should stop looking live.
+	if n := s.killStreamsForMachine(name, "machine deleted by the operator"); n > 0 {
+		s.logf("machine deleted: %q, ended %d live console session(s)", name, n)
 	}
 	return nil
 }

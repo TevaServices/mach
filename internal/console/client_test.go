@@ -946,3 +946,48 @@ func TestLoadConfigDistinguishesUnreadableFromAbsent(t *testing.T) {
 		t.Fatal("an unreadable console.json was reported as not configured — plain `mach` would enroll this box")
 	}
 }
+
+// A terminal record that will not decode is not an exit status either. The
+// zero value was returned for it, which read as success — the same shape as a
+// stream that dies, and the rule "a stream that dies is not success" has to
+// hold for a record we cannot read too.
+//
+// It is not reachable from a command's own output: frames are typed and this one
+// only ever comes from the relay. The rule is about the shape of the answer, not
+// about who could forge it.
+func TestUnreadableExitRecordIsNotSuccess(t *testing.T) {
+	relay := &fakeRelay{responder: func(conn *protocol.WSConn) {
+		sendOut(t, conn, "stdout", "the command ran\n")
+		// A stream_end whose payload is not a terminal record.
+		_ = conn.WriteEnvelope(protocol.Envelope{
+			Type: "stream_end", Payload: json.RawMessage(`"not a record"`),
+		})
+	}}
+	base := relay.start(t)
+
+	var code int
+	stdout, stderr := capture(t, func() {
+		code = streamConsole(base, "key", "org-test-01", "echo hi")
+	})
+	if code != streamLost {
+		t.Fatalf("code = %d, want %d: an unreadable exit record was read as a status", code, streamLost)
+	}
+	if !strings.Contains(stderr, "unreadable exit record") {
+		t.Errorf("stderr = %q, want an explanation", stderr)
+	}
+	// The output that did arrive is still printed: this is about the status, not
+	// about discarding what came before it.
+	if !strings.Contains(stdout, "the command ran") {
+		t.Errorf("stdout = %q, want the bytes that did arrive", stdout)
+	}
+	// The sane case is untouched.
+	ok := &fakeRelay{responder: func(conn *protocol.WSConn) {
+		payload, _ := json.Marshal(protocol.StreamEnd{ExitCode: 7})
+		_ = conn.WriteEnvelope(protocol.Envelope{Type: "stream_end", Payload: payload})
+	}}
+	var code2 int
+	capture(t, func() { code2 = streamConsole(ok.start(t), "key", "org-test-01", "exit 7") })
+	if code2 != 7 {
+		t.Fatalf("a normal exit record reported %d, want 7", code2)
+	}
+}

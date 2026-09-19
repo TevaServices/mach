@@ -176,7 +176,25 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-`, name, userLine, envLine, exe)
+`, unitEscape(name), userLine, envLine, exe)
+}
+
+// unitEscape makes a value safe to interpolate into a systemd unit.
+//
+// The unit is written to /etc/systemd/system as root, so a newline in any
+// interpolated value starts a new directive — a tampered config.json (which
+// lives in the same state dir the command user owns) could add ExecStartPre,
+// User=, or anything else. The in-band values are already validated, so this is
+// the layer that does not depend on that staying true, and the plist side has
+// always escaped its own.
+func unitEscape(s string) string {
+	// A systemd unit is line-oriented and has no general escape for a newline,
+	// so the honest answer is to refuse to emit one: fold CR/LF to a space
+	// rather than let it start a directive.
+	s = strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(s)
+	// A leading '[' would open a new section header; the rest of the characters
+	// that matter to the parser cannot survive the fold above.
+	return strings.TrimLeft(s, "[")
 }
 
 // launchdPlist renders the macOS LaunchAgent.

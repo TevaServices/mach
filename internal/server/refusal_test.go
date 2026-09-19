@@ -285,3 +285,75 @@ func assertNotScopedRows(t *testing.T, st *store.Store, machine string, want int
 		}
 	}
 }
+
+// Unrestricted exec is the `exec:*` scope, and admin power comes from it and
+// nothing else.
+//
+// `exec:web|*` mints a key whose allowlist holds a literal `*`. No machine is
+// named `*`, so the key could exec on no real machine — while the admin check
+// read the entry as "all machines" and handed it block, revoke and delete over
+// the whole fleet. A key scoped that way is always a typo for `exec:*`, so the
+// mint refuses it now too; this is the check that has to be right even for
+// scopes written before that.
+func TestAdminPowerComesFromTheUnrestrictedScopeOnly(t *testing.T) {
+	for _, scopes := range []string{"exec:*", "readonly,exec:*"} {
+		if !adminScopeOK(scopes) {
+			t.Errorf("adminScopeOK(%q) = false, want true", scopes)
+		}
+	}
+	for _, scopes := range []string{
+		"exec:web|*", // the shape that used to confer admin
+		"exec:*|web",
+		"exec:web",
+		"readonly",
+		"enroll",
+		"",
+	} {
+		if adminScopeOK(scopes) {
+			t.Errorf("adminScopeOK(%q) = true — an allowlist is not fleet-wide power", scopes)
+		}
+	}
+}
+
+// The register endpoint checks an API key, so it belongs to the same
+// auth-failure control every other bearer surface uses. It did not: the
+// documented "auth-failure rate limit" simply did not cover it, and a limit an
+// operator has to remember the exceptions to is one they cannot rely on. The
+// keys are 192-bit so guessing one is not a real attack — the point is that the
+// control is where the documentation says it is.
+func TestRegisterEndpointCountsFailedKeyAttempts(t *testing.T) {
+	s, st := newAuthTestServer(t)
+	if err := st.CreateMachine("bcross-web", "pub-web", "h", "linux", "amd64", "v", "", false); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	body := `{"api_key":"mach_wrong","pub_key":"` + strings.Repeat("ab", 32) + `","name":"bcross-new"}`
+	var refused int
+	for i := 0; i < 200; i++ {
+		code, resp := bearerJSON(t, s.Routes(), "POST", "/v1/register/apikey", "", body)
+		if code == http.StatusTooManyRequests {
+			refused++
+			_ = resp
+			break
+		}
+		if code != http.StatusForbidden {
+			t.Fatalf("attempt %d returned %d (%s), want 403", i, code, resp)
+		}
+	}
+	if refused == 0 {
+		t.Fatal("a burst of wrong enroll keys was never throttled")
+	}
+
+	// A correct key is still accepted once the burst stops, so the limiter is a
+	// limit and not a lockout. (A new server: the failed attempts are keyed to
+	// the test's own loopback address and the limiter is in-memory.)
+	s2, st2 := newAuthTestServer(t)
+	if err := st2.CreateMachine("bcross-web", "pub-web", "h", "linux", "amd64", "v", "", false); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	key := adminKey(t, s2, "enroll")
+	good := `{"api_key":"` + key + `","pub_key":"` + strings.Repeat("cd", 32) + `","name":"bcross-web-2"}`
+	if code, resp := bearerJSON(t, s2.Routes(), "POST", "/v1/register/apikey", "", good); code != http.StatusOK {
+		t.Fatalf("a correct enroll key returned %d (%s)", code, resp)
+	}
+}

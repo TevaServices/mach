@@ -650,3 +650,56 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool, msg string) {
 	}
 	t.Fatal(msg)
 }
+
+// Revoking and deleting end live console sessions, the way blocking does.
+//
+// The machine's own connection goes away with it, so a session left open has
+// nowhere to send anything — it is a timeliness wart rather than a capability
+// anyone keeps. But a session that still looks alive in the UI while the machine
+// is out of the fleet is exactly the kind of thing an operator acts on, and
+// block was the only one of the three that cleaned up after itself.
+func TestRevokeAndDeleteEndLiveConsoleSessions(t *testing.T) {
+	for _, action := range []string{"revoke", "delete"} {
+		t.Run(action, func(t *testing.T) {
+			h := newStreamHarness(t)
+			key := adminKey(t, h.s, "exec:*")
+
+			conn, _, resp := h.console(t, key, h.mach)
+			if resp != nil {
+				t.Fatalf("console dial refused: %s", resp.Status)
+			}
+			if n := streamCountForMachine(h.mach); n != 1 {
+				t.Fatalf("sessions before the %s = %d, want 1", action, n)
+			}
+
+			switch action {
+			case "revoke":
+				if err := h.s.revokeMachine(h.mach, false); err != nil {
+					t.Fatalf("revoke: %v", err)
+				}
+			case "delete":
+				if err := h.s.deleteMachine(h.mach); err != nil {
+					t.Fatalf("delete: %v", err)
+				}
+			}
+
+			// The session is told why, and then the socket is closed under it.
+			end := nextFrame(t, conn)
+			if end.Type != "stream_end" {
+				t.Fatalf("frame = %q, want a terminal record", end.Type)
+			}
+			var td protocol.StreamEnd
+			_ = json.Unmarshal(end.Payload, &td)
+			if !strings.Contains(td.Error, action) {
+				t.Fatalf("terminal record says %q, want it to name the %s", td.Error, action)
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for streamCountForMachine(h.mach) != 0 && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			if n := streamCountForMachine(h.mach); n != 0 {
+				t.Fatalf("sessions after the %s = %d, want 0", action, n)
+			}
+		})
+	}
+}

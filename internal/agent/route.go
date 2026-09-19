@@ -31,7 +31,7 @@ func Route(args []string) {
 	case "register":
 		fs := flag.NewFlagSet("register", flag.ContinueOnError)
 		serverURL := fs.String("server", envOr("MACH_SERVER", ""), "control plane base URL (https://…)")
-		apiKey := fs.String("api-key", "", "enroll headlessly with an enroll-scoped API key")
+		apiKey := fs.String("api-key", "", "enroll headlessly with an enroll-scoped API key (`-` reads it from stdin)")
 		name := fs.String("name", "", "machine name, org-prefixed: <org>-<machine>")
 		org := fs.String("org", envOr("MACH_ORG", ""), "org prefix (or MACH_ORG env; prompted if empty)")
 		_ = fs.Parse(args[1:])
@@ -63,6 +63,24 @@ func Route(args []string) {
 			*org = strings.TrimSpace(line)
 			if *org == "" {
 				fmt.Fprintln(os.Stderr, "mach: an org prefix is required (pass --org/--name or set MACH_ORG)")
+				os.Exit(2)
+			}
+		}
+		// `--api-key -` reads the key from stdin. An enroll key on argv is in
+		// `ps` for every local user for the life of the process, and in the
+		// shell history of whoever ran it; the container's entrypoint sets it
+		// from an environment variable, which has the same problem one step
+		// removed. Reading it from a pipe is the shape a provisioning script
+		// can use.
+		if *apiKey == "-" {
+			line, rerr := bufio.NewReader(os.Stdin).ReadString('\n')
+			if rerr != nil && strings.TrimSpace(line) == "" {
+				fmt.Fprintln(os.Stderr, "mach: --api-key - reads the key from stdin, which was empty")
+				os.Exit(2)
+			}
+			*apiKey = strings.TrimSpace(line)
+			if *apiKey == "" {
+				fmt.Fprintln(os.Stderr, "mach: --api-key - reads the key from stdin, which was empty")
 				os.Exit(2)
 			}
 		}

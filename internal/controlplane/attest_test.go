@@ -389,3 +389,28 @@ func TestPushUpdateWithoutAttestationSaysSo(t *testing.T) {
 		t.Fatalf("an unattested push said nothing about it: %q", out)
 	}
 }
+
+// A literal `*` as an allowlist entry is refused at mint time.
+//
+// `exec:web|*` is always a typo for `exec:*`: no machine is named `*`, so the
+// key could exec on nothing real — while the control plane's admin check read
+// the entry as "all machines" and handed it block, revoke and delete over the
+// whole fleet. Refusing it here means an operator gets an error rather than a
+// key that does nothing they meant and something they did not.
+func TestAddAPIKeyRefusesALiteralStarEntry(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MACH_DB", filepath.Join(dir, "mach.db"))
+	t.Setenv("MACH_SERVER_KEY", filepath.Join(dir, "mach.db.key"))
+
+	for _, scopes := range []string{"exec:web|*", "exec:*|web", "exec:* | web"} {
+		if _, _, _, err := AddAPIKey("k", scopes); err == nil {
+			t.Errorf("AddAPIKey(%q) was accepted", scopes)
+		}
+	}
+	// The forms that mean what they say still mint.
+	for _, scopes := range []string{"exec:*", "exec:web|db-1", "readonly", "enroll"} {
+		if _, _, _, err := AddAPIKey("k", scopes); err != nil {
+			t.Errorf("AddAPIKey(%q) was refused: %v", scopes, err)
+		}
+	}
+}

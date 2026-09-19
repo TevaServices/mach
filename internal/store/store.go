@@ -325,16 +325,38 @@ func NormalizeCode(s string) string {
 // The dashes are display only: what is hashed is the normalized form, so the
 // operator may type the code with or without them.
 func NewChallengeCode() string {
-	b := make([]byte, ChallengeCodeLen)
-	if _, err := rand.Read(b); err != nil {
-		panic(err)
-	}
-	out := make([]byte, ChallengeCodeLen)
-	for i, c := range b {
-		out[i] = challengeAlphabet[int(c)%len(challengeAlphabet)]
+	out := make([]byte, 0, ChallengeCodeLen)
+	var b [1]byte
+	for len(out) < ChallengeCodeLen {
+		if _, err := rand.Read(b[:]); err != nil {
+			panic(err)
+		}
+		i, ok := challengeIndex(b[0])
+		if !ok {
+			continue // redraw; see challengeIndex for why
+		}
+		out = append(out, challengeAlphabet[i])
 	}
 	s := string(out)
 	return s[0:4] + "-" + s[4:8] + "-" + s[8:12]
+}
+
+// challengeIndex maps a random byte to a position in the alphabet, reporting
+// false when the byte must be redrawn.
+//
+// Rejection sampling rather than `b % 31`. 256 is not a multiple of the
+// 31-character alphabet, so a modulo makes the first eight letters likelier
+// than the rest — a sliver of the ~60 bits the code is documented to carry, and
+// free to remove: bytes at or above the largest multiple of the alphabet that
+// fits in one (248) are redrawn, and every remaining byte maps to exactly one
+// letter. It is a function here rather than inline so the property is exactly
+// testable rather than statistically sampled.
+func challengeIndex(b byte) (int, bool) {
+	limit := 256 - (256 % len(challengeAlphabet))
+	if int(b) >= limit {
+		return 0, false
+	}
+	return int(b) % len(challengeAlphabet), true
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339) }

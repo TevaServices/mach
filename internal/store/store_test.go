@@ -714,3 +714,44 @@ func modeOf(t *testing.T, path string) os.FileMode {
 	}
 	return fi.Mode().Perm()
 }
+
+// The challenge code is documented as ~60 bits, so every letter of the
+// 31-character alphabet has to be exactly as likely as every other. `b % 31`
+// is not that: 256 is not a multiple of 31, so the first eight letters came up
+// on nine of the 256 byte values and the rest on eight — a sliver of the
+// entropy, negligible in practice and free to remove.
+//
+// The mapping is asserted exactly rather than sampled: every alphabet position
+// must be reachable from the same number of byte values, and the bytes that
+// would break that balance must be redrawn rather than folded in.
+func TestChallengeCodeBytesMapUniformly(t *testing.T) {
+	counts := map[int]int{}
+	for i := 0; i < 256; i++ {
+		idx, ok := challengeIndex(byte(i))
+		if !ok {
+			continue
+		}
+		if idx < 0 || idx >= len(challengeAlphabet) {
+			t.Fatalf("challengeIndex(%d) = %d, out of range", i, idx)
+		}
+		counts[idx]++
+	}
+	if len(counts) != len(challengeAlphabet) {
+		t.Fatalf("%d of %d letters are reachable", len(counts), len(challengeAlphabet))
+	}
+	want := counts[0]
+	for idx, n := range counts {
+		if n != want {
+			t.Fatalf("letter %q is reachable from %d bytes and letter %q from %d — the code is biased",
+				challengeAlphabet[idx], n, challengeAlphabet[0], want)
+		}
+	}
+	// The redrawn bytes are exactly the ones above the largest multiple of the
+	// alphabet, which is what makes the counts above equal.
+	if _, ok := challengeIndex(255); ok {
+		t.Fatal("a byte above the rejection limit was accepted")
+	}
+	if _, ok := challengeIndex(247); !ok {
+		t.Fatal("a byte inside the limit was rejected")
+	}
+}

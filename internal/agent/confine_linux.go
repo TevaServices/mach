@@ -7,10 +7,11 @@ import (
 )
 
 // linuxProcAttr builds SysProcAttr with setpgid (own process group).
-// Go's os/exec does NOT expose child rlimits via SysProcAttr on stock Go
-// (only on the golang.org/x/sys fork used by some projects); instead the
-// agent applies rlimits by re-execing itself through prlimit(1) when
-// available, or falls back to pgroup-only. See confineApply in run.go.
+//
+// Process group only: Go's os/exec does not expose child rlimits through
+// SysProcAttr, and nothing here re-execs through prlimit(1) to add them. The
+// comment that used to say otherwise described a mechanism nobody wrote — see
+// the package comment on confine.go.
 func linuxProcAttr() any {
 	return &syscall.SysProcAttr{Setpgid: true}
 }

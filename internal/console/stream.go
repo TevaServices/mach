@@ -119,7 +119,6 @@ func streamConsole(server, apiKey, machine, command string) int {
 		}
 	}()
 
-	exit := 0
 	for {
 		_, raw, err := ws.ReadMessage()
 		if err != nil {
@@ -157,13 +156,22 @@ func streamConsole(server, apiKey, machine, command string) int {
 			}
 		case "stream_end":
 			var end protocol.StreamEnd
-			if json.Unmarshal(env.Payload, &end) == nil {
-				if end.Error != "" {
-					fmt.Fprintln(os.Stderr, "mach: "+end.Error)
-				}
-				exit = end.ExitCode
+			if json.Unmarshal(env.Payload, &end) != nil {
+				// A terminal record that will not decode is not an exit status,
+				// and reporting the zero value made it read as one: "a stream
+				// that dies is not success" has to hold for a record we cannot
+				// read too. Not reachable from a command's own output — frames
+				// are typed and this one only ever comes from the relay — but the
+				// rule is about the shape of the answer, not about who could
+				// forge it.
+				fmt.Fprintln(os.Stderr,
+					"mach: the stream ended with an unreadable exit record — the command may still be running on "+machine)
+				return streamLost
 			}
-			return exit
+			if end.Error != "" {
+				fmt.Fprintln(os.Stderr, "mach: "+end.Error)
+			}
+			return end.ExitCode
 		}
 	}
 }
