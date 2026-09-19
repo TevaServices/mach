@@ -1,7 +1,8 @@
-# Default owner for every path.
+# Only the repo owner is listed, deliberately.
 #
-# The `Main` ruleset requires a code-owner review, and GitHub blocks
-# self-approval — so with a single owner, a maintainer-authored PR is
-# unmergeable and only that owner can unblock a dependabot PR. Listing
-# both maintainers keeps either one able to satisfy the review.
-* @bcross @jon-davie
+# GitHub auto-requests review from every code owner the moment a PR opens,
+# and CODEOWNERS has no way to opt one person out of that. Listing a second
+# maintainer here pings them on every PR targeting `main` — do not add one.
+# The `Main` ruleset's code-owner requirement is satisfied by the single
+# entry below.
+* @bcross
