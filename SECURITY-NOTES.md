@@ -412,6 +412,13 @@ signature protects delivery, the attestation records provenance.
 8. **The copies of the agent binaries baked into the container image are not
    attested** by `push-update --attestation`, which covers runtime pushes only
    (issue #4).
+8b. **`push-update` without `--attestation` still queues the binary.** That is
+   deliberate — a locally built binary has nothing to attest with — but it means
+   the release-pipeline control rests on the pipeline passing the flag, and the
+   command now says so on stderr rather than letting an unattested push look
+   like a checked one. Nothing verifies provenance at the agent: the pinned-key
+   manifest signature over `version|sha256` is what protects the wire, and the
+   attestation is the pipeline's record of what was built.
 9. **The web UI's only gate is the identity provider.** Block is fleet-wide and
    delete is irreversible, so anyone who can obtain an identity the configured
    issuer verifies can do both. With a public issuer that permits

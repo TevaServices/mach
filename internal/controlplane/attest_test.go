@@ -7,10 +7,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/TevaServices/mach/internal/release"
 	"github.com/TevaServices/mach/internal/store"
@@ -311,5 +314,78 @@ func TestServerKeyPathWithAPostgresDSN(t *testing.T) {
 	path, err = requireServerKeyPath()
 	if err != nil || path != "/data/mach.db.key" {
 		t.Fatalf("sqlite key path = %q (%v), want /data/mach.db.key", path, err)
+	}
+}
+
+// A statement whose signature and subject verify but whose predicate will not
+// decode used to sail past BOTH checks — they were written `err == nil &&`,
+// so an unreadable predicate silently skipped the version match and, worse,
+// the modified-tree refusal. That refusal is what stops a build from someone's
+// working copy reaching a fleet, and only the key holder can produce such an
+// envelope, which is exactly why it should be a hard error rather than a
+// conditional one.
+func TestPushUpdateRefusesAnUnreadablePredicate(t *testing.T) {
+	priv, bin := setup(t)
+	seedMachine(t, "mach-pred")
+
+	st, err := release.Attest(release.Options{
+		SubjectName: filepath.Base(bin), Binary: bin, Version: "1.2.3", Started: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("attest: %v", err)
+	}
+	// The subject still describes these bytes and the envelope is still signed
+	// by this control plane's own key: only the predicate is unreadable.
+	st.Predicate = json.RawMessage(`"this is not an in-toto predicate"`)
+	env, err := release.Sign(context.Background(), st, priv)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	att := filepath.Join(t.TempDir(), "bogus.intoto.jsonl")
+	if err := release.SaveAttestation(att, env); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	perr := PushUpdate("mach-pred", bin, "1.2.3", att)
+	if perr == nil {
+		t.Fatal("push-update queued a binary whose attestation predicate could not be read")
+	}
+	if !strings.Contains(perr.Error(), "predicate") {
+		t.Fatalf("the refusal does not name the predicate: %v", perr)
+	}
+	if _, ok := queued(t, "mach-pred"); ok {
+		t.Fatal("an update was queued despite the unreadable predicate")
+	}
+}
+
+// Queuing without an attestation still works — a locally built binary has
+// nothing to attest with — but it says so. Silence here is how a by-hand push
+// quietly becomes the thing the release pipeline promises it cannot be: the
+// flag is omitted, nothing notices, and an unattested binary is on its way to a
+// fleet.
+func TestPushUpdateWithoutAttestationSaysSo(t *testing.T) {
+	_, bin := setup(t)
+	seedMachine(t, "mach-warn")
+
+	origErr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stderr = w
+	perr := PushUpdate("mach-warn", bin, "1.2.3", "")
+	os.Stderr = origErr
+	w.Close()
+	out, _ := io.ReadAll(r)
+	r.Close()
+
+	if perr != nil {
+		t.Fatalf("push-update: %v", perr)
+	}
+	if _, ok := queued(t, "mach-warn"); !ok {
+		t.Fatal("no update was queued")
+	}
+	if !strings.Contains(string(out), "WARNING") || !strings.Contains(string(out), "attestation") {
+		t.Fatalf("an unattested push said nothing about it: %q", out)
 	}
 }

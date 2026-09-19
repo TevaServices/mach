@@ -447,14 +447,35 @@ func PushUpdate(machine, binPath, version, attestation string) error {
 		if err := st.VerifyArtifact("", binPath); err != nil {
 			return fmt.Errorf("attestation does not describe this binary: %w", err)
 		}
+		// A predicate that will not decode is refused, not skipped. It used to
+		// fall through both checks below — `err == nil &&` — so a statement
+		// whose signature and digest verified but whose predicate was
+		// unreadable sailed past the version match and, worse, past the
+		// modified-tree refusal, which is exactly the check that stops a build
+		// from someone's working copy being shipped to a fleet. A check that
+		// cannot be made is refused for the same reason an unreadable policy
+		// file is fatal: silence and success look identical from outside.
 		pred, err := st.PredicateOf()
-		if err == nil && pred.Version != version {
+		if err != nil {
+			return fmt.Errorf("attestation predicate could not be read (%w) — the version and modified-tree "+
+				"checks cannot be made, and this refuses rather than shipping an unchecked build", err)
+		}
+		if pred.Version != version {
 			return fmt.Errorf("attestation is for version %q but this push declares %q", pred.Version, version)
 		}
-		if err == nil && pred.Byproducts.VCSModified {
+		if pred.Byproducts.VCSModified {
 			return fmt.Errorf("attestation records a build from a modified tree — refusing to ship it; rebuild from a clean tree and re-attest")
 		}
 		fmt.Printf("attestation verified: %s describes %s (version %s)\n", attestation, binPath, version)
+	} else {
+		// Queuing an unattested binary is a real choice an operator may make by
+		// hand — a locally built binary has nothing to attest with, which is why
+		// this stays legal — but it is not the documented posture ("push-update
+		// --attestation used so nothing unattested ships"), and the release
+		// pipeline always passes the flag. Saying so is what keeps a by-hand push
+		// from quietly becoming the thing the pipeline promises it cannot be.
+		fmt.Fprintf(os.Stderr, "mach-server: WARNING: no attestation for %s — queueing it without checking which "+
+			"build produced it; pass --attestation FILE to have it checked\n", binPath)
 	}
 
 	manifest := updateManifest{
