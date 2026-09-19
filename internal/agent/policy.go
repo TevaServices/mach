@@ -2,7 +2,9 @@ package agent
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"strings"
@@ -29,23 +31,87 @@ const maxFleetPolicyBytes = 64 << 10
 // on internal/policy for what it can and cannot promise.
 type lazyPolicy struct {
 	once sync.Once
-	p    policy.Policy
+	// err is set when the guardrail could not be read at all. Evaluate refuses
+	// everything while it is set: a machine whose own rules are missing is
+	// exactly the case this layer exists to prevent, so the failure is
+	// fail-closed as well as loud.
+	err error
+	p   policy.Policy
 }
 
-// globalPolicy is loaded on first use: reading the state dir at process
-// start would run before the agent has dropped privileges.
+// globalPolicy is the machine's own guardrail: MACH_POLICY when set, otherwise
+// policy.txt in the state dir. It is loaded once, at startup.
 var globalPolicy lazyPolicy
 
+// LoadLocalPolicy reads the machine's own guardrail. It is called at startup,
+// *before* the privilege drop.
+//
+// That ordering is the fix for a real hole. The load used to be lazy, at the
+// first command — which is after DropPrivileges() — so a root install that
+// dropped to nobody and left a root-owned policy.txt got EACCES, and the error
+// left an empty ruleset with no log line, for the life of the process. Every
+// command, sealed or not, ran with the one layer SECURITY-NOTES says "survives
+// a hostile control plane" silently absent. MACH_POLICY was never affected, and
+// that is what let the two options look equivalent in the documentation.
+//
+// A file that does not exist is not an error: no local rules is the default. A
+// file that exists and cannot be read is, for the reason the control plane
+// refuses to boot on an unreadable MACH_EXEC_POLICY_FILE — an operator cannot
+// tell "no rules" from "the rules I configured" if both are silent.
+func LoadLocalPolicy() error { return globalPolicy.loadStartup() }
+
+// loadStartup runs the load exactly once and reports what it cost. The method
+// form exists so a test can exercise a load on its own instance rather than on
+// the process-wide one, which is set-once by construction.
+func (l *lazyPolicy) loadStartup() error {
+	l.once.Do(l.load)
+	return l.err
+}
+
+// load is the body both entry points run exactly once.
+func (l *lazyPolicy) load() {
+	if v := os.Getenv("MACH_POLICY"); v != "" {
+		l.installReported(v, "MACH_POLICY")
+		return
+	}
+	path := policyPath()
+	raw, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		l.installReported(string(raw), path)
+	case errors.Is(err, fs.ErrNotExist):
+		// No local guardrail configured. The fleet-wide rules, if any, still
+		// apply on this machine — those arrive over the connection.
+		log.Printf("agent: local exec policy: none configured (%s absent, MACH_POLICY unset)", path)
+	default:
+		l.err = fmt.Errorf("cannot read %s: %w", path, err)
+		log.Printf("agent: local exec policy: %v — refusing every command rather than running unguarded", l.err)
+	}
+}
+
+// installReported installs spec and reports any line the grammar ignored, then
+// logs what is in force. The ruleset is printed either way: "what is this
+// machine enforcing" should be answerable from the journal rather than assumed.
+func (l *lazyPolicy) installReported(spec, source string) {
+	ignored := l.p.Replace(spec)
+	if rules := l.p.Describe(); len(rules) > 0 {
+		log.Printf("agent: local exec policy from %s: %s", source, strings.Join(rules, " "))
+	} else {
+		log.Printf("agent: local exec policy from %s: none", source)
+	}
+	if w := policy.IgnoredWarning(ignored); w != "" {
+		log.Printf("agent: local exec policy from %s: %s", source, w)
+	}
+}
+
 func (l *lazyPolicy) Evaluate(command string, argv []string) string {
-	l.once.Do(func() {
-		if v := os.Getenv("MACH_POLICY"); v != "" {
-			l.p.Replace(v)
-			return
-		}
-		if raw, err := os.ReadFile(policyPath()); err == nil {
-			l.p.Replace(string(raw))
-		}
-	})
+	// A caller that never called LoadLocalPolicy (a test, or code that ignored
+	// its error) still gets the rules loaded — and still gets the failure, which
+	// is turned into a refusal rather than into silence.
+	l.once.Do(l.load)
+	if l.err != nil {
+		return "denied by command policy (this machine's own policy could not be read: " + l.err.Error() + ")"
+	}
 	return l.p.Evaluate(command, argv)
 }
 
@@ -54,7 +120,8 @@ func (l *lazyPolicy) Evaluate(command string, argv []string) string {
 // whoever installed the rules.
 func (l *lazyPolicy) install(spec string) {
 	l.once.Do(func() {})
-	l.p.Replace(spec)
+	l.err = nil
+	l.installReported(spec, "installed")
 }
 
 func policyPath() string {

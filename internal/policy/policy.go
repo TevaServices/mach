@@ -42,15 +42,24 @@ type Policy struct {
 func New() *Policy { return &Policy{} }
 
 // Replace resets the policy and loads spec into it. It is safe to call
-// concurrently with Evaluate.
-func (p *Policy) Replace(spec string) {
-	deny, allowOnly, allow := parse(spec)
+// concurrently with Evaluate. It returns the lines it did not recognize — the
+// caller decides how loud to be about them (see IgnoredWarning).
+func (p *Policy) Replace(spec string) []string {
+	deny, allowOnly, allow, ignored := parse(spec)
 	p.mu.Lock()
 	p.deny, p.allowOnly, p.allow = deny, allowOnly, allow
 	p.mu.Unlock()
+	return ignored
 }
 
-func parse(spec string) (deny []string, allowOnly bool, allow []string) {
+// parse reads a ruleset spec. Anything that is not a blank line, a comment, or
+// one of the three directives is returned as ignored rather than dropped in
+// silence: `deny rm -rf` (no colon), `den:rm`, `Allowonly` and a bare `deny:`
+// all parse to zero rules, and an operator who believes an allowlist is in
+// force when it was never parsed has no guardrail at all. That is the same
+// failure the unreadable-file rule refuses to start over, one level down — the
+// parser's job is to report it, not to guess what was meant.
+func parse(spec string) (deny []string, allowOnly bool, allow []string, ignored []string) {
 	for _, line := range strings.Split(spec, "\n") {
 		line = stripComment(strings.TrimSpace(line))
 		if line == "" {
@@ -60,16 +69,34 @@ func parse(spec string) (deny []string, allowOnly bool, allow []string) {
 		case strings.HasPrefix(line, "deny:"):
 			if r := Normalize(strings.TrimPrefix(line, "deny:")); r != "" {
 				deny = append(deny, r)
+			} else {
+				ignored = append(ignored, line)
 			}
 		case line == "allowonly":
 			allowOnly = true
 		case strings.HasPrefix(line, "allow:"):
 			if r := Normalize(strings.TrimPrefix(line, "allow:")); r != "" {
 				allow = append(allow, r)
+			} else {
+				ignored = append(ignored, line)
 			}
+		default:
+			ignored = append(ignored, line)
 		}
 	}
-	return deny, allowOnly, allow
+	return deny, allowOnly, allow, ignored
+}
+
+// IgnoredWarning renders the report for lines Replace could not use, or "" when
+// there are none. One wording in one place, because this string is what an
+// operator greps for after a rule they wrote had no effect — and the agent and
+// the control plane both write it.
+func IgnoredWarning(ignored []string) string {
+	if len(ignored) == 0 {
+		return ""
+	}
+	return "ignored " + strconv.Itoa(len(ignored)) + " rule line(s), which match no directive in the grammar: " +
+		strconv.Quote(strings.Join(ignored, " | "))
 }
 
 // stripComment removes a trailing #-comment, using the shell's own rule for

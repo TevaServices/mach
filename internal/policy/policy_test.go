@@ -1,6 +1,9 @@
 package policy
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestNormalize(t *testing.T) {
 	cases := [][2]string{
@@ -174,6 +177,42 @@ func TestDenyRulesStillMatchAcrossNewlines(t *testing.T) {
 		if r := p.Evaluate(cmd, nil); r == "" {
 			t.Errorf("deny rule missed a command: %q", cmd)
 		}
+	}
+}
+
+// A rule line the grammar cannot use is reported, not dropped. Every one of
+// these parses to zero rules — and an operator who wrote `deny rm -rf` believed
+// they had a block list, one who wrote `Allowonly` believed they had an
+// allowlist. That is the same fail-open shape as an unreadable policy file, one
+// level down, so the parser reports and the caller decides how loud to be.
+func TestUnrecognizedRuleLinesAreReported(t *testing.T) {
+	p := New()
+	ignored := p.Replace("deny rm -rf\nden:mkfs\nAllowonly\ndeny:\nallow:\nallowonly\nallow:df\n# a comment\n\n")
+	want := []string{"deny rm -rf", "den:mkfs", "Allowonly", "deny:", "allow:"}
+	if len(ignored) != len(want) {
+		t.Fatalf("ignored = %q, want %q", ignored, want)
+	}
+	for i := range want {
+		if ignored[i] != want[i] {
+			t.Fatalf("ignored[%d] = %q, want %q", i, ignored[i], want[i])
+		}
+	}
+	// The lines that did parse still took effect: reporting is not a reset.
+	if r := p.Evaluate("cat /etc/shadow", nil); r == "" {
+		t.Fatal("the allowlist from the valid lines was not installed")
+	}
+	if r := p.Evaluate("df -h", nil); r != "" {
+		t.Fatalf("allow:df was lost: %s", r)
+	}
+	// A clean spec reports nothing, and the report for no lines is empty.
+	if got := p.Replace("deny:rm -rf\nallowonly\nallow:df\n"); len(got) != 0 {
+		t.Fatalf("a valid spec reported ignored lines: %q", got)
+	}
+	if w := IgnoredWarning(nil); w != "" {
+		t.Fatalf("IgnoredWarning(nil) = %q, want empty", w)
+	}
+	if w := IgnoredWarning([]string{"deny rm -rf"}); !strings.Contains(w, "deny rm -rf") {
+		t.Fatalf("IgnoredWarning does not name the line: %q", w)
 	}
 }
 

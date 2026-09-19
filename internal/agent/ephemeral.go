@@ -198,6 +198,15 @@ func RunEphemeral(server, org string) error {
 	// Privilege drop AFTER enrollment, mirroring the order in Run: a session
 	// started as root should execute commands as the unprivileged account, but
 	// must not drop before it has finished talking to the control plane.
+	//
+	// The machine's own guardrail is read first, for the same reason it is in
+	// Run: a session started as root must read a root-owned policy.txt as root,
+	// or the drop turns it into an empty ruleset with nothing said about it. A
+	// temporary session runs commands like any other, so the local layer applies
+	// to it exactly as it does to an installed agent.
+	if err := LoadLocalPolicy(); err != nil {
+		return err
+	}
 	DropPrivileges()
 
 	ctl := newSessionCtl()

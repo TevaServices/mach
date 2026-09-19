@@ -96,6 +96,15 @@ func Run(stateDir string) error {
 	if err != nil {
 		return err
 	}
+	// The machine's own guardrail is read here, with the identity and E2E keys
+	// and for the same reason: a root-installed service reads a root-owned
+	// policy.txt as root, so the drop below cannot turn it into an unreadable
+	// file and an empty ruleset (see LoadLocalPolicy). It is also the point at
+	// which an unreadable one is still a startup failure rather than a machine
+	// that quietly enforces nothing.
+	if err := LoadLocalPolicy(); err != nil {
+		return err
+	}
 	DropPrivileges()
 	return serveLoop(cfg, id, e2eKey, nil)
 }

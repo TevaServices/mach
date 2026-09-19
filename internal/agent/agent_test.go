@@ -43,6 +43,64 @@ func TestAgentPolicyLoadsFromFile(t *testing.T) {
 	}
 }
 
+// A policy.txt that exists and cannot be read must not leave an empty ruleset
+// with nothing said about it — which is exactly what happened when the load was
+// lazy, at the first command, and therefore *after* DropPrivileges(): a
+// root-installed agent that dropped to an unprivileged user got EACCES on a
+// root-owned file, and every command, sealed or not, then ran with the one
+// layer SECURITY-NOTES says "survives a hostile control plane" silently absent.
+//
+// The read is now eager, before the drop, and an unreadable file is an error
+// that also fails closed if anyone ignores it: a machine whose own guardrail is
+// missing is the case this layer exists to prevent. A directory stands in for
+// the unreadable file because the failure is then independent of which user the
+// test runs as — chmod 000 does not stop root.
+func TestAgentPolicyFailsClosedWhenTheFileCannotBeRead(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MACH_STATE_DIR", dir)
+	t.Setenv("MACH_POLICY", "")
+	if err := os.Mkdir(policyPath(), 0o700); err != nil {
+		t.Fatalf("make policy.txt unreadable: %v", err)
+	}
+	var lp lazyPolicy
+	if err := lp.loadStartup(); err == nil {
+		t.Fatal("an unreadable policy.txt loaded without error")
+	}
+	// And if a caller ignores that error, the failure is still not silent.
+	if r := lp.Evaluate("ls -la", nil); r == "" {
+		t.Fatal("a machine with an unreadable policy.txt ran a command")
+	}
+	// An *absent* file is not an error. That is the default, not a fault, and
+	// refusing to run over it would make the default configuration unusable.
+	t.Setenv("MACH_STATE_DIR", t.TempDir())
+	var lp2 lazyPolicy
+	if err := lp2.loadStartup(); err != nil {
+		t.Fatalf("an absent policy.txt was treated as a failure: %v", err)
+	}
+	if r := lp2.Evaluate("ls -la", nil); r != "" {
+		t.Fatalf("no local policy refused a command: %s", r)
+	}
+}
+
+// The load happens at startup, not at the first command: rules written to
+// policy.txt are in force before anything is asked of the agent, which is what
+// makes "loaded before the privilege drop" true rather than aspirational.
+func TestAgentPolicyLoadsAtStartup(t *testing.T) {
+	t.Setenv("MACH_STATE_DIR", t.TempDir())
+	t.Setenv("MACH_POLICY", "")
+	if err := os.WriteFile(policyPath(), []byte("allowonly\nallow:systemctl\n"), 0o600); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+	var lp lazyPolicy
+	if err := lp.loadStartup(); err != nil {
+		t.Fatalf("loadStartup: %v", err)
+	}
+	// The rules are already in force — no Evaluate has run yet.
+	if r := lp.Evaluate("cat /etc/shadow", nil); r == "" {
+		t.Fatal("the allowlist was not loaded at startup")
+	}
+}
+
 func TestResolveShellPerOS(t *testing.T) {
 	sh, err := resolveShell()
 	if err != nil {

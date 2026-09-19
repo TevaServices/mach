@@ -76,11 +76,24 @@ func (s *Server) pollPolicyOnce() {
 
 // Replace installs rules wholesale (the parser resets first, so this never
 // accumulates). An empty spec clears the policy.
+//
+// A line the grammar cannot use is reported rather than dropped in silence. An
+// operator who writes `deny rm -rf` (no colon) or `Allowonly` has no rule and no
+// allowlist, and the log line is the only thing that says so — the same failure
+// the unreadable-file rule refuses to start over, one level down.
 func (e *execPolicy) Replace(spec, source string) {
 	e.mu.Lock()
-	e.p.Replace(spec)
+	ignored := e.p.Replace(spec)
 	e.src = source
 	e.mu.Unlock()
+	reportIgnoredRules(ignored, source)
+}
+
+// reportIgnoredRules logs the lines a ruleset spec could not use.
+func reportIgnoredRules(ignored []string, source string) {
+	if w := policy.IgnoredWarning(ignored); w != "" {
+		log.Printf("server: global exec policy from %s: %s", source, w)
+	}
 }
 
 // Evaluate returns "" when the command is permitted, or a human-readable
@@ -206,9 +219,10 @@ func (e *execPolicy) loadEnv() error {
 			mod = fi.ModTime()
 		}
 		e.mu.Lock()
-		e.p.Replace(string(raw))
+		ignored := e.p.Replace(string(raw))
 		e.src, e.path, e.mod = path, path, mod
 		e.mu.Unlock()
+		reportIgnoredRules(ignored, path)
 		return nil
 	}
 	if spec := os.Getenv(execPolicyEnv); spec != "" {
@@ -236,9 +250,10 @@ func (e *execPolicy) reloadFile() bool {
 		return false
 	}
 	e.mu.Lock()
-	e.p.Replace(string(raw))
+	ignored := e.p.Replace(string(raw))
 	e.mod = fi.ModTime()
 	e.mu.Unlock()
+	reportIgnoredRules(ignored, path)
 	return true
 }
 
