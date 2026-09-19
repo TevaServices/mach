@@ -143,7 +143,9 @@ Put Caddy/nginx in front for TLS (agents speak wss://).
   back, which is how the agent verifies it is talking to the pinned server key
   rather than to whatever TLS handed it.
 - Pairing tokens are single-use, ~10-minute TTL; pair-start is rate-limited
-  and grants nothing until phone approval + challenge-code match.
+  and a token grants nothing until phone approval, which requires the
+  challenge code read off the machine's own console. The code gates the pair
+  page's deny button as well as its approve button.
 - **Command policy, in two layers:** each agent can hold its own block list
   (`MACH_POLICY`) that nothing upstream can override, and the control plane
   can hold a fleet-wide one (`MACH_EXEC_POLICY` / `MACH_EXEC_POLICY_FILE`)
@@ -184,9 +186,12 @@ Put Caddy/nginx in front for TLS (agents speak wss://).
   is, so flipping it needs no re-enrollment. A machine enrolled before this
   feature has no key, and `mach exec` says so rather than pretending.
 - **Confinement**: every remote command runs in its own process group
-  (unix) and is SIGKILL-killed as a tree on timeout — detached
-  grandchildren no longer outlive commands. (Windows: timeout + output
-  caps only.)
+  (unix) and the whole group is SIGKILL-killed on timeout, so children and
+  grandchildren die with it — **unless** one left the group first (a
+  `setsid`/double-forking daemon does exactly that, and survives). There are
+  no per-command CPU or file-size limits: Go's `os/exec` cannot set child
+  rlimits. (Windows: timeout + output caps only.) Use containers or systemd
+  sandboxing when the threat is an attacker rather than a mistake.
 - **Streaming console**: `mach console` runs each command over the
   streaming endpoint — output arrives live (32 KiB chunks) instead of
   buffered-at-end; Ctrl-C kills the remote session. Falls back to
@@ -338,8 +343,10 @@ mise run local:reset     # stop and wipe back to a fresh install
 ```
 
 The challenge code is printed on the agent's console and typed on the pair page:
-the QR alone grants nothing, and the page is reachable from the LAN precisely
-because the code is what gates it. On an untrusted network, start with
+it gates every action there — approving **and** denying — so the QR alone can do
+neither. (What a photographed QR does still grant, for the pairing's ~10-minute
+life, is the enrolling machine's self-reported hostname/platform and the ability
+to burn the pairing by exhausting its code attempts. See SECURITY-NOTES.md.) On an untrusted network, start with
 `MACH_LOCAL_HOST=127.0.0.1` and enroll from a browser on this machine instead.
 
 Builds are unstamped by default and report `devel`. Stamp a version with

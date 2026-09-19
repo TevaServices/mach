@@ -54,6 +54,15 @@ This is `mach`: remote CLI access to registered machines, outbound-only
 1. Agents are **outbound-only**: never add an inbound listener to the agent.
 2. **Hello is challenge-bound**: the agent signs `name|challenge` where the
    challenge is per-connection (`ReqID` of the server's hello frame).
+   It is also the point at which the machine name is resolved, and that ordering
+   is a control: `/v1/agent/ws` upgrades, sends the same challenge, and verifies
+   the hello *before* it looks the name up, so an unauthenticated caller gets one
+   answer — a challenge, then silence — whatever name it tries. Resolving the
+   name first made the endpoint an enumeration oracle (a known name got a
+   challenge, an unknown one got silence, a revoked one got a frame). A revoked
+   machine still learns it is revoked, as a `hello_result` carrying the error
+   string, because it can only get there by proving it holds the machine's key.
+   Failed dials are counted per source; successful ones are not.
 3. **Server key pinning**: agents store `server_key` at enrollment and
    verify update manifests against it (sig over `version|sha256`).
 4. **Challenge codes** are 12 chars (Crockford-ish alphabet, ~60 bits) and
@@ -63,7 +72,12 @@ This is `mach`: remote CLI access to registered machines, outbound-only
    org and a suggested machine name (invariant 5), and adding the code to that
    list would be the end of the property the code exists for: a photograph of
    the QR would grant any name in any org for the life of the pairing. The code
-   stays on the machine's own screen, read by a person standing at it.
+   stays on the machine's own screen, read by a person standing at it, and it
+   gates **every** action on the pair page — deny as well as approve — because a
+   token holder who cannot read the console must not be able to stop an
+   enrollment either. What a token holder can still do (read the machine's
+   self-reported details, and burn the pairing by exhausting its attempts) is
+   documented in SECURITY-NOTES.md rather than claimed away.
 5. **Names are org-prefixed** (`<org>-<machine>`, validated by
    `store.ValidOrgName`); taken names error and require a new name. The pair
    page may **pre-fill** the org and a machine name from the QR — a
@@ -159,6 +173,12 @@ This is `mach`: remote CLI access to registered machines, outbound-only
     neither is a sandbox — keep `SECURITY-NOTES.md` honest about that rather
     than overselling it.
 
+    The machine's own file is read **at startup, before the privilege drop** —
+    a root install must read a root-owned `policy.txt` as root, or the drop turns
+    it into an empty ruleset with nothing said — and an unreadable file that
+    *exists* is an error that refuses every command. A line the grammar cannot
+    use is reported rather than dropped. Do not make either of those lazy again.
+
     **The control plane's own check is skipped for a sealed request, and that is
     the same rule rather than an exception to it.** There is no text to match, and
     running the grammar against the empty command left behind is not a stricter
@@ -171,7 +191,13 @@ This is `mach`: remote CLI access to registered machines, outbound-only
     inside it — so `allowonly` refuses command substitution (`$(...)`, backticks,
     process substitution) instead of authorizing it by accident. argv mode is
     unaffected: nothing re-parses an argument vector, so a literal `$(date)` is
-    its own text. And a machine name in an exec allowlist is matched *exactly*:
+    its own text. An allowlist also splits on newlines **before** normalization
+    (a collapsed separator was invisible to it), and a deny rule is matched
+    against a small set of renderings — the text as written, each `${…}` rendered
+    empty and as a space, brace groups as the words they expand to, ANSI-C
+    quoting decoded — because the text as written is always one of them, so a
+    rendering can only add a refusal. A **glob** is deliberately not seen through;
+    see the package comment. And a machine name in an exec allowlist is matched *exactly*:
     the store, the lookups and the dispatch path are all case-sensitive, so
     folding case here would let a key scoped to `web` reach `Web`.
 13. **Release attestations**: `mach-server attest` signs an in-toto statement
@@ -315,16 +341,23 @@ to run it, and for why the driver difference matters.
 ## Testing
 
 - `mise run test` — unit tests (`-race -cover`). Store (both drivers, SQL
-  translation, the soft block, org CRUD, single-delivery update pop), server
-  (scopes, orgs, normalizeCode, pair page, fleet-wide policy, the streaming
-  relay, the per-org E2E flag and its control signal, the fleet-rules mirror and
-  its propagation, the block gates on both dispatch paths, the web UI's
-  fail-closed routing and CSRF layers), agent (policy — including fleet rules
-  binding a sealed command — shells, streaming writers, confinement, the
-  supervisor directives), console (output-is-data, lost-stream, obeying the E2E
-  signal, key pinning and trust), policy, protocol, oidcauth (a fake issuer, one
-  broken check per test), release and in-toto all have coverage; keep it that
-  way for touched code.
+  translation, the soft block, org CRUD, single-delivery update pop, the
+  database file's mode, the challenge code's uniform mapping), server (scopes,
+  orgs, normalizeCode, pair page — including that a wrong code tells a caller
+  nothing about the fleet and cannot deny a pairing — fleet-wide policy, the
+  streaming relay and its per-key session bound, the per-org E2E flag and its
+  control signal, the fleet-rules mirror and its propagation, the block and
+  revocation gates on both dispatch paths, scope refusals in the audit trail,
+  the web UI's fail-closed routing and CSRF layers, that the agent socket
+  answers an unauthenticated caller identically for every name), agent (policy —
+  including fleet rules binding a sealed command, and the local file's load
+  ordering and fail-closed read — shells, streaming writers, confinement, the
+  supervisor directives, that no key file is replaced over one that exists),
+  console (output-is-data, lost-stream, an unreadable exit record, obeying the
+  E2E signal, key pinning and trust, terminal-escape filtering, that no request
+  can be replayed by the transport), policy, protocol, oidcauth (a fake issuer,
+  one broken check per test), release and in-toto all have coverage; keep it
+  that way for touched code.
 - `mise run lint` — the gofmt check plus `go vet`. Read-only; `mise run fmt`
   writes the formatting.
 - `mise run local:up` / `local:down` / `local:status` / `local:logs` — a real
@@ -366,7 +399,8 @@ to run it, and for why the driver difference matters.
 
   The playground binds **all interfaces by default**, and that is worth stating
   as a security fact rather than an ergonomic one: the pair page is reachable
-  from the LAN, gated on the challenge code (the QR token alone grants nothing),
+  from the LAN, gated on the challenge code (which is what the QR token alone
+  does not give you: it gates approve *and* deny),
   and `local:enroll` is a foreground flow a person watches. Use
   `MACH_LOCAL_HOST=127.0.0.1` on an untrusted network, or when the point of the
   run is not the phone.
@@ -513,6 +547,15 @@ to run it, and for why the driver difference matters.
   they need `MACH_TRUST_PROXY=1` or every client shares the proxy IP.
 - **Time-based tests**: pairing TTL/expiry tests sleep tiny amounts;
   keep tolerances loose or they flake on loaded machines.
+- **A control with two entry points needs one home, or one of them loses it.**
+  Three of the audit's findings were the same shape: the pair page's deny button
+  was not gated on the challenge code the approve button was; the pair page
+  checked "name already taken" before the code, while the API-key path did not;
+  and the register endpoint checked an API key without the auth-failure limiter
+  every other bearer surface used. Each was two copies of one rule that had
+  drifted. When you add a second caller of a check, route it through the same
+  function (`requirePairingCode`, `dispatchRefusal`, `enrollmentRefusal`) rather
+  than restating it — and test the seam, not each half.
 - **A policy change has to be broadcast, not just applied.** The fleet rules
   are enforced on the machines, so `SetExecPolicy` and a `MACH_EXEC_POLICY_FILE`
   reload both call `broadcastFleetPolicy()`. Forget that and the control plane

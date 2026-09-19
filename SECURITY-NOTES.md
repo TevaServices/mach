@@ -509,6 +509,69 @@ signature protects delivery, the attestation records provenance.
     machine it runs on. The one thing it can do is remove itself from the fleet,
     which is visible (the row shows revoked) and recoverable (re-enroll).
 
+18. **A remote command runs as the same user that owns the agent's state dir.**
+    After `mach install`, the agent and the commands it runs share one uid, and
+    that uid owns `agent.key`, `e2e.key`, `config.json` and `policy.txt`. So one
+    command can read both keys and rewrite the pinned `server_key` — redirecting
+    the agent to another control plane — and nothing detects it: the console's
+    TOFU pin covers a *machine's* E2E key, not a control plane's identity key.
+    This grants no new remote capability (commands are arbitrary by design), but
+    it does mean the machine's own `MACH_POLICY` is a guardrail against the
+    fleet's users rather than against a command that has already run, and the
+    "nothing upstream can loosen the local rules" claim is about the *agent*,
+    not about a command that can edit the file. Privilege separation between the
+    agent user and the command user is the fix; there is none today.
+19. **The pair claim proves the token, not possession of the key it claims.**
+    `/v1/pair/claim` matches `pub_key` by string equality against the pairing
+    row. An attacker holding both the token *and* the machine's public key can
+    therefore win the claim race and choose `temporary` and `pub_e2e` for the
+    row. The preconditions are strong — the public key is in neither the QR nor
+    the pair page, and the token is only in the QR — and the impact is squatting
+    (the real agent's claim then fails) or a machine whose sealed commands
+    cannot be opened, not disclosure. A signature over `name|token` at claim
+    time would close it; that is a protocol change both ends have to make, so it
+    is recorded here rather than half-done.
+20. **A sealed frame has no freshness binding.** The AEAD binds the recipient's
+    key and the format version, but not a request id or a timestamp, so a
+    captured sealed frame that is replayed re-executes. The control plane is the
+    only source of frames on that path and it already holds dispatch authority,
+    so this grants a hostile one nothing it could not do by dispatching again
+    directly — and "one command is one execution" is enforced in the console,
+    not on the wire. Bind the dispatch `ReqID` into the HKDF info or the AAD if
+    that ever needs to change.
+21. **Updates have no anti-rollback.** A manifest signed earlier replays
+    forever: an agent that has already applied `1.4.0` will accept `1.2.0`
+    again if an attacker can present that manifest. Subsumed by the control
+    plane being the signer (gap #2) — a malicious database can already push any
+    correctly signed binary — but a monotonic version check on the agent would
+    narrow it, and does not exist.
+22. **No PKCE on the OIDC exchange.** The UI is a confidential client with a
+    client secret, which is the case where PKCE is optional rather than
+    required, and the login CSRF is covered by the state cookie. It is a
+    one-line BCP upgrade away and is not done.
+23. **Windows runs no privilege drop, and the task requests the highest
+    privileges available.** `installWindows` creates the scheduled task with
+    `/RL HIGHEST`, so an agent installed by an administrator runs commands with
+    that administrator's full token. `MACH_USER` and the drop are Linux-only.
+    This is the same-uid gap (#18) taken to its conclusion, and it is a Windows
+    deployment's own decision what account the task runs as.
+24. **A daemonizing command escapes the tree kill.** The process-group kill
+    reaches children and grandchildren that stayed in the group; a `setsid` or
+    double-forking daemon leaves it and survives, by design of the mechanism
+    rather than by oversight. Same family as the string-matcher carve-out: use
+    OS-level confinement when a command is the threat.
+25. **The E2E pin file has no cross-process locking.** Two consoles on one host
+    sealing to the same machine for the first time can both read the pin file,
+    both find no entry, and the later write wins — losing one pin, once. It is
+    first-use only and shared-user only, and the file is an error rather than
+    "no pins" when it cannot be parsed, so the failure is narrow rather than
+    silent.
+26. **There are no per-command resource limits.** A command can spin a CPU or
+    fill a disk for as long as its timeout allows (and the timeout is a cap on
+    how long the *console* waits, not a kill the machine honours forever). The
+    confinement is a process group and a SIGKILL, not rlimits; see the
+    `internal/agent/confine.go` package comment.
+
 ## Deployment checklist
 
 - [ ] Control plane behind TLS reverse proxy; `MACH_TRUST_PROXY=1`.
