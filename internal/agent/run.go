@@ -195,6 +195,15 @@ func dialAndServe(cfg *Config, id *Identity, e2eKey *E2EKeyPair, ctl *sessionCtl
 	defer ws.Close()
 	conn := protocol.NewWSConn(ws)
 
+	// Bound one inbound frame. gorilla's default is no limit at all, and
+	// ReadEnvelope buffers a whole frame before decoding it, so without this a
+	// peer could make this process allocate without bound — and the peer that
+	// matters is the control plane the agent trusts, which is exactly the party
+	// a compromised or replaced one would be. MaxAgentFrameBytes is sized above
+	// the largest legitimate frame (a command re-marshaled out of a 1 MiB
+	// request, worst-case HTML-escaped) so no real command is cut off.
+	conn.SetReadLimit(protocol.MaxAgentFrameBytes)
+
 	// Keepalive: the pinger sends pings; the pong handler (and any data
 	// frame) refreshes the read deadline. A dead server fails the read
 	// within pongWait; a server that stops answering pongs is detected the

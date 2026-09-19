@@ -195,6 +195,88 @@ func nextFrame(t *testing.T, conn *protocol.WSConn) protocol.Envelope {
 	}
 }
 
+// Bound the read side of the relay socket. It had deadlines but no size limit,
+// and gorilla's default is no limit at all: ReadEnvelope buffers a whole frame
+// before decoding it, so a holder of any exec-scoped key could send one
+// multi-gigabyte frame and have the process that is the command authority for
+// every machine allocate it. The HTTP exec path caps a body at 1 MiB; the socket
+// must not be the softer way in.
+func TestConsoleRelayBoundsInboundFrames(t *testing.T) {
+	h := newStreamHarness(t)
+	key := adminKey(t, h.s, "exec:*")
+	console, _, resp := h.console(t, key, h.mach)
+	if resp != nil {
+		t.Fatalf("console dial refused: %s", resp.Status)
+	}
+
+	// One byte past the cap, in a single frame.
+	big, _ := json.Marshal(protocol.StreamStart{Command: strings.Repeat("a", protocol.MaxConsoleFrameBytes+1)})
+	if err := console.WriteEnvelope(protocol.Envelope{Type: "exec_stream", Payload: big}); err != nil {
+		return // the peer closed first; the frame was never read
+	}
+	// The relay closes the connection rather than reading a frame over the
+	// limit, so the next read here fails instead of returning a frame.
+	_ = console.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := console.ReadEnvelope(); err == nil {
+		t.Fatal("the relay read a frame past the limit instead of closing the socket")
+	}
+	// And the command it carried never reached the machine.
+	select {
+	case env := <-h.frames:
+		t.Fatalf("an over-limit frame was dispatched to the agent as %q", env.Type)
+	default:
+	}
+}
+
+// Each relay session costs a goroutine, two frame pumps and a socket on the
+// control plane, and nothing on this path was per-key: a key with exec scope
+// over every machine could park unbounded sessions on the single point of
+// command authority. The bound is a resource ceiling rather than an
+// authorization rule — scope already decides which machines a key reaches — so
+// it sits far above what one operator does by hand.
+func TestConsoleSessionsAreBoundedPerKey(t *testing.T) {
+	h := newStreamHarness(t)
+	key := adminKey(t, h.s, "exec:*")
+	// A second key, with its own name: the bound is indexed by the key's name,
+	// which is also what the audit row records.
+	other := "mach_" + store.RandToken(24)
+	if err := h.st.CreateAPIKey("other", other, "exec:*"); err != nil {
+		t.Fatalf("create second key: %v", err)
+	}
+
+	for i := 0; i < maxStreamSessionsPerKey; i++ {
+		if _, _, resp := h.console(t, key, h.mach); resp != nil {
+			t.Fatalf("session %d of %d refused early: %s", i+1, maxStreamSessionsPerKey, resp.Status)
+		}
+	}
+	if n := streamCountForKey("k"); n != maxStreamSessionsPerKey {
+		t.Fatalf("sessions recorded for the key = %d, want %d", n, maxStreamSessionsPerKey)
+	}
+	// The next one is refused before the upgrade, so the answer is an HTTP
+	// status rather than a session that dies immediately.
+	if conn, _, resp := h.console(t, key, h.mach); resp == nil || resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("session past the bound: conn=%v resp=%v, want 429", conn, resp)
+	}
+	// A different key is unaffected: the bound is per key, not per process.
+	c, _, resp := h.console(t, other, h.mach)
+	if resp != nil {
+		t.Fatalf("an unrelated key was refused: %s", resp.Status)
+	}
+	// Ending a session hands its slot back — the bound is on concurrent
+	// sessions, not on how many a key has opened over its lifetime.
+	c.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for streamCountForKey("other") != 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := streamCountForKey("other"); n != 0 {
+		t.Fatalf("sessions for the second key after close = %d, want 0", n)
+	}
+	if _, _, resp := h.console(t, other, h.mach); resp != nil {
+		t.Fatalf("the freed slot was not reusable: %s", resp.Status)
+	}
+}
+
 // A readonly key is for watching. The streaming endpoint is command execution,
 // so it must refuse one — otherwise the scope would be decorative.
 func TestStreamEndpointRefusesReadonlyKey(t *testing.T) {

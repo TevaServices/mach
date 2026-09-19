@@ -50,3 +50,9 @@ func (w *WSConn) Ping() error {
 func (w *WSConn) SetPongHandler(h func(string) error) { w.conn.SetPongHandler(h) }
 func (w *WSConn) SetReadDeadline(t time.Time) error   { return w.conn.SetReadDeadline(t) }
 func (w *WSConn) SetWriteDeadline(t time.Time) error  { return w.conn.SetWriteDeadline(t) }
+
+// SetReadLimit bounds one inbound frame. A peer that exceeds it is closed by the
+// read, which is what makes an unbounded frame the peer's problem rather than
+// this process's: ReadEnvelope buffers a whole frame before decoding, and
+// gorilla's default is no limit at all.
+func (w *WSConn) SetReadLimit(n int64) { w.conn.SetReadLimit(n) }

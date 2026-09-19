@@ -65,6 +65,34 @@ const (
 	MaxExecReplyBytes = 16 * MaxOutputBytes
 )
 
+// Inbound frame caps. gorilla/websocket's default is *no* limit and
+// ReadEnvelope buffers a whole frame before decoding it, so an unbounded socket
+// is an unbounded allocation decided by the peer: on the console relay that
+// peer holds only an exec-scoped API key, and it shares a process with every
+// other machine's command authority. The HTTP exec path already caps a request
+// body at 1 MiB; these are the same control on the two WebSocket paths, which
+// bypassed it.
+//
+// The two numbers differ because a frame is not the request that produced it.
+// The control plane re-marshals a command into an envelope on the way to the
+// agent, and encoding/json HTML-escapes on the way out while the request body
+// it came from needed no escaping — so a legal 1 MiB request of `<`, `>` and
+// `&` arrives as up to six times that. MaxAgentFrameBytes sits above that worst
+// case so a legitimate command is never cut off, and is still a hard bound so
+// no frame is unbounded.
+const (
+	// MaxConsoleFrameBytes bounds one frame a console may send up the relay
+	// socket (exec_stream, stream_stdin, stream_kill): the same 1 MiB the HTTP
+	// exec path caps a request body at, so neither path is the softer way in.
+	MaxConsoleFrameBytes = 1 << 20
+
+	// MaxAgentFrameBytes bounds one frame the control plane may send down to an
+	// agent. 6 × MaxConsoleFrameBytes is the escaping worst case above; the
+	// round number above it is the point, since this is a ceiling rather than a
+	// budget and an agent's own output cap (MaxOutputBytes) is already 8 MiB.
+	MaxAgentFrameBytes = 8 << 20
+)
+
 type ExecResult struct {
 	ExitCode int    `json:"exit_code"`
 	Stdout   string `json:"stdout"`

@@ -56,15 +56,27 @@ const streamPingInterval = 30 * time.Second
 // streamSessions tracks active console↔agent relay pairs by session ID, so a
 // teardown can find the relay to unbind. streamsByMachine is the same set
 // indexed the other way, so an operator action can find every session for one
-// machine — streamSessions carries the machine only as a field.
+// machine — streamSessions carries the machine only as a field. streamsByKey is
+// the same set a third way, so concurrent sessions can be bounded per API key;
+// it is also what reserveStreamSlot claims a slot in, ahead of the upgrade.
 var (
 	streamMu         sync.Mutex
 	streamSessions   = map[string]*streamRelay{}
 	streamsByMachine = map[string]map[string]bool{}
+	streamsByKey     = map[string]map[string]bool{}
 )
+
+// maxStreamSessionsPerKey bounds concurrent console sessions held by one API
+// key. It is a resource ceiling, not an authorization rule — the key's scope
+// already decides which machines it may reach — so it is set well above what one
+// operator does by hand and far below what would matter to the process.
+const maxStreamSessionsPerKey = 32
 
 type streamRelay struct {
 	machine string
+	// key is the API key that opened this session, for the per-key session
+	// bound. It is the key's name, never its secret.
+	key string
 	// console is the console end of this relay, retained so the session can be
 	// ended from outside it. Without it a session could only be ended by the
 	// console itself or by the idle deadline — and the keepalive pings below
@@ -89,9 +101,10 @@ type streamRelay struct {
 	errOut  []byte
 }
 
-func newStreamRelay(machine string, console *protocol.WSConn) *streamRelay {
+func newStreamRelay(machine, key string, console *protocol.WSConn) *streamRelay {
 	return &streamRelay{
 		machine:   machine,
+		key:       key,
 		console:   console,
 		toConsole: make(chan protocol.Envelope, 64),
 		Done:      make(chan struct{}),
@@ -120,7 +133,10 @@ func (r *streamRelay) kill(reason string) {
 	r.stop()
 }
 
-// registerStream records a session in both indexes.
+// registerStream records a session in the two indexes that are keyed
+// independently of it. The per-key index is already populated: the slot for this
+// session was claimed by reserveStreamSlot, keyed by this session's own ID, so
+// there is no separate counter to keep in step.
 func registerStream(sessionID string, relay *streamRelay) {
 	streamMu.Lock()
 	streamSessions[sessionID] = relay
@@ -131,8 +147,8 @@ func registerStream(sessionID string, relay *streamRelay) {
 	streamMu.Unlock()
 }
 
-// unregisterStream drops a session from both indexes.
-func unregisterStream(sessionID, machine string) {
+// unregisterStream drops a session from every index.
+func unregisterStream(sessionID, machine, key string) {
 	streamMu.Lock()
 	delete(streamSessions, sessionID)
 	if set := streamsByMachine[machine]; set != nil {
@@ -141,7 +157,62 @@ func unregisterStream(sessionID, machine string) {
 			delete(streamsByMachine, machine)
 		}
 	}
+	if set := streamsByKey[key]; set != nil {
+		delete(set, sessionID)
+		if len(set) == 0 {
+			delete(streamsByKey, key)
+		}
+	}
 	streamMu.Unlock()
+}
+
+// reserveStreamSlot claims a concurrent-session slot for an API key, reporting
+// false when the key already holds maxStreamSessionsPerKey.
+//
+// Each session costs a goroutine, two frame pumps and a socket on the single
+// point of command authority, and nothing else on this path is per-key: a key
+// with exec scope over every machine could otherwise park unbounded sessions
+// here. The slot is claimed by session ID, ahead of the upgrade, because that is
+// the last point at which a refusal can still be an HTTP status — and because
+// counting and then registering would let two racing connects both pass a limit
+// of one. A slot that never becomes a session is given back by
+// releaseStreamSlot; one that does is dropped by unregisterStream with the rest
+// of the session's state, so the three indexes cannot drift apart.
+func reserveStreamSlot(key, sessionID string) bool {
+	streamMu.Lock()
+	defer streamMu.Unlock()
+	if len(streamsByKey[key]) >= maxStreamSessionsPerKey {
+		return false
+	}
+	if streamsByKey[key] == nil {
+		streamsByKey[key] = map[string]bool{}
+	}
+	streamsByKey[key][sessionID] = true
+	return true
+}
+
+// releaseStreamSlot gives back a slot reserved by reserveStreamSlot that never
+// became a session, naming it exactly rather than dropping an arbitrary entry.
+func releaseStreamSlot(key, sessionID string) {
+	streamMu.Lock()
+	defer streamMu.Unlock()
+	set := streamsByKey[key]
+	if set == nil {
+		return
+	}
+	delete(set, sessionID)
+	if len(set) == 0 {
+		delete(streamsByKey, key)
+	}
+}
+
+// streamCountForKey reports how many console sessions a key holds. It exists so
+// a test can assert the index without reaching into the map, which would be a
+// read outside streamMu.
+func streamCountForKey(key string) int {
+	streamMu.Lock()
+	defer streamMu.Unlock()
+	return len(streamsByKey[key])
 }
 
 // killStreamsForMachine ends every live console session for a machine and
@@ -273,6 +344,24 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 		return
 	}
 
+	// Bound this key's concurrent sessions before anything is committed to: the
+	// slot has to be claimed ahead of the upgrade, which is past the point where
+	// an HTTP status can still be sent. The defer hands it back if this
+	// connection never becomes a session; once registerStream records one, the
+	// session's own teardown drops the slot with the rest of its state.
+	sessionID := store.RandToken(8)
+	if !reserveStreamSlot(keyName, sessionID) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{
+			"error": "too many concurrent console sessions for this key"})
+		return
+	}
+	reserved := true
+	defer func() {
+		if reserved {
+			releaseStreamSlot(keyName, sessionID)
+		}
+	}()
+
 	ws, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -280,11 +369,19 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 	consoleConn := protocol.NewWSConn(ws)
 	defer consoleConn.Close()
 
-	sessionID := store.RandToken(8)
-	relay := newStreamRelay(machine, consoleConn)
+	// Bound one inbound frame. The relay socket had deadlines but no size
+	// limit, and gorilla's default is no limit at all — so a holder of any
+	// exec-scoped key could send a single multi-gigabyte frame and have
+	// ReadEnvelope buffer it, on the process that is the command authority for
+	// every machine. The HTTP exec path caps a body at 1 MiB; this is the same
+	// cap on the path that bypassed it.
+	consoleConn.SetReadLimit(protocol.MaxConsoleFrameBytes)
+
+	relay := newStreamRelay(machine, keyName, consoleConn)
 	registerStream(sessionID, relay)
+	reserved = false
 	defer func() {
-		unregisterStream(sessionID, machine)
+		unregisterStream(sessionID, machine, keyName)
 		s.br.UnbindStream(sessionID)
 		relay.stop()
 		// A command that never reported an exit status — the console
