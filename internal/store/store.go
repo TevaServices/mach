@@ -13,6 +13,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -71,11 +73,51 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// The database file exists now. The driver created it with the process
+	// umask, and it holds the whole audit trail (command text and output
+	// snippets — including exactly the shapes RedactScrubs has to catch) plus
+	// the API-key lookup and hash columns. The identity key beside it is
+	// deliberately 0600, which made the database the outlier: with the compose
+	// bind mount the docs describe, every local user on the control-plane host
+	// could read it.
+	tightenDatabaseFiles(path)
 	if err := s.verifySchema(); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+// dbFileMode is what the database and its WAL sidecars are tightened to.
+const dbFileMode = 0o600
+
+// tightenDatabaseFiles closes the group and other bits on the SQLite database
+// and its sidecars.
+//
+// Done on every open rather than only at creation, for the reason console.json
+// re-tightens its own: a volume restored from a backup, or a database created
+// under a looser umask, arrives readable. The sidecars matter as much as the
+// file — WAL mode keeps recent transactions in <db>-wal, which is the same data
+// written by the same driver with the same default mode, so tightening the
+// database alone would leave the newest rows exposed.
+//
+// A failure is logged rather than fatal. The control plane still works, the
+// operator can fix it in place, and refusing to start over a chmod would take
+// every machine in the fleet offline for a permissions problem.
+func tightenDatabaseFiles(path string) {
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		st, err := os.Stat(p)
+		if err != nil || st.Mode().Perm() == dbFileMode {
+			continue // not created yet, or already right
+		}
+		if err := os.Chmod(p, dbFileMode); err != nil {
+			log.Printf("store: WARNING: %s is mode %v and could not be tightened to %v: %v — "+
+				"the database holds the audit trail and the API-key hashes",
+				p, st.Mode().Perm(), os.FileMode(dbFileMode), err)
+			continue
+		}
+		log.Printf("store: tightened %s from %v to %v", p, st.Mode().Perm(), os.FileMode(dbFileMode))
+	}
 }
 
 // Known reports the backing driver ("sqlite" or "postgres").
