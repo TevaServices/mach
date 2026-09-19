@@ -216,6 +216,92 @@ func TestUnrecognizedRuleLinesAreReported(t *testing.T) {
 	}
 }
 
+// Every deny rule in this repo's own documentation contains a space
+// (`deny:rm -rf`), and a space is exactly what these three shapes let a command
+// hide from a substring matcher. Verified against the real engine: each of
+// these ran while the identical command with the space written out was refused.
+//
+// The spellings of the first are unbounded — `${IFS:0:1}`, `${IFS: -1}`,
+// `${IFS:?}`, `${IFS:1:1}` are four ways to write one space — so enumeration
+// could never have covered them, which is what the old ifsReplacer tried to do.
+func TestDenyRulesSeeThroughTextGeneratingFeatures(t *testing.T) {
+	p := New()
+	// Deny rules only — no allowlist, which would refuse these commands for a
+	// different reason and hide whether the deny rule saw them.
+	p.Replace("deny:rm -rf\ndeny:dd if=/dev/\n")
+	for _, cmd := range []string{
+		"rm${IFS:0}-rf /",     // the enumerated spelling's neighbours
+		"rm${IFS: -1}-rf /",   // …and these
+		"rm${IFS:?}-rf /",     // …and this
+		"rm${IFS:1:1}-rf /",   // …and this; the set is unbounded
+		"rm${X}-rf /",         // any expansion at all may be a space
+		"{rm,-rf,/}",          // brace expansion rebuilds the words
+		"{rm,-rf,/} /tmp",     // …with arguments after it
+		`$'\x72\x6d' -rf /`,   // ANSI-C quoting is the literal `rm`
+		`r$'\x6d' -rf /`,      // …including inside a word
+		"dd if=/dev${X}/zero", // an expansion may be empty: /dev/zero
+	} {
+		if r := p.Evaluate(cmd, nil); r == "" {
+			t.Errorf("deny rule evaded by %q", cmd)
+		}
+	}
+	// The same commands written plainly are refused too, so the renderings are
+	// additions rather than replacements.
+	for _, cmd := range []string{"rm -rf /", "dd if=/dev/zero"} {
+		if r := p.Evaluate(cmd, nil); r == "" {
+			t.Errorf("plain form allowed: %q", cmd)
+		}
+	}
+	// And the fix must not turn into "refuse anything with a brace or a dollar":
+	// legitimate uses of both still run.
+	for _, cmd := range []string{
+		"echo ${HOME}",
+		"echo a,b",
+		"echo {not,a,list}",
+		"echo 'quoted $VAR'",
+	} {
+		if r := p.Evaluate(cmd, nil); r != "" {
+			t.Errorf("legitimate command refused by the deny renderings: %q (%s)", cmd, r)
+		}
+	}
+}
+
+// A rendering may only ever add a refusal. If one of them ever *replaced* the
+// text as written, a deny rule that used to catch something would stop catching
+// it — which is the direction that fails open.
+func TestDenyRenderingsOnlyTighten(t *testing.T) {
+	p := New()
+	p.Replace("deny:rm -rf\n")
+	for _, cmd := range []string{
+		"rm -rf /",
+		"echo hi; rm -rf /",
+		"rm${IFS:0}-rf /",
+		"rm ${IFS:0}-rf /",
+		"rm -rf${IFS:0}/",
+	} {
+		if r := p.Evaluate(cmd, nil); r == "" {
+			t.Errorf("deny rule missed %q", cmd)
+		}
+	}
+}
+
+// The glob is the one shape left out on purpose, and this pins that it is a
+// documented limit rather than a silent one: `?` and `*` are decided by the
+// filesystem at run time, and a matcher that guessed would be inventing facts.
+// The package comment names it; if this ever starts passing, the comment is
+// wrong and should be tightened rather than the other way round.
+func TestGlobsRemainOutOfScope(t *testing.T) {
+	p := New()
+	p.Replace("deny:dd if=/dev/\n")
+	if r := p.Evaluate("dd if=/de?/zero", nil); r != "" {
+		t.Skipf("globs are now seen through (%s) — narrow the package comment", r)
+	}
+	// The literal form is still refused, so the rule itself works.
+	if r := p.Evaluate("dd if=/dev/zero", nil); r == "" {
+		t.Fatal("the literal form was not refused")
+	}
+}
+
 func TestEmptyPolicyAllowsEverything(t *testing.T) {
 	p := New()
 	if !p.Empty() {

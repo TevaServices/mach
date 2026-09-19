@@ -217,12 +217,20 @@ consequences worth knowing:
   way past them. The refusal says which layer refused, because the two rule sets
   usually have different authors.
 
-Grammar: `deny:<substring>`, `allowonly`, `allow:<prefix>`, matched against
-whitespace-normalized text so `r''m` and `r${IFS}m` do not slip past a
-`deny:rm` rule. Shell-mode commands are split on separators and every segment
-must satisfy the allowlist independently; argv (`--`) mode is never split,
-because an argument list is one command and a semicolon inside an argument is
-a character, not a boundary.
+Grammar: `deny:<substring>`, `allowonly`, `allow:<prefix>`. Deny rules match
+every rendering a shell command could take: the text as written, with quoting
+and escapes removed and whitespace collapsed (so `r''m -rf /` is refused by
+`deny:rm -rf`), plus — for the text-generating features that can be decided
+statically — each `${…}` parameter expansion rendered both empty and as a
+space, brace groups rendered as the words they expand to, and ANSI-C quoting
+(`$'\x72\x6d'`) decoded. A rendering can only *add* a refusal, because the text
+as written is always checked too, so no rule is loosened by one. A **glob** is
+the shape left out on purpose: `dd if=/de?/zero` is `dev` to the shell and
+`de?/zero` to this matcher, and which characters a `?` or `*` matches is
+decided by the filesystem at run time. Shell-mode commands are split on
+separators and every segment must satisfy the allowlist independently; argv
+(`--`) mode is never split, because an argument list is one command and a
+semicolon inside an argument is a character, not a boundary.
 
 Two properties of `allowonly` that a prefix match does not give you for free,
 and that it now enforces rather than assumes:

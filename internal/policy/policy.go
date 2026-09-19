@@ -5,12 +5,18 @@
 // Scope, stated plainly: this is a best-effort string guardrail, not a
 // confinement boundary and not a sandbox. Rules are matched against a
 // normalized rendering of the command, which defeats the cheap evasions
-// (quote splicing, escaped whitespace, $IFS, separator swapping), but no
-// string matcher can decide what a shell will actually execute — it cannot
-// see through a downloaded script, an interpreter, an alias, or an encoded
-// payload. Use it to catch mistakes and to make casual misuse fail; use an
-// OS-level mechanism (a dedicated unprivileged user, a container, seccomp,
-// SELinux/AppArmor) when you need a boundary that holds against an attacker.
+// (quote splicing, escaped whitespace, $IFS, separator swapping), and against
+// the extra renderings below for the text-generating features that can be
+// decided statically — every `${…}` parameter expansion, brace expansion, and
+// ANSI-C quoting.
+//
+// It cannot see through a downloaded script, an interpreter, an alias, an
+// encoded payload, or a glob (`dd if=/de?/zero` is the string "de?/zero" to
+// this matcher and "dev" to the shell, and no amount of pattern work decides
+// which characters a `*` will match). Use it to catch mistakes and to make
+// casual misuse fail; use an OS-level mechanism (a dedicated unprivileged
+// user, a container, seccomp, SELinux/AppArmor) when you need a boundary that
+// holds against an attacker.
 package policy
 
 import (
@@ -164,22 +170,28 @@ func (p *Policy) Evaluate(command string, argv []string) string {
 	shellMode := len(argv) == 0
 	var joined string
 	var segments []string
+	denyForms := []string{}
 	if shellMode {
-		// Deny rules match the whole command as one normalized string, exactly
-		// as before — collapsing a newline there makes a deny match *more*, not
-		// less, which is the safe direction. The allowlist's segmentation is the
-		// check a collapsed newline can defeat, so that one splits on the raw
-		// text (splitLines) before Normalize folds the separator away.
+		// Deny rules match every rendering the command could take (see
+		// denyRenderings) — the text as written is always one of them, so a
+		// rendering can tighten a rule but never loosen one. The allowlist's
+		// segmentation splits on the raw text (splitLines) before Normalize
+		// folds the newline away, because that is the check a collapsed
+		// separator defeats.
 		joined = Normalize(command)
 		segments = splitLines(command)
+		denyForms = denyRenderings(command)
 	} else {
 		joined = Normalize(strings.Join(argv, " "))
 		segments = []string{joined}
+		denyForms = []string{joined}
 	}
 
 	for _, d := range deny {
-		if strings.Contains(joined, d) {
-			return "denied by command policy (deny:" + d + ")"
+		for _, form := range denyForms {
+			if strings.Contains(form, d) {
+				return "denied by command policy (deny:" + d + ")"
+			}
 		}
 	}
 	if !allowOnly {
@@ -293,6 +305,232 @@ func splitCommands(s string) []string {
 		}
 	}
 	return out
+}
+
+// denyRenderings returns every normalized form a deny rule is matched against.
+//
+// The first is the command exactly as written, with the enumerated $IFS
+// spellings folded by Normalize — so nothing that used to be caught stops being
+// caught, and every rendering below can only add refusals.
+//
+// The rest exist because a shell generates text this matcher cannot see, and
+// the shapes are bounded even where the spellings are not:
+//
+//   - A parameter expansion may produce whitespace, nothing, or anything else.
+//     `${IFS:0:1}` is a space, and `${IFS: -1}`, `${IFS:?}` and `${IFS:1:1}`
+//     are the same space spelled three more ways, so the enumerated replacer in
+//     Normalize could never have covered them: `rm${IFS:0}-rf /` slid past a
+//     `deny:rm -rf`, while the same command with the space written out was
+//     refused. The spellings cannot be enumerated, but the two extremes can be
+//     rendered — the expansion removed entirely (which can only join the text
+//     around it) and the expansion replaced by a space (which can only separate
+//     it) — and a rule that matches either is refused.
+//   - Brace expansion is the same shape without a '$': `{rm,-rf,/}` is one word
+//     to the matcher and three to the shell, so its comma-separated members are
+//     rendered as the separate words they become.
+//   - ANSI-C quoting is not an expansion at all but a literal with an encoding:
+//     `$'\x72\x6d'` *is* `rm`, so it is decoded rather than guessed at.
+//
+// What is deliberately absent is the glob: `?` and `*` are decided by the
+// filesystem at run time, and a matcher that guessed would be inventing facts.
+func denyRenderings(command string) []string {
+	base := Normalize(command)
+	out := []string{base}
+	add := func(s string) {
+		if s != base {
+			for _, seen := range out {
+				if seen == s {
+					return
+				}
+			}
+			out = append(out, s)
+		}
+	}
+	if strings.Contains(command, "${") {
+		add(Normalize(expandAway(command, "")))
+		add(Normalize(expandAway(command, " ")))
+	}
+	if strings.Contains(command, "'") && strings.Contains(command, "\\") {
+		add(Normalize(ansiCDecoded(command)))
+	}
+	if strings.Contains(command, "{") && strings.Contains(command, ",") {
+		add(Normalize(flattenBraces(command)))
+	}
+	return out
+}
+
+// expandAway replaces every ${…} parameter expansion with repl, skipping nested
+// braces so `${a${b}c}` is one expansion rather than two. A '$' with no brace is
+// left alone: `$IFS` and `$VAR` are single words to the shell, and Normalize
+// already folds the IFS spellings that can become whitespace.
+func expandAway(s, repl string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] != '$' || i+1 >= len(s) || s[i+1] != '{' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		depth, j := 0, i+1
+		for ; j < len(s); j++ {
+			switch s[j] {
+			case '{':
+				depth++
+			case '}':
+				depth--
+			}
+			if depth == 0 {
+				break
+			}
+		}
+		if j >= len(s) {
+			// Unterminated: leave it as written rather than swallowing the rest.
+			b.WriteString(s[i:])
+			break
+		}
+		b.WriteString(repl)
+		i = j + 1
+	}
+	return b.String()
+}
+
+// flattenBraces renders a comma-separated brace group as the words it expands
+// to, so `{rm,-rf,/}` reads as `rm -rf /`. A group with no comma is left alone
+// (a lone brace is ordinary text to the shell, and `{a..z}` needs an expansion
+// this does not attempt — under-matching there is the safe direction only when
+// it does not also drop a literal, which is why the base rendering is always
+// still checked).
+func flattenBraces(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] != '{' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		j := strings.IndexByte(s[i:], '}')
+		if j < 0 {
+			b.WriteString(s[i:])
+			break
+		}
+		body := s[i+1 : i+j]
+		if !strings.Contains(body, ",") {
+			b.WriteString(s[i : i+j+1])
+			i += j + 1
+			continue
+		}
+		b.WriteByte(' ')
+		b.WriteString(strings.ReplaceAll(body, ",", " "))
+		b.WriteByte(' ')
+		i += j + 1
+	}
+	return b.String()
+}
+
+// ansiCDecoded renders $'…' ANSI-C quoting as the literal text the shell will
+// see, so `$'\x72\x6d' -rf /` reads as `rm -rf /`. Only the escapes that
+// produce text are decoded; anything unrecognized is kept verbatim, which can
+// only make the rendering less specific and never more.
+func ansiCDecoded(s string) string {
+	if !strings.Contains(s, "$'") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] != '$' || i+1 >= len(s) || s[i+1] != '\'' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		var lit strings.Builder
+		j := i + 2
+		for j < len(s) && s[j] != '\'' {
+			if s[j] == '\\' && j+1 < len(s) {
+				lit.WriteByte(s[j])
+				lit.WriteByte(s[j+1])
+				j += 2
+				continue
+			}
+			lit.WriteByte(s[j])
+			j++
+		}
+		if j >= len(s) {
+			b.WriteString(s[i:]) // unterminated quote: ordinary text
+			break
+		}
+		b.WriteString(unescapeANSI(lit.String()))
+		i = j + 1
+	}
+	return b.String()
+}
+
+// unescapeANSI decodes the C-style escapes bash understands inside $'…'.
+func unescapeANSI(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\\' || i+1 >= len(s) {
+			b.WriteByte(s[i])
+			continue
+		}
+		i++
+		switch c := s[i]; c {
+		case 'n':
+			b.WriteByte('\n')
+		case 't':
+			b.WriteByte('\t')
+		case 'r':
+			b.WriteByte('\r')
+		case 'a':
+			b.WriteByte(7)
+		case 'b':
+			b.WriteByte(8)
+		case 'f':
+			b.WriteByte(12)
+		case 'v':
+			b.WriteByte(11)
+		case 'e', 'E':
+			b.WriteByte(27)
+		case '\\', '\'', '"', '?':
+			b.WriteByte(c)
+		case 'x', 'u', 'U':
+			width := map[byte]int{'x': 2, 'u': 4, 'U': 8}[c]
+			v, n := parseHexDigits(s[i+1:], width)
+			if n == 0 {
+				b.WriteByte('\\')
+				b.WriteByte(c)
+				break
+			}
+			b.WriteRune(rune(v))
+			i += n
+		default:
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+const hexDigits = "0123456789abcdefABCDEF"
+
+// parseHexDigits reads between 1 and width hex digits and returns their value
+// and how many were consumed.
+func parseHexDigits(s string, width int) (int, int) {
+	n, v := 0, 0
+	for ; n < width && n < len(s); n++ {
+		d := strings.IndexByte(hexDigits, s[n])
+		if d < 0 {
+			break
+		}
+		if d >= 16 {
+			d -= 6 // uppercase A-F sit above the lowercase ones in hexDigits
+		}
+		v = v*16 + d
+	}
+	return v, n
 }
 
 // ifsReplacer expands the shell's IFS trick, the oldest way to smuggle
