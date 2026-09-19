@@ -240,6 +240,15 @@ func (c *client) runExec(machine, command string, argv []string, timeout int, as
 				fmt.Fprintln(os.Stderr, "mach: cannot seal: could not read the control plane's E2E setting ("+err.Error()+")")
 				return 3
 			}
+			// Say so, for the same reason the neighbouring "no key on this
+			// machine" case does. Falling back to plaintext is fine; falling back
+			// *silently* is the one outcome this whole path exists to prevent —
+			// an operator who believes a command was encrypted when it was not.
+			// It was also the cheapest way to reach that state: a 5xx, a proxy in
+			// the way, or a control plane older than the route, any of which
+			// hands the command to the control plane in the clear while a fleet
+			// the operator believes has E2E on says nothing.
+			fmt.Fprintln(os.Stderr, "mach: could not read the control plane's E2E setting — running in plaintext ("+err.Error()+")")
 		case !info.Enabled:
 			if mode == E2ERequire {
 				fmt.Fprintln(os.Stderr, "mach: cannot seal: "+info.Reason)

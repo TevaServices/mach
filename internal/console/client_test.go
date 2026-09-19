@@ -274,6 +274,10 @@ type fakeExecServer struct {
 	// command and the agent did not answer in time — the reply is lost, but the
 	// command may well have run, which is the case the console must not retry.
 	sealedStatus int
+	// pubStatus answers /e2epub with that status instead of the signal, which is
+	// what a proxy fault, a 5xx or a control plane older than the route looks
+	// like from here.
+	pubStatus int
 }
 
 func newFakeExecServer(t *testing.T, enabled bool, withKey bool) *fakeExecServer {
@@ -290,7 +294,13 @@ func newFakeExecServer(t *testing.T, enabled bool, withKey bool) *fakeExecServer
 		if strings.HasSuffix(r.URL.Path, "/e2epub") {
 			f.mu.Lock()
 			f.pubCalls++
+			pubStatus := f.pubStatus
 			f.mu.Unlock()
+			if pubStatus != 0 {
+				w.WriteHeader(pubStatus)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "the E2E signal is unreadable"})
+				return
+			}
 			resp := map[string]any{"machine": "org-test-01", "e2e": "off", "e2e_enabled": f.enabled}
 			if f.enabled && f.key != nil {
 				resp["e2e"] = "on"
@@ -453,6 +463,46 @@ func TestExecWarnsWhenTheMachineHasNoKey(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "has no E2E key") || !strings.Contains(stderr, "plaintext") {
 		t.Errorf("stderr = %q, want a line saying it ran in plaintext and why", stderr)
+	}
+}
+
+// The E2E signal is what tells the console whether sealing is possible at all,
+// and it comes from the party the seal defends against. When it cannot be read —
+// a 5xx, a proxy in the way, a control plane older than the route — the default
+// obey mode falls back to plaintext, which is defensible; doing so *silently*
+// is the failure mode this whole path exists to prevent, and it was the cheapest
+// way to reach it. Every neighbouring case printed a line; this one did not.
+func TestExecWarnsWhenTheE2ESignalCannotBeRead(t *testing.T) {
+	pinState(t)
+	f := newFakeExecServer(t, true, true)
+	f.pubStatus = http.StatusInternalServerError
+	var code int
+	stdout, stderr := capture(t, func() {
+		code = f.client().Exec("org-test-01", "echo marker", 0, false, E2EObey)
+	})
+	if code != 0 {
+		t.Fatalf("code = %d, want 0 (%s)", code, stderr)
+	}
+	if !strings.Contains(stderr, "could not read the control plane's E2E setting") {
+		t.Errorf("stderr = %q, want a line saying it ran in plaintext and why", stderr)
+	}
+	if !strings.Contains(stderr, "plaintext") {
+		t.Errorf("stderr = %q, want the notice to name plaintext", stderr)
+	}
+	// Obeying still means running the command — the notice is the whole change.
+	// It must not have sealed to a key it never read.
+	if !strings.Contains(stdout, "plain") {
+		t.Errorf("stdout = %q, want the plaintext result", stdout)
+	}
+	bodies := f.bodies()
+	if len(bodies) != 1 {
+		t.Fatalf("server saw %d requests, want 1", len(bodies))
+	}
+	if !strings.Contains(bodies[0], "marker") {
+		t.Errorf("the command was not sent as plaintext: %s", bodies[0])
+	}
+	if strings.Contains(bodies[0], "sealed") {
+		t.Errorf("the console sealed to a key it could not read the setting for: %s", bodies[0])
 	}
 }
 
