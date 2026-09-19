@@ -572,6 +572,28 @@ signature protects delivery, the attestation records provenance.
     confinement is a process group and a SIGKILL, not rlimits; see the
     `internal/agent/confine.go` package comment.
 
+27. **The org list is public.** The enrollment page prints every configured org
+    to an anonymous visitor, and the pair page offers them in a dropdown. That
+    is deliberate — the operator has to pick one, and an agent cannot enroll
+    without being told which prefix it is under — but it is half of the
+    name-space: the other half is the machine part, which is now the only thing
+    an unauthenticated caller cannot get (see the pair page and the agent socket
+    above). Do not treat an org name as a secret.
+28. **The bounded stores can be filled.** Two in-memory stores refuse rather
+    than grow: the UI's in-flight sign-in states (a distributed source that
+    fills it blocks *other* operators' sign-ins until the entries age out, up
+    to the state TTL) and the fleet's rate limiters (per-IP, so a wide source
+    escapes them, and a restart clears them — gaps #6 and #12 are the same
+    family). Both are refusals rather than anything worse, and both are the
+    cost of a store that cannot be made to grow without bound.
+29. **An unpinned agent trusts TLS alone.** An agent enrolled before server-key
+    pinning has no `server_key`, so it cannot verify the control plane's
+    identity and logs a warning at every connect instead of refusing. Updates
+    still refuse (a manifest must verify against a pin), so integrity holds;
+    re-enrolling is what pins one. This is backward compatibility with a loud
+    warning, not a silent downgrade, and it is worth knowing before someone
+    reads the warning as harmless.
+
 ## Deployment checklist
 
 - [ ] Control plane behind TLS reverse proxy; `MACH_TRUST_PROXY=1`.
