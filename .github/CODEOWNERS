@@ -1,1 +1,7 @@
-* @bcross
+# Default owner for every path.
+#
+# The `Main` ruleset requires a code-owner review, and GitHub blocks
+# self-approval — so with a single owner, a maintainer-authored PR is
+# unmergeable and only that owner can unblock a dependabot PR. Listing
+# both maintainers keeps either one able to satisfy the review.
+* @bcross @jon-davie
