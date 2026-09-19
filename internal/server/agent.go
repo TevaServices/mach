@@ -8,7 +8,6 @@ import (
 	"errors"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/TevaServices/mach/internal/broker"
@@ -246,31 +245,48 @@ func (s *Server) enrollmentRefusal(name, pubkey string) (int, string) {
 
 // ---- GET /v1/agent/ws  (agent main connection; identity via ed25519) ----
 
+// handleAgentWS is the agent's main connection. It authenticates the machine
+// with an ed25519 signature over a per-connection challenge, and it says nothing
+// that depends on which machine was asked for until that signature has verified.
+//
+// That ordering IS the control. The name arrives in the query string from an
+// unauthenticated caller, so the lookup used to answer a different question than
+// the one it was meant to: a known name was sent a challenge, an unknown one got
+// silence, and a revoked one got an explicit frame — all before any
+// authentication. A trivial WebSocket client could therefore enumerate a fleet's
+// org-prefixed hostnames, which is exactly the reconnaissance a targeted
+// attacker wants, and the route had no rate limit. The comment here said this
+// must not be "an oracle for distinguishing known machine from unknown" while
+// the code did precisely that.
+//
+// So the socket is upgraded, the same challenge goes out, and the client's hello
+// is read and verified before the name is resolved. An unauthenticated caller
+// gets one answer — a challenge, then silence — whatever name it tries, which is
+// nothing it did not already know. A revoked machine still learns it is revoked,
+// because retiring is what revocation means and it is the only way the agent
+// stops; it learns it by proving it holds the machine's key, so the disclosure
+// reaches exactly the party that already had the answer.
 func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
-	machine, err := s.st.MachineByName(name)
-	if err != nil || machine == nil {
-		// Upgrade-then-close instead of a 401: an HTTP-level error would be
-		// an oracle for distinguishing "known machine" from "unknown" during
-		// name enumeration. (Revoked machines get the explicit frame below.)
-		if ws0, err0 := s.upgrader.Upgrade(w, r, nil); err0 == nil {
-			ws0.SetReadLimit(64 << 10)
-			_ = ws0.SetReadDeadline(time.Now().Add(10 * time.Second))
-			ws0.Close()
-		}
+
+	// Failed dials are counted against their source; a dial that authenticates
+	// is not. The silence below removes the oracle but not the cost of asking,
+	// and an enumerator is by definition a client that never authenticates — so
+	// the budget is spent by exactly the traffic with no other reason to be here.
+	// A real fleet behind one address is unaffected: its agents succeed and are
+	// never counted. The one honest failure is a machine deleted from the fleet,
+	// whose agent retries on a backoff capped at two minutes — a few dials an
+	// hour, against a limit an order of magnitude above that.
+	ip := s.clientIP(r)
+	if s.agentDials.blocked(ip) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{
+			"error": "too many failed agent connections from this address; try again later"})
 		return
 	}
-	if machine.Revoked {
-		ws2, err2 := s.upgrader.Upgrade(w, r, nil)
-		if err2 == nil {
-			ws2.SetReadLimit(64 << 10)
-			_ = ws2.SetReadDeadline(time.Now().Add(10 * time.Second))
-			conn0 := protocol.NewWSConn(ws2)
-			_ = conn0.WriteEnvelope(protocol.Envelope{Type: "revoked"})
-			conn0.Close()
-		}
-		return
-	}
+	// fail records one unauthenticated dial. Every path that ends without a
+	// verified hello calls it, so "which answers cost the caller" has one home.
+	fail := func() { s.agentDials.record(ip) }
+
 	ws, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -285,26 +301,55 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	_ = ws.SetReadDeadline(time.Now().Add(15 * time.Second))
 
 	// Replay-proof hello: server sends a random challenge; the agent signs
-	// name|challenge. Captured hellos are worthless on other connections.
+	// name|challenge. Captured hellos are worthless on other connections — and
+	// this frame is byte-identical for every name in the query string, which is
+	// what makes the lookup below unobservable.
 	nonce := store.RandToken(32)
 	if err := conn.WriteEnvelope(protocol.Envelope{Type: "hello", ReqID: nonce}); err != nil {
 		return
 	}
 	env, err := conn.ReadEnvelope()
 	if err != nil || env.Type != "hello" {
-		_ = conn.WriteEnvelope(protocol.Envelope{Type: "hello_result", Payload: mustJSON(protocol.HelloResponse{OK: false, Error: "expected hello"})})
+		fail()
 		return
 	}
 	var hr protocol.HelloRequest
-	if err := json.Unmarshal(env.Payload, &hr); err != nil || hr.PubKey != machine.PubKey || hr.Name != machine.Name || verifyAgentHello(machine.PubKey, hr, nonce) != nil {
-		_ = conn.WriteEnvelope(protocol.Envelope{Type: "hello_result", Payload: mustJSON(protocol.HelloResponse{OK: false, Error: "bad signature or key"})})
+	if err := json.Unmarshal(env.Payload, &hr); err != nil {
+		fail()
 		return
 	}
+
+	// Resolve the name only now, after the caller has committed to an identity.
+	// Every failure from here is the same silence and the same budget, so no
+	// answer can be read off the response until the signature has verified.
+	machine, err := s.st.MachineByName(name)
+	if err != nil || machine == nil {
+		fail()
+		return
+	}
+	if hr.PubKey != machine.PubKey || hr.Name != machine.Name || verifyAgentHello(machine.PubKey, hr, nonce) != nil {
+		fail()
+		return
+	}
+	if machine.Revoked {
+		// The signature verified against the revoked row's own key, so this says
+		// nothing to anyone who does not already hold it — and the machine's
+		// agent has to hear it, because retiring is what revocation means. Sent
+		// as a hello_result rather than the bare frame the live path uses: this
+		// is the reply to a hello, and the agent maps this error string back to
+		// errRevoked (which is what makes it exit 0 instead of reconnecting).
+		_ = conn.WriteEnvelope(protocol.Envelope{Type: "hello_result",
+			Payload: mustJSON(protocol.HelloResponse{OK: false, Error: "revoked"})})
+		return
+	}
+
 	// Mutual authentication: sign the challenge with this control plane's
 	// identity key. The agent verifies against the key it pinned at
 	// enrollment, so a hijacked TLS layer cannot impersonate the server.
 	resp := protocol.HelloResponse{OK: true, ServerAuth: "v1 " + base64.StdEncoding.EncodeToString(ed25519.Sign(s.serverPriv, []byte("server|"+nonce)))}
-	_ = conn.WriteEnvelope(protocol.Envelope{Type: "hello_result", Payload: mustJSON(resp)})
+	if err := conn.WriteEnvelope(protocol.Envelope{Type: "hello_result", Payload: mustJSON(resp)}); err != nil {
+		return
+	}
 
 	// Authenticated: exec_result frames carry up to 2×8 MiB of output plus
 	// JSON overhead; raise the frame cap accordingly.
@@ -549,32 +594,4 @@ func (s *Server) completeExec(env protocol.Envelope, fromMachine string) {
 		default:
 		}
 	}
-}
-
-// authFailures tracks failed console-auth attempts per IP for rate limiting.
-type authLimiter struct {
-	mu    sync.Mutex
-	fails map[string][]time.Time
-}
-
-func (a *authLimiter) tooMany(ip string) bool {
-	now := time.Now()
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.fails == nil {
-		a.fails = map[string][]time.Time{}
-	}
-	times := a.fails[ip][:0]
-	for _, t := range a.fails[ip] {
-		if now.Sub(t) < 10*time.Minute {
-			times = append(times, t)
-		}
-	}
-	if len(times) >= 20 {
-		a.fails[ip] = times
-		return true
-	}
-	times = append(times, now)
-	a.fails[ip] = times
-	return false
 }

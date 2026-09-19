@@ -41,6 +41,11 @@ type Server struct {
 	// failures count, max 20 per IP per 10 minutes
 	authFails *ipLimiter
 
+	// agent dials that never authenticated, per client (rate limiting): only
+	// failures count, so a fleet behind one address spends nothing by
+	// connecting. max 60 per IP per 10 minutes — see handleAgentWS.
+	agentDials *ipLimiter
+
 	// pair-token lookups (page views, agent polls): generous but bounded
 	//
 	// Only the endpoints that create state or hash a low-entropy secret need
@@ -122,6 +127,7 @@ func New(st *store.Store, br *broker.Broker, org, keyPath string) *Server {
 		pending:     map[string]*pendingExec{},
 		pairStarts:  newIPLimiter(5, 10*time.Minute),
 		authFails:   newIPLimiter(20, 10*time.Minute),
+		agentDials:  newIPLimiter(maxAgentDialFailures, 10*time.Minute),
 		pairLookups: newIPLimiter(600, 10*time.Minute),
 		cleanupStop: make(chan struct{}),
 	}
@@ -344,6 +350,12 @@ func (s *Server) clientIP(r *http.Request) string {
 	}
 	return r.RemoteAddr
 }
+
+// maxAgentDialFailures is the per-IP budget for agent dials that never
+// authenticated, over the same 10-minute window the other limiters use. See
+// handleAgentWS: only failures count, so a fleet behind one address spends
+// nothing by connecting.
+const maxAgentDialFailures = 60
 
 // maxTrackedIPs caps an ipLimiter's map. It is reachable only under a large
 // distributed flood — the case a per-IP limiter cannot help with anyway — and

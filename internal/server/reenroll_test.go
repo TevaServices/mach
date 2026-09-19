@@ -14,7 +14,9 @@ package server
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -39,12 +41,11 @@ func enrollBody(key, pubHex, name string) string {
 	return fmt.Sprintf(`{"api_key":%q,"pub_key":%q,"name":%q}`, key, pubHex, name)
 }
 
-// dialAgentExpectRefusal dials the agent endpoint WITHOUT attempting a hello.
-//
-// A revoked machine is answered before the handshake: the control plane upgrades,
-// writes the terminal frame and closes. So the test cannot use dialAgent, which
-// would fail on the missing challenge frame — and the refusal is exactly what it
-// wants to observe.
+// dialAgentExpectRefusal dials the agent endpoint WITHOUT attempting a hello,
+// and returns the socket so a caller can see what an unauthenticated client is
+// told. Since the control plane now sends the challenge first and says nothing
+// else until it has verified a signature, what such a client sees is the
+// challenge and then silence — for every name, which is the point.
 func dialAgentExpectRefusal(t *testing.T, srvURL, mach string) *websocket.Conn {
 	t.Helper()
 	u := "ws" + strings.TrimPrefix(srvURL, "http") + "/v1/agent/ws?name=" + mach
@@ -54,6 +55,38 @@ func dialAgentExpectRefusal(t *testing.T, srvURL, mach string) *websocket.Conn {
 	}
 	t.Cleanup(func() { ws.Close() })
 	return ws
+}
+
+// dialAgentHello performs the whole challenge/hello exchange and hands back the
+// reply without asserting what it says, so a test can check a refusal. Unlike
+// dialAgent it does not require the machine to be accepted.
+func dialAgentHello(t *testing.T, srvURL, mach, pubHex string, priv ed25519.PrivateKey) (*websocket.Conn, protocol.HelloResponse) {
+	t.Helper()
+	u := "ws" + strings.TrimPrefix(srvURL, "http") + "/v1/agent/ws?name=" + mach
+	ws, _, err := websocket.DefaultDialer.Dial(u, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { ws.Close() })
+	var challenge protocol.Envelope
+	if err := ws.ReadJSON(&challenge); err != nil {
+		t.Fatalf("read challenge: %v", err)
+	}
+	if challenge.Type != "hello" {
+		t.Fatalf("first frame = %q, want hello", challenge.Type)
+	}
+	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(mach+"|"+challenge.ReqID)))
+	hello, _ := json.Marshal(protocol.HelloRequest{Auth: "v1 " + sig, PubKey: pubHex, Name: mach})
+	if err := ws.WriteJSON(protocol.Envelope{Type: "hello", Payload: hello}); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+	var result protocol.Envelope
+	if err := ws.ReadJSON(&result); err != nil {
+		t.Fatalf("read hello_result: %v", err)
+	}
+	var hr protocol.HelloResponse
+	_ = json.Unmarshal(result.Payload, &hr)
+	return ws, hr
 }
 
 // The whole point: a revoked machine comes back through a fresh enrollment.
@@ -100,7 +133,7 @@ func TestRevivedMachineCanConnectAgain(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	mach := "bcross-web"
-	oldPub, _ := newKeyHex(t)
+	oldPub, oldPriv := newKeyHex(t)
 	if err := st.CreateMachine(mach, oldPub, "h", "linux", "amd64", "v", "", false); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -108,15 +141,13 @@ func TestRevivedMachineCanConnectAgain(t *testing.T) {
 		t.Fatalf("revoke: %v", err)
 	}
 
-	// The revoked agent is refused with the terminal frame, so it retires rather
-	// than hammering the control plane.
-	ws := dialAgentExpectRefusal(t, srv.URL, mach)
-	var env protocol.Envelope
-	if err := ws.ReadJSON(&env); err != nil {
-		t.Fatalf("read refusal: %v", err)
-	}
-	if env.Type != "revoked" {
-		t.Fatalf("revoked agent got %q, want revoked", env.Type)
+	// The revoked agent is refused with the terminal answer, so it retires rather
+	// than hammering the control plane — and it is refused only after proving it
+	// holds the machine's key, which is what keeps the same answer out of reach
+	// of anyone probing for a name (see TestAgentDialCannotEnumerateNames).
+	ws, hr := dialAgentHello(t, srv.URL, mach, oldPub, oldPriv)
+	if hr.OK || hr.Error != "revoked" {
+		t.Fatalf("revoked agent got ok=%v error=%q, want the revoked refusal", hr.OK, hr.Error)
 	}
 	ws.Close()
 
@@ -133,6 +164,115 @@ func TestRevivedMachineCanConnectAgain(t *testing.T) {
 	}
 	if ac := s.br.WaitOnline(mach, 3*time.Second); ac == nil {
 		t.Fatal("the revived machine never came online")
+	}
+}
+
+// The agent socket must not be an oracle. The name arrives in the query string
+// from an unauthenticated caller, and the handler used to resolve it *before*
+// the hello — so a known name was sent a challenge, an unknown one got silence,
+// and a revoked one got an explicit frame, all before any authentication. A
+// trivial WebSocket client could enumerate a fleet's org-prefixed hostnames
+// that way, which is the reconnaissance a targeted attacker most wants, and the
+// route had no rate limit either. The comment in the handler claimed the
+// opposite of what the code did.
+//
+// All three names now get the same thing: a challenge, and then nothing.
+func TestAgentDialCannotEnumerateNames(t *testing.T) {
+	s, st := newAuthTestServer(t)
+	srv := httptest.NewServer(s.Routes())
+	t.Cleanup(srv.Close)
+
+	knownPub, _ := newKeyHex(t)
+	if err := st.CreateMachine("bcross-live", knownPub, "h", "linux", "amd64", "v", "", false); err != nil {
+		t.Fatalf("seed known machine: %v", err)
+	}
+	revokedPub, _ := newKeyHex(t)
+	if err := st.CreateMachine("bcross-revoked", revokedPub, "h", "linux", "amd64", "v", "", false); err != nil {
+		t.Fatalf("seed revoked machine: %v", err)
+	}
+	if err := st.RevokeMachine("bcross-revoked"); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+
+	// Probe each name the way an enumerator does: connect, and see what comes
+	// back before proving anything. An honest client — a real agent — is the
+	// only party that can tell these apart, and it does it by signing.
+	seen := map[string]string{}
+	for _, name := range []string{"bcross-live", "bcross-revoked", "bcross-does-not-exist"} {
+		u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/v1/agent/ws?name=" + name
+		ws, _, err := websocket.DefaultDialer.Dial(u, nil)
+		if err != nil {
+			t.Fatalf("dial %s: %v", name, err)
+		}
+		var env protocol.Envelope
+		_ = ws.SetReadDeadline(time.Now().Add(3 * time.Second))
+		if err := ws.ReadJSON(&env); err != nil {
+			t.Fatalf("read first frame for %s: %v", name, err)
+		}
+		// The challenge is the whole of what an unauthenticated caller sees. It
+		// must not carry a name, a version, or anything else that varies.
+		if env.Type != "hello" {
+			t.Fatalf("%s got %q as the first frame, want hello for every name", name, env.Type)
+		}
+		if env.Payload != nil {
+			t.Fatalf("%s got a payload on the challenge frame: %s", name, env.Payload)
+		}
+		seen[name] = env.Type
+		// Silence after that: no hello_result, no revoked frame, no error. The
+		// connection does not answer a client that has not authenticated.
+		var after protocol.Envelope
+		if err := ws.ReadJSON(&after); err == nil {
+			t.Fatalf("%s got a second frame %q before authenticating", name, after.Type)
+		}
+		ws.Close()
+	}
+	for name, typ := range seen {
+		if typ != "hello" {
+			t.Fatalf("%s = %q, want an identical challenge", name, typ)
+		}
+	}
+}
+
+// An agent that never authenticates spends its source's budget, and a burst of
+// it is refused. A real agent is not counted, which is what keeps a fleet behind
+// one address unaffected.
+func TestAgentDialIsRateLimitedPerSource(t *testing.T) {
+	s, st := newAuthTestServer(t)
+	srv := httptest.NewServer(s.Routes())
+	t.Cleanup(srv.Close)
+
+	knownPub, knownPriv := newKeyHex(t)
+	if err := st.CreateMachine("bcross-live", knownPub, "h", "linux", "amd64", "v", "", false); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Successes are free: a real agent connects as often as it likes, which is
+	// what keeps a fleet behind one address unaffected by its neighbours.
+	for i := 0; i < maxAgentDialFailures+10; i++ {
+		ws, hr := dialAgentHello(t, srv.URL, "bcross-live", knownPub, knownPriv)
+		if !hr.OK {
+			t.Fatalf("authenticated dial %d was refused: %q", i, hr.Error)
+		}
+		ws.Close()
+	}
+	// Failures are not: the burst is refused once the budget is spent, and the
+	// refusal is a status rather than a silent close — it says nothing about the
+	// name that was asked for, only about the source.
+	agentWS := "ws" + strings.TrimPrefix(srv.URL, "http") + "/v1/agent/ws?name=bcross-nope"
+	var refusal *http.Response
+	for i := 0; i < 4*maxAgentDialFailures; i++ {
+		ws, resp, err := websocket.DefaultDialer.Dial(agentWS, nil)
+		if err != nil {
+			refusal = resp
+			break
+		}
+		ws.Close()
+	}
+	if refusal == nil {
+		t.Fatal("a burst of unauthenticated dials was never refused")
+	}
+	if refusal.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("over-limit dial returned %s, want 429", refusal.Status)
 	}
 }
 

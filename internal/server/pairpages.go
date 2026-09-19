@@ -288,7 +288,9 @@ func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store
 	}
 
 	// Org must be a registered org, and the composed name must satisfy the
-	// org-prefix rule. Conflicts error out and require a new name.
+	// org-prefix rule. These are rules about the text the operator typed and the
+	// configuration of this control plane — neither says anything about which
+	// machines exist, so they may be answered before the code.
 	if !s.orgRegistered(org) {
 		renderPair(w, retry("Unknown org "+strconv.Quote(org)+" — pick one from the list."))
 		return
@@ -297,6 +299,44 @@ func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store
 		renderPair(w, retry("Machine part must be 1-48 chars (letters/digits/hyphen). Final name: "+org+"-<machine>."))
 		return
 	}
+
+	// The challenge code comes next, BEFORE anything that depends on the fleet.
+	//
+	// "Machine name already taken" is a fact about the machines this control
+	// plane has, and it used to be answered first — so anyone who started their
+	// own pairing could probe names with the form and learn which exist, and
+	// which are revoked or temporary, without reading a single code and without
+	// spending one of the five attempts. The code is what approval is gated on,
+	// so it gates the fleet's answers too: a caller who cannot read the agent's
+	// console learns nothing, and a wrong code here counts as the attempt it is.
+	//
+	// ApprovePairing re-checks the code on the way through, so this is the gate
+	// in front of it rather than a second, weaker check that must agree.
+	verified, why, err := s.st.VerifyPairingCode(p.ID, code)
+	if err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	if !verified {
+		if why == "bad-code" {
+			// Count the attempt; expire the pairing after 5 wrong tries.
+			alive, aerr := s.st.RecordPairingAttempt(p.ID, 5)
+			if aerr != nil || !alive {
+				renderPair(w, pairPageData{Error: "Too many wrong code attempts — this pairing is expired. Run enrollment again on the machine.", State: "expired", Terminal: true})
+				return
+			}
+			renderPair(w, retry("Wrong code. Do not approve unless you can read the agent's console."))
+			return
+		}
+		if why == "not-pending" {
+			// A concurrent deny/expiry won the race; show the real state.
+			renderPair(w, terminalPair(s.st.PairingState(p), p.Name))
+			return
+		}
+		renderPair(w, terminalPair(why, p.Name))
+		return
+	}
+
 	// Whether this name may be taken is the enrollment policy's call, not this
 	// page's. A revoked or temporary row may be taken over (see store.reenroll),
 	// and a second copy of that rule living here is exactly how the QR path came

@@ -856,6 +856,37 @@ func (s *Store) RecordPairingAttempt(pairID string, max int) (ok bool, err error
 	return true, nil
 }
 
+// VerifyPairingCode checks a challenge code against a pending pairing without
+// changing anything. Returns the same (ok, why) shape as ApprovePairing.
+//
+// It exists so the pair page can judge the code *before* it judges the machine
+// name. "That name is already taken" is a fact about the fleet, and answering it
+// for a caller who has not yet proved they can read the agent's console turned
+// the page into a name-enumeration oracle: a name probe cost no code attempt, so
+// one pairing's budget bought hundreds of name lookups. The code is what gates
+// approval, so it gates the answer too.
+//
+// ApprovePairing still re-checks on the way through — this is the gate in front
+// of it, not a replacement for it, and its atomic UPDATE..WHERE state='pending'
+// is what keeps a concurrent deny winning the race.
+func (s *Store) VerifyPairingCode(pairID, code string) (bool, string, error) {
+	var codeHash, codeSalt, state string
+	err := s.queryRow(`SELECT code_hash, code_salt, state FROM pairings WHERE id = ?`, pairID).Scan(&codeHash, &codeSalt, &state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, "not found", nil
+	}
+	if err != nil {
+		return false, "", err
+	}
+	if state != "pending" {
+		return false, state, nil
+	}
+	if subtle.ConstantTimeCompare([]byte(HashSecret(NormalizeCode(code), codeSalt)), []byte(codeHash)) != 1 {
+		return false, "bad-code", nil
+	}
+	return true, "", nil
+}
+
 func (s *Store) ApprovePairing(pairID, code, name string) (bool, string, error) {
 	var codeHash, codeSalt, state string
 	err := s.queryRow(`SELECT code_hash, code_salt, state FROM pairings WHERE id = ?`, pairID).Scan(&codeHash, &codeSalt, &state)

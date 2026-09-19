@@ -123,6 +123,74 @@ func TestPairApprovalRefusesAWrongCodeOverHTTP(t *testing.T) {
 	}
 }
 
+// The pair page must not answer questions about the fleet before the code does.
+//
+// "Machine name already taken" was checked first, and a name probe cost no code
+// attempt — so anyone who started their own pairing (5 per IP per 10 minutes)
+// could submit hundreds of names per window and learn which exist, and which are
+// revoked or temporary. The org list is printed to anonymous visitors on the
+// enrollment page, so the keyspace came with it. The code is what approval is
+// gated on; it has to gate the fleet's answers too.
+func TestPairPageDoesNotLeakNamesToAWrongCode(t *testing.T) {
+	s, st := newAuthTestServer(t)
+	h := s.Routes()
+
+	// One name that exists and is active, one that does not. The pair page must
+	// not tell them apart to a caller who cannot read the agent's console.
+	livePub, _ := newKeyHex(t)
+	if err := st.CreateMachine("bcross-live", livePub, "h", "linux", "amd64", "v", "", false); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	post := func(t *testing.T, token string, form url.Values) string {
+		t.Helper()
+		req := httptest.NewRequest("POST", "/pair/"+token, strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("pair post: %d", rec.Code)
+		}
+		return rec.Body.String()
+	}
+
+	for _, name := range []string{"bcross-live", "bcross-free"} {
+		probePub, _ := newKeyHex(t)
+		code, body := bearerJSON(t, h, "POST", "/v1/pair/start", "",
+			`{"pub_key":"`+probePub+`","hostname":"h"}`)
+		if code != http.StatusOK {
+			t.Fatalf("pair start: %d (%s)", code, body)
+		}
+		var start protocol.PairStartResponse
+		_ = json.Unmarshal([]byte(body), &start)
+
+		org, part, _ := strings.Cut(name, "-")
+		page := post(t, start.Token, url.Values{
+			"code": {"AAAA-AAAA-AAAA"}, "org": {org}, "name": {part}, "approve": {"1"}})
+		if strings.Contains(page, "already taken") {
+			t.Fatalf("%s: the page answered a fleet question before checking the code", name)
+		}
+		if !strings.Contains(page, "Wrong code") {
+			t.Fatalf("%s: a wrong code was not refused: %s", name, page)
+		}
+		if p, _ := st.PairingByToken(start.Token); p == nil || s.st.PairingState(p) == "approved" {
+			t.Fatalf("%s: a wrong code approved the pairing", name)
+		}
+	}
+
+	// The name check still happens — it just happens after the code now. A
+	// correct code on a taken name is refused exactly as it always was.
+	takenPub, _ := newKeyHex(t)
+	page, state := approvePair(t, s, takenPub, "bcross-live")
+	if !strings.Contains(page, "already taken") {
+		t.Fatalf("a taken name was accepted after a correct code: %s", page)
+	}
+	if state == "approved" {
+		t.Fatal("a taken name approved the pairing")
+	}
+}
+
 // approvePair drives the pair page for a machine name and returns the rendered
 // page plus the pairing's resulting state.
 func approvePair(t *testing.T, s *Server, pubHex, name string) (page, state string) {
