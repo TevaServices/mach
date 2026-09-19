@@ -243,6 +243,19 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "machine offline or unknown: " + req.Machine})
 		return
 	}
+	// Re-checked after the wait, because that wait is up to fifteen seconds and
+	// the check above is now that old. A block (or a revocation) set in the
+	// window would otherwise be dispatched anyway — the operator's "stop
+	// sending this machine commands" arriving one command too late, which is
+	// precisely the command they were trying to prevent. The streaming path
+	// re-checks per frame and never had this window; this is the same pattern
+	// on the path that did.
+	if ref := s.dispatchRefusal(req.Machine); ref != nil {
+		s.auditExec(&pendingExec{machine: req.Machine, command: display, source: "console:" + keyName},
+			execRefused, "", ref.msg)
+		writeJSON(w, ref.status, map[string]string{"error": ref.msg})
+		return
+	}
 
 	reqID := store.RandToken(8)
 	pe := &pendingExec{

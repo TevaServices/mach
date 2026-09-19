@@ -167,6 +167,104 @@ func TestExecRefusedWhenMachineBlocked(t *testing.T) {
 	}
 }
 
+// Revoking a machine is meant to take it out of the fleet, and the dispatch
+// path did not read the flag. `mach-server revoke-machine` runs in a *separate
+// process*, so it cannot close this control plane's agent socket; the HTTP and
+// UI paths do close it, so the gap was reachable only from the CLI — the one an
+// operator would not think to check. The machine stays connected and keeps
+// accepting exec, exec_stream, stream_stdin and stream_kill until it happens to
+// reconnect, which for a healthy agent is never.
+//
+// The agent socket here is live on purpose: that is the whole condition.
+func TestExecRefusedWhenMachineRevoked(t *testing.T) {
+	h := newStreamHarness(t)
+	key := adminKey(t, h.s, "exec:*")
+
+	// Revoked in the store, the way the CLI does it, with the socket left open.
+	if err := h.st.RevokeMachine(h.mach); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if ac := h.s.br.Get(h.mach); ac == nil {
+		t.Fatal("the agent socket was not left open; this test proves nothing")
+	}
+
+	code, body := execReq(t, h.s, key, fmt.Sprintf(`{"machine":%q,"command":"echo hi"}`, h.mach))
+	if code != http.StatusForbidden {
+		t.Fatalf("exec on a revoked machine returned %d, want 403 (%s)", code, body)
+	}
+	if !strings.Contains(body, "revoked") {
+		t.Fatalf("the refusal does not name the revocation: %s", body)
+	}
+	// Audited like every other refusal, so the record shows the attempt.
+	entries, err := h.st.AuditList(h.mach, 10)
+	if err != nil {
+		t.Fatalf("audit list: %v", err)
+	}
+	if len(entries) != 1 || !entries[0].ExitCode.Valid || entries[0].ExitCode.Int64 != execRefused {
+		t.Fatalf("revoked exec refusal not audited as %d: %+v", execRefused, entries)
+	}
+
+	// The streaming relay is a command path too: opening a session must be
+	// refused rather than left to the per-frame check.
+	if conn, _, resp := h.console(t, key, h.mach); conn != nil || resp == nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("streaming on a revoked machine: conn=%v resp=%v, want 403", conn, resp)
+	}
+}
+
+// A block set during the fifteen-second wait for the agent must not be
+// dispatched anyway: "stop sending this machine commands" arriving one command
+// too late is arriving at the command the operator was trying to prevent.
+//
+// The check used to happen only before the wait, so a request that parked there
+// while the machine was offline had a window the streaming path never had (the
+// relay re-checks every frame, so its window is microseconds). This drives the
+// window for real: the exec is in flight and past its first check, the block
+// lands, and only then does the agent come online so the wait returns.
+func TestBlockSetDuringWaitOnlineStopsTheDispatch(t *testing.T) {
+	s, st := newAuthTestServer(t)
+	srv := httptest.NewServer(s.Routes())
+	t.Cleanup(srv.Close)
+
+	mach := "bcross-late"
+	pubHex, priv := seedMachine(t, st, mach)
+	key := adminKey(t, s, "exec:*")
+
+	type result struct {
+		code int
+		body string
+	}
+	ch := make(chan result, 1)
+	go func() {
+		// A one-second timeout, so a dispatch that slips through the window comes
+		// back as a 504 in eleven seconds rather than holding the test open for
+		// forty: the assertion below is then about the status, not about patience.
+		code, body := execReq(t, s, key,
+			fmt.Sprintf(`{"machine":%q,"command":"echo hi","timeout":1}`, mach))
+		ch <- result{code, body}
+	}()
+
+	// Let the handler get past its first check — the machine is not blocked when
+	// the request arrives, so that check passes — then block, then let the agent
+	// connect and release the wait.
+	time.Sleep(300 * time.Millisecond)
+	if _, err := st.SetMachineBlocked(mach, true); err != nil {
+		t.Fatalf("block: %v", err)
+	}
+	_ = dialAgent(t, srv.URL, mach, pubHex, priv)
+
+	select {
+	case r := <-ch:
+		if r.code != http.StatusForbidden {
+			t.Fatalf("a machine blocked mid-request was dispatched to: %d (%s)", r.code, r.body)
+		}
+		if !strings.Contains(r.body, "blocked") {
+			t.Fatalf("refusal does not name the block: %s", r.body)
+		}
+	case <-time.After(25 * time.Second):
+		t.Fatal("the exec never returned")
+	}
+}
+
 // The negative control for the test above: the same request succeeds when the
 // machine is not blocked, so the refusal is the block and not the request shape.
 func TestExecAllowedWhenNotBlocked(t *testing.T) {

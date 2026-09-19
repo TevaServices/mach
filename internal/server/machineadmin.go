@@ -75,6 +75,26 @@ func (s *Server) dispatchRefusal(name string) *refusal {
 			"machine is blocked by the operator: " + name + " — unblock it to run commands",
 		}
 	}
+	// Revocation is checked here too, and that closes the dispatch half of a
+	// documented gap. A revoked machine is meant to be out of the fleet: it is
+	// told to retire and its key can never re-enroll. But revocation is written
+	// by `mach-server revoke-machine` in a *separate process*, which cannot
+	// close this control plane's socket — so the connection stays open and,
+	// with nothing reading the flag on the dispatch path, the machine keeps
+	// accepting exec, exec_stream, stream_stdin and stream_kill until it
+	// happens to reconnect. The HTTP and UI paths terminate the socket, so this
+	// was only reachable from the CLI, which is exactly the case an operator
+	// would not think to check.
+	//
+	// This does not touch the reconnect design: an agent that dials with a
+	// revoked key is still answered the same way it always was (see
+	// handleAgentWS), so the endpoint stays free of a name-enumeration oracle.
+	if m.Revoked {
+		return &refusal{
+			http.StatusForbidden,
+			"machine is revoked: " + name + " — re-enroll it to run commands again",
+		}
+	}
 	return nil
 }
 
