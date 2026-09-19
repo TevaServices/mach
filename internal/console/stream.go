@@ -151,9 +151,9 @@ func streamConsole(server, apiKey, machine, command string) int {
 				continue
 			}
 			if out.Stream == "stderr" {
-				os.Stderr.Write(b)
+				os.Stderr.Write(safeForTerminal(b, os.Stderr))
 			} else {
-				os.Stdout.Write(b)
+				os.Stdout.Write(safeForTerminal(b, os.Stdout))
 			}
 		case "stream_end":
 			var end protocol.StreamEnd

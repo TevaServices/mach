@@ -32,7 +32,15 @@ func ConsoleDefault() int {
 		if ver == "" {
 			ver = "?"
 		}
-		fmt.Printf("%-20s %-8s %-10s %-18s %s\n", m.Name, state, m.OS+"/"+m.Arch, m.Hostname, ver)
+		// Hostname, OS, arch and version are agent-reported: a machine chooses
+		// its own hostname, and a hostname can contain an escape sequence. The
+		// table is printed to a terminal, so it goes through the same filter the
+		// command output does.
+		fmt.Printf("%-20s %-8s %-10s %-18s %s\n",
+			m.Name, state,
+			string(safeForTerminal([]byte(m.OS+"/"+m.Arch), os.Stdout)),
+			string(safeForTerminal([]byte(m.Hostname), os.Stdout)),
+			string(safeForTerminal([]byte(ver), os.Stdout)))
 	}
 	return 0
 }

@@ -7,10 +7,66 @@ package console
 import (
 	"encoding/base64"
 	"encoding/json"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/TevaServices/mach/internal/protocol"
 )
+
+// A machine's output is data, and the terminal is the one destination that
+// *interprets* it. ESC]52 writes the operator's clipboard, OSC 0/8 rewrite the
+// window title or forge a hyperlink, and CSI K/J erase what was already printed
+// — which is how a compromised machine paints a fake `mach>` prompt, or a fake
+// `mach: ` diagnostic, over what really happened. The console's candour that a
+// human cannot tell machine output from mach diagnostics by content is about
+// reading text; a sequence that redraws the screen is a different problem.
+func TestEscapeSequencesAreNeutralizedOnATerminal(t *testing.T) {
+	// A terminal destination: rewrite the ESC byte and nothing else.
+	old := isTerminal
+	isTerminal = func(*os.File) bool { return true }
+	t.Cleanup(func() { isTerminal = old })
+
+	hostile := "before\x1b]52;c;aGFjaw==\x07\x1b[2K\x1bmach: ok\nafter\n"
+	got := string(safeForTerminal([]byte(hostile), os.Stdout))
+	if strings.ContainsRune(got, 0x1b) {
+		t.Fatalf("an escape survived: %q", got)
+	}
+	// Everything that is not ESC is preserved, so the output is still readable
+	// and still says what the machine said — just visibly.
+	if !strings.Contains(got, "^[]52;c;aGFjaw==\x07") || !strings.Contains(got, "after\n") {
+		t.Fatalf("the filter rewrote more than the ESC bytes: %q", got)
+	}
+
+	// A pipe gets the exact bytes, which is what invariant 9 promises and what a
+	// program reading the output requires.
+	isTerminal = func(*os.File) bool { return false }
+	if got := string(safeForTerminal([]byte(hostile), os.Stdout)); got != hostile {
+		t.Fatalf("a non-terminal destination was rewritten:\n got %q\nwant %q", got, hostile)
+	}
+	// And with nothing to filter, the destination is not even consulted.
+	isTerminal = func(*os.File) bool { t.Fatal("the terminal check ran for output with no ESC"); return false }
+	clean := "ls -la\ntotal 8\n"
+	if got := string(safeForTerminal([]byte(clean), os.Stdout)); got != clean {
+		t.Fatalf("clean output was rewritten: %q", got)
+	}
+}
+
+// The agent-reported fields in the fleet table are a machine's own words too: a
+// hostname is chosen by the machine, and it can contain an escape sequence.
+func TestFleetTableSanitizesAgentReportedFields(t *testing.T) {
+	old := isTerminal
+	isTerminal = func(*os.File) bool { return true }
+	t.Cleanup(func() { isTerminal = old })
+
+	got := string(SafeForTerminal([]byte("web-01\x1b]0;pwned\x07")))
+	if strings.ContainsRune(got, 0x1b) {
+		t.Fatalf("a hostname's escape survived: %q", got)
+	}
+	if !strings.Contains(got, "web-01") {
+		t.Fatalf("the hostname was mangled away: %q", got)
+	}
+}
 
 // Output that is not valid UTF-8 reaches the terminal as the bytes the machine
 // produced. It cannot travel as a JSON string — Go's encoder replaces every

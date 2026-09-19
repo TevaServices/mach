@@ -212,7 +212,14 @@ func consoleMain(args []string) {
 			if m.E2E == "off" {
 				e2e = "e2e=off"
 			}
-			fmt.Printf("%-20s %-8s %-10s %-18s %-8s %s\n", m.Name, status, m.OS+"/"+m.Arch, m.Hostname, e2e, m.AgentVer)
+			// Name, OS, arch, hostname and version are all machine-supplied.
+			// The table is for a human at a terminal, so the fields a machine
+			// chooses go through the console's terminal filter — the same one
+			// the command output does.
+			fmt.Printf("%-20s %-8s %-10s %-18s %-8s %s\n", m.Name, status,
+				console.SafeForTerminal([]byte(m.OS+"/"+m.Arch)),
+				console.SafeForTerminal([]byte(m.Hostname)), e2e,
+				console.SafeForTerminal([]byte(m.AgentVer)))
 		}
 
 	case "exec":

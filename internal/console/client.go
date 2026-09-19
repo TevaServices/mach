@@ -24,6 +24,7 @@ import (
 
 	"github.com/TevaServices/mach/internal/e2e"
 	"github.com/TevaServices/mach/internal/protocol"
+	"golang.org/x/term"
 )
 
 // Config is the console client's local config (~/.mach/console.json).
@@ -420,15 +421,63 @@ func printExecResult(res *protocol.ExecResult, asJSON bool) int {
 	// Output(), not the text fields: it is what carries the exact bytes when the
 	// machine's output was not valid UTF-8.
 	stdout, stderr := res.Output()
-	os.Stdout.Write(stdout)
+	os.Stdout.Write(safeForTerminal(stdout, os.Stdout))
 	if len(stderr) > 0 {
-		os.Stderr.Write(stderr)
+		os.Stderr.Write(safeForTerminal(stderr, os.Stderr))
 	}
 	if res.Error != "" {
 		fmt.Fprintln(os.Stderr, "mach: "+res.Error)
 	}
 	return res.ExitCode
 }
+
+// isTerminal decides whether a destination is a terminal. A variable so a test
+// can decide it: a test binary's stdout is a terminal when `go test` is run from
+// one and a pipe when it is not, which is exactly the kind of environment
+// dependence a test must not have.
+var isTerminal = func(f *os.File) bool { return term.IsTerminal(int(f.Fd())) }
+
+// safeForTerminal makes a machine's output safe to write to a terminal, and
+// changes nothing when the destination is not one.
+//
+// The machine's output is data, and this is the one place that data reaches a
+// device that *interprets* it. A terminal honours the escape sequences it is
+// given, so a compromised machine can write the operator's clipboard (OSC 52),
+// rewrite the window title or forge a hyperlink (OSC 0/8), or erase what it
+// already printed and paint a fake `mach>` prompt — or a fake `mach: `
+// diagnostic — over what really happened. The console's existing candour, that
+// a human cannot tell machine output from mach diagnostics by content, is about
+// *reading* text; a sequence that redraws the screen is a different problem and
+// was not covered by it.
+//
+// Only the ESC byte is rewritten, and only as `^[`. Newlines, tabs, carriage
+// returns and every other byte pass through untouched, and the whole function
+// is a no-op unless the destination is a terminal: a pipe, a redirect and
+// `--json` all get the exact bytes, which is what invariant 9 promises and what
+// a program reading the output requires. The destination is a parameter rather
+// than always stdout because a command's stderr has its own — `mach exec host
+// cmd > out.txt` sends the machine's stderr to the terminal while its stdout
+// goes to a file, and the terminal is the one that needs the filter.
+func safeForTerminal(b []byte, f *os.File) []byte {
+	if !bytes.ContainsRune(b, 0x1b) || !isTerminal(f) {
+		return b
+	}
+	out := make([]byte, 0, len(b)+16)
+	for _, c := range b {
+		if c == 0x1b {
+			out = append(out, '^', '[')
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// SafeForTerminal is safeForTerminal for stdout, exported for the callers in
+// cmd/mach that render a machine's own hostname, OS and version themselves —
+// so every place those words reach a terminal goes through one function rather
+// than each caller remembering.
+func SafeForTerminal(b []byte) []byte { return safeForTerminal(b, os.Stdout) }
 
 // machineE2EPub reads the control plane's E2E signal for one machine: whether
 // this control plane accepts sealed exec at all, why not when it does not, and
