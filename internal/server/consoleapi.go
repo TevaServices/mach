@@ -139,6 +139,18 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provide command or argv, not both"})
 		return
 	}
+	// Sealed and plaintext are two ways to say the same thing, and a request
+	// carrying both is refused rather than resolved. Execution was never
+	// smuggleable — the dispatch payload is built from the sealed fields only —
+	// but the audit trail was: the plaintext `command` a sealed request happened
+	// to carry was what the refusal and timeout rows recorded, so a key holder
+	// could choose the text of a row describing a command the control plane
+	// cannot read. Nothing legitimate sends both, and a client that does is
+	// telling us its two halves disagree.
+	if req.Sealed != "" && (req.Command != "" || len(req.Argv) > 0) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provide sealed or command/argv, not both"})
+		return
+	}
 	if (req.Sealed != "") != (req.E2EPub != "") {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "sealed and e2e_pub must be provided together"})
 		return
@@ -147,7 +159,17 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key is not scoped for machine " + req.Machine})
 		return
 	}
+	// The display form is what every audit row for this request carries — the
+	// refusals and the timeout as well as the reply — so for a sealed request it
+	// is the placeholder and nothing else. Deriving it from `command`/`argv`
+	// would leave a sealed refusal audited as an empty command (meaningless in
+	// the record) and, before the validation above, as whatever text the caller
+	// chose to attach to a command the control plane cannot read. One home for
+	// the decision is what keeps every path saying the same thing.
 	display := commandForDisplay(req.Command, req.Argv)
+	if req.Sealed != "" {
+		display = auditSealedLabel
+	}
 	// Sealed (E2E) exec is the control plane's call, not the client's: it is the
 	// party that cannot read ciphertext, and the one an operator points at when
 	// they want a fleet that can (or cannot) be inspected. With E2E off the

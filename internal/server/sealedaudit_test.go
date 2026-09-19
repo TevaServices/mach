@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/TevaServices/mach/internal/protocol"
 	"github.com/TevaServices/mach/internal/store"
@@ -175,3 +176,67 @@ func TestSealedExecWithoutAReportedStatusAuditsNone(t *testing.T) {
 }
 
 func ptr(n int) *int { return &n }
+
+// A sealed request has no plaintext, so every audit row it produces says so —
+// on the refusal paths as well as the reply path. It did not: the display form
+// was derived from `command`/`argv` whatever else the request carried, so a
+// sealed command refused for a blocked machine was audited with an *empty*
+// command — a row that tells the operator nothing — and a caller who attached
+// text to a sealed request chose the wording of a row describing a command the
+// control plane cannot read.
+func TestSealedRefusalAuditsThePlaceholder(t *testing.T) {
+	h := newSealedHarness(t)
+	key := adminKey(t, h.s, "exec:*")
+	if _, err := h.st.SetMachineBlocked(h.mach, true); err != nil {
+		t.Fatalf("block machine: %v", err)
+	}
+
+	code, body := execReq(t, h.s, key, `{"machine":"`+h.mach+`","sealed":"b3BhcXVl","e2e_pub":"ab"}`)
+	if code != http.StatusForbidden {
+		t.Fatalf("sealed exec to a blocked machine returned %d, want 403 (%s)", code, body)
+	}
+	entries, err := h.st.AuditList(h.mach, 10)
+	if err != nil {
+		t.Fatalf("audit list: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("sealed refusal left %d audit rows, want 1", len(entries))
+	}
+	if entries[0].Command != auditSealedLabel {
+		t.Fatalf("sealed refusal audited as %q, want the sealed placeholder", entries[0].Command)
+	}
+}
+
+// Sealed and plaintext are two ways to say the same thing; a request carrying
+// both is refused rather than resolved, so a caller cannot pick the text of an
+// audit row for a command the control plane cannot read. Nothing is dispatched
+// and nothing is audited — the request never got past validation.
+func TestSealedWithPlaintextIsRefused(t *testing.T) {
+	h := newSealedHarness(t)
+	key := adminKey(t, h.s, "exec:*")
+
+	for _, body := range []string{
+		`{"machine":"` + h.mach + `","sealed":"b3BhcXVl","e2e_pub":"ab","command":"rm -rf /"}`,
+		`{"machine":"` + h.mach + `","sealed":"b3BhcXVl","e2e_pub":"ab","argv":["rm","-rf","/"]}`,
+	} {
+		code, resp := execReq(t, h.s, key, body)
+		if code != http.StatusBadRequest {
+			t.Fatalf("sealed + plaintext returned %d, want 400 (%s)", code, resp)
+		}
+	}
+	entries, err := h.st.AuditList(h.mach, 10)
+	if err != nil {
+		t.Fatalf("audit list: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("a refused request shape left %d audit rows: %+v", len(entries), entries)
+	}
+	// The machine is still online and nothing was dispatched to it.
+	var env protocol.Envelope
+	_ = h.agent.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	for h.agent.ReadJSON(&env) == nil {
+		if env.Type == "exec" {
+			t.Fatal("a refused request shape was dispatched")
+		}
+	}
+}
