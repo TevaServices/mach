@@ -26,8 +26,14 @@ operator browser ┘ (TLS, OIDC — the web UI, optional)
 - Agents trust exactly: (a) their pinned control-plane identity key
   (`server_key` in config.json), (b) TLS to the enrolled URL.
 - The phone/admin is trusted only after presenting the challenge code
-  that was printed on the agent's console (12 chars, ~60 bits) — the QR
-  token alone grants nothing.
+  that was printed on the agent's console (12 chars, ~60 bits). The QR
+  token **alone** cannot approve an enrollment and cannot deny one — both
+  actions on the pair page are gated on that code. What it does grant, for
+  the pairing's ~10-minute life, is stated plainly rather than claimed away:
+  the token holder can read what the enrolling machine reported about itself
+  (the page shows the operator that, because deciding needs it) and can burn
+  the pairing by exhausting its five code attempts — a denial of enrollment,
+  not a compromise of one.
 
 **End-to-end encryption exists, on one of the two command paths, and it is
 optional per org.** A one-shot `mach exec` can be sealed with X25519 +
@@ -129,7 +135,7 @@ from the broker; nothing protects content from the machine's own operator.
 | Per-connection challenge-bound agent hello (replay-proof) | server/agent.go, agent/run.go |
 | Control-plane identity key persisted & pinned by agents; signed update manifests (sig over version\|sha256) | server/serverkey.go, agent/run.go handleUpdate |
 | Pairing tokens: 256-bit, single-use, ~10 min TTL | store.CreatePairing |
-| Challenge codes: 12 chars, agent-console-only, typed blind on phone; 5 wrong attempts expire the pairing. **Never placed in the QR, the URL or the pair page** — the QR carries the org and a suggested machine name, and the code stays on the agent's console, so a photograph of the QR alone still grants nothing | store.NewChallengeCode, server/pairpages.go, agent/register.go pairPrefill |
+| Challenge codes: 12 chars, agent-console-only, typed blind on phone; 5 wrong attempts expire the pairing. **Never placed in the QR, the URL or the pair page** — the QR carries the org and a suggested machine name, and the code stays on the agent's console. It gates **every** action on the page, approve and deny alike, so a photographed QR cannot approve, cannot deny, and cannot learn a name | store.NewChallengeCode, server/pairpages.go pairPageHandler/requirePairingCode, agent/register.go pairPrefill |
 | Pair-start rate limit (5 per IP / 10 min) and auth-failure rate limit (20 / 10 min) | server.go, consoleapi.go |
 | Org-prefixed machine names, conflicts error, and every submitted name validated regardless of what the QR suggested. The pair page pre-fills the org and a hostname-derived machine name **as editable defaults under a line saying the agent supplied them** (the `org` and `name` query parameters on the pair link); a suggested value is shown only if it satisfies `store.ValidMachinePart` (the store's own rule, not a second one) and is re-validated on submit, and nothing acts on it | store.ValidOrgName/ValidMachinePart, server/orgs.go, pairpages.go suggestedOrg/suggestedNamePart, agent/register.go suggestMachinePart |
 | Scoped API keys (enroll / readonly / exec:* / exec:m1\|m2), server-generated 192-bit secrets, stretched salted hashes | controlplane.AddAPIKey, store |

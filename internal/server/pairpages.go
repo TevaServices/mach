@@ -13,11 +13,19 @@ import (
 //
 // Security properties:
 //   - The challenge code is NEVER displayed on this page, and it is not in the
-//     QR either. The human must type the code they read on the agent's console
-//     (anti-QR-theft: a photo of just the QR is useless). The QR carries the org
+//     QR either. The human must type the code they read on the agent's console,
+//     and it gates *every* action here — approving and denying alike — so a
+//     photograph of the QR cannot approve and cannot deny. The QR carries the org
 //     and a *suggested* machine name so the operator has less to type, but the
-//     one secret — the code — travels by a channel the phone does not have:
-//     the target machine's own screen, read by a person standing at it.
+//     one secret — the code — travels by a channel the phone does not have: the
+//     target machine's own screen, read by a person standing at it.
+//
+//     What a token holder *can* still do, for the pairing's ~10-minute life, is
+//     not nothing and is worth stating rather than glossing: read what the
+//     machine reported about itself (this page shows it, because the operator
+//     needs it to decide), and burn the pairing by exhausting its five code
+//     attempts — a denial of enrollment, not a compromise of it. Both are
+//     documented in SECURITY-NOTES.md beside this control.
 //   - The suggested name comes from the enrolling agent's hostname, which is
 //     agent-reported text. It is a starting point in an editable field, shown
 //     under a heading that says where it came from, and the name the operator
@@ -248,11 +256,74 @@ func suggestedNamePart(v string) string {
 	return v
 }
 
+// requirePairingCode checks the challenge code and, when it is wrong, renders
+// the answer and reports false. One function because every action on this page —
+// approving and denying alike — is gated on the same code, the same attempt
+// counter and the same lockout, and a second copy of that logic is how one of
+// the two buttons ends up without it.
+func (s *Server) requirePairingCode(w http.ResponseWriter, p *store.Pairing, retry func(string) pairPageData, code string) bool {
+	ok, why, err := s.st.VerifyPairingCode(p.ID, code)
+	if err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return false
+	}
+	if ok {
+		return true
+	}
+	if why == "bad-code" {
+		// Count the attempt; expire the pairing after 5 wrong tries.
+		alive, aerr := s.st.RecordPairingAttempt(p.ID, 5)
+		if aerr != nil || !alive {
+			renderPair(w, pairPageData{Error: "Too many wrong code attempts — this pairing is expired. Run enrollment again on the machine.", State: "expired", Terminal: true})
+			return false
+		}
+		renderPair(w, retry("Wrong code. Do not approve or deny unless you can read the agent's console."))
+		return false
+	}
+	if why == "not-pending" {
+		// A concurrent deny/expiry won the race; show the real state.
+		renderPair(w, terminalPair(s.st.PairingState(p), p.Name))
+		return false
+	}
+	// Anything else is the pairing's own state ("denied", "expired", …), which is
+	// what a terminal page renders.
+	renderPair(w, terminalPair(why, p.Name))
+	return false
+}
+
 func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store.Pairing, state, token string) {
 	// token is the raw bearer token from the URL path — retry/error renders
 	// reuse it so the retry form posts back to the same working link.
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	// Everything the operator typed is handed back on a refusal, so a wrong code
+	// does not also cost them the org and the name.
+	code := normalizeCode(r.FormValue("code"))
+	org := strings.ToLower(strings.TrimSpace(r.FormValue("org")))
+	machinePart := strings.TrimSpace(r.FormValue("name"))
+	name := org + "-" + machinePart
+	retry := func(msg string) pairPageData {
+		return pairPageData{
+			Error: msg, State: "pending-retry", Token: token, Orgs: s.ListOrgs(),
+			Org: org, NamePart: machinePart,
+		}
+	}
+
+	// The challenge code gates BOTH buttons, and it is checked before the action
+	// is even looked at.
+	//
+	// It used to gate approving only. The deny button sits in the same form as
+	// the code field, so a browser asked for one — but a direct POST did not,
+	// and "a photograph of the QR alone still grants nothing" is the property
+	// this whole flow exists to have. A token holder could terminally deny a
+	// legitimate enrollment without ever being near the machine, which is a
+	// cheap way to stop a machine being enrolled at all. (The other residual
+	// power of a token holder is not closable this way and is documented
+	// instead: five wrong codes burn the pairing, and the GET page shows what
+	// the machine reported about itself.)
+	if !s.requirePairingCode(w, p, retry, code) {
 		return
 	}
 	if r.FormValue("deny") == "1" {
@@ -269,28 +340,11 @@ func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store
 		}
 		return
 	}
-	if state != "pending" {
-		renderPair(w, terminalPair(state, p.Name))
-		return
-	}
-	code := normalizeCode(r.FormValue("code"))
-	org := strings.ToLower(strings.TrimSpace(r.FormValue("org")))
-	machinePart := strings.TrimSpace(r.FormValue("name"))
-	name := org + "-" + machinePart
-
-	// Everything the operator typed is handed back on a refusal, so a wrong code
-	// does not also cost them the org and the name.
-	retry := func(msg string) pairPageData {
-		return pairPageData{
-			Error: msg, State: "pending-retry", Token: token, Orgs: s.ListOrgs(),
-			Org: org, NamePart: machinePart,
-		}
-	}
 
 	// Org must be a registered org, and the composed name must satisfy the
 	// org-prefix rule. These are rules about the text the operator typed and the
 	// configuration of this control plane — neither says anything about which
-	// machines exist, so they may be answered before the code.
+	// machines exist, so they may be answered once the code is in.
 	if !s.orgRegistered(org) {
 		renderPair(w, retry("Unknown org "+strconv.Quote(org)+" — pick one from the list."))
 		return
@@ -300,43 +354,12 @@ func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store
 		return
 	}
 
-	// The challenge code comes next, BEFORE anything that depends on the fleet.
-	//
-	// "Machine name already taken" is a fact about the machines this control
-	// plane has, and it used to be answered first — so anyone who started their
-	// own pairing could probe names with the form and learn which exist, and
-	// which are revoked or temporary, without reading a single code and without
-	// spending one of the five attempts. The code is what approval is gated on,
-	// so it gates the fleet's answers too: a caller who cannot read the agent's
-	// console learns nothing, and a wrong code here counts as the attempt it is.
-	//
-	// ApprovePairing re-checks the code on the way through, so this is the gate
-	// in front of it rather than a second, weaker check that must agree.
-	verified, why, err := s.st.VerifyPairingCode(p.ID, code)
-	if err != nil {
-		http.Error(w, "store error", http.StatusInternalServerError)
-		return
-	}
-	if !verified {
-		if why == "bad-code" {
-			// Count the attempt; expire the pairing after 5 wrong tries.
-			alive, aerr := s.st.RecordPairingAttempt(p.ID, 5)
-			if aerr != nil || !alive {
-				renderPair(w, pairPageData{Error: "Too many wrong code attempts — this pairing is expired. Run enrollment again on the machine.", State: "expired", Terminal: true})
-				return
-			}
-			renderPair(w, retry("Wrong code. Do not approve unless you can read the agent's console."))
-			return
-		}
-		if why == "not-pending" {
-			// A concurrent deny/expiry won the race; show the real state.
-			renderPair(w, terminalPair(s.st.PairingState(p), p.Name))
-			return
-		}
-		renderPair(w, terminalPair(why, p.Name))
-		return
-	}
-
+	// The name-taken check comes after the code, and that ordering is the whole
+	// point of the gate above: "machine name already taken" is a fact about the
+	// machines this control plane has, and answering it before the code made the
+	// page a name-enumeration oracle — one pairing's five-attempt budget bought
+	// hundreds of name lookups, with no code read once. See
+	// TestPairPageDoesNotLeakNamesToAWrongCode.
 	// Whether this name may be taken is the enrollment policy's call, not this
 	// page's. A revoked or temporary row may be taken over (see store.reenroll),
 	// and a second copy of that rule living here is exactly how the QR path came

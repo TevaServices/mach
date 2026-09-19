@@ -363,11 +363,13 @@ func TestPairPageKeepsTypedValuesOnARetry(t *testing.T) {
 // one now does too.
 func TestPairDenyRendersTerminalPage(t *testing.T) {
 	s, st := newAuthTestServer(t)
-	_, token, _, err := st.CreatePairing("pub", "agent-host", "linux", "amd64", "v", 10*time.Minute)
+	_, token, code, err := st.CreatePairing("pub", "agent-host", "linux", "amd64", "v", 10*time.Minute)
 	if err != nil {
 		t.Fatalf("create pairing: %v", err)
 	}
-	form := url.Values{"deny": {"1"}}
+	// With the code, because denying is gated on it exactly as approving is —
+	// see TestPairDenyWithoutTheCodeIsRefused for why.
+	form := url.Values{"deny": {"1"}, "code": {code}}
 	req := httptest.NewRequest("POST", "/pair/"+token, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
@@ -393,5 +395,56 @@ func TestPairDenyRendersTerminalPage(t *testing.T) {
 	}
 	if !strings.Contains(body, "denied") {
 		t.Errorf("the deny response does not say the pairing was denied: %s", body)
+	}
+}
+
+// Denying needs the challenge code too.
+//
+// It did not, and the page made that hard to see: the deny button sits in the
+// same form as the code field, so a browser asked for one — but a direct POST
+// did not, and a photographed QR is exactly a direct POST. "A photograph of the
+// QR alone still grants nothing" is the property the whole pairing flow exists
+// to have, and it was true of approval only: a token holder could terminally
+// deny a legitimate enrollment without ever being near the machine.
+//
+// The other residual powers of a token holder are not closable this way and are
+// documented in SECURITY-NOTES instead: five wrong codes burn the pairing, and
+// the GET page shows what the machine reported about itself.
+func TestPairDenyWithoutTheCodeIsRefused(t *testing.T) {
+	s, st := newAuthTestServer(t)
+	_, token, code, err := st.CreatePairing("pub", "agent-host", "linux", "amd64", "v", 10*time.Minute)
+	if err != nil {
+		t.Fatalf("create pairing: %v", err)
+	}
+
+	post := func(form url.Values) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest("POST", "/pair/"+token, strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		rec := httptest.NewRecorder()
+		s.Routes().ServeHTTP(rec, req)
+		return rec
+	}
+
+	// No code at all: refused, and the pairing is still alive.
+	if rec := post(url.Values{"deny": {"1"}}); !strings.Contains(rec.Body.String(), "Wrong code") {
+		t.Fatalf("a deny with no code was not refused: %s", rec.Body.String())
+	}
+	// A wrong code: refused too, and counted as the attempt it is.
+	if rec := post(url.Values{"deny": {"1"}, "code": {"AAAA-AAAA-AAAA"}}); !strings.Contains(rec.Body.String(), "Wrong code") {
+		t.Fatalf("a deny with a wrong code was not refused: %s", rec.Body.String())
+	}
+	p, _ := st.PairingByToken(token)
+	if p == nil || s.st.PairingState(p) != "pending" {
+		t.Fatalf("state = %q, want the pairing still pending", s.st.PairingState(p))
+	}
+	// The right code still denies, so the gate is a gate and not a removal.
+	if rec := post(url.Values{"deny": {"1"}, "code": {code}}); !strings.Contains(rec.Body.String(), "denied") {
+		t.Fatalf("the right code did not deny: %s", rec.Body.String())
+	}
+	p, _ = st.PairingByToken(token)
+	if p == nil || s.st.PairingState(p) != "denied" {
+		t.Fatalf("state = %q, want denied", s.st.PairingState(p))
 	}
 }
