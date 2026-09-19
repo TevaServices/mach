@@ -103,8 +103,26 @@ type client struct {
 	pins *pinStore
 }
 
+// New builds the console client.
+//
+// The transport is the default one with keep-alives turned off, and that is a
+// correctness setting rather than a performance one. net/http will re-send a
+// request by itself in a few situations, and every one of those situations
+// requires a *reused* connection (`shouldRetryRequest` returns false for a fresh
+// one) — so closing each connection removes the whole class, by construction,
+// instead of relying on net/http's current rules about which methods and bodies
+// are replayable.
+//
+// That matters because of what this client carries: `mach exec` sends commands,
+// and "one command is one execution" is the invariant the sealed path is built
+// around. A transport that re-sent a request on its own would run the command a
+// second time with nothing in the console to see or report. The cost is one TCP
+// (and TLS) handshake per API call, and the console makes a handful of calls per
+// command.
 func New(cfg *Config) *client {
-	return &client{cfg: cfg, http: &http.Client{Timeout: 12 * time.Minute}, pins: newPinStore()}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DisableKeepAlives = true
+	return &client{cfg: cfg, http: &http.Client{Timeout: 12 * time.Minute, Transport: tr}, pins: newPinStore()}
 }
 
 // maxResp bounds what one API response may be. It comes from the protocol
@@ -113,22 +131,43 @@ func New(cfg *Config) *client {
 // the agent's is what stopped the agent's truncation marker from ever arriving.
 const maxResp = protocol.MaxExecReplyBytes
 
-func (c *client) do(method, path string, body any, out any) error {
+// newRequest builds one API request. It is separate from do so the properties
+// that make a request unreplayable can be asserted directly (see
+// TestRequestsCannotBeReplayedByTheTransport) rather than inferred from the
+// transport's behaviour.
+func (c *client) newRequest(method, path string, body any) (*http.Request, error) {
 	var rd io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		rd = bytes.NewReader(raw)
 	}
 	req, err := http.NewRequest(method, strings.TrimRight(c.cfg.Server, "/")+path, rd)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	// GetBody is the *mechanism* by which net/http gets a second copy of a body
+	// to re-send, and bytes.Reader hands it to us for free. Dropping it says
+	// plainly that this request must not be replayed, and it closes the one
+	// branch in shouldRetryRequest that consults it (which fires only when
+	// nothing was written, so it was never reachable as a second execution —
+	// see TestRequestsCannotBeReplayedByTheTransport for what was checked). It
+	// is belt to the keep-alive braces: the transport cannot retry a fresh
+	// connection at all, and this makes the request itself unreplayable too.
+	req.GetBody = nil
+	return req, nil
+}
+
+func (c *client) do(method, path string, body any, out any) error {
+	req, err := c.newRequest(method, path, body)
+	if err != nil {
+		return err
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {

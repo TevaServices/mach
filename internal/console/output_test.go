@@ -7,6 +7,7 @@ package console
 import (
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -119,5 +120,53 @@ func TestPrintExecResultWritesExactBytesForBinaryOutput(t *testing.T) {
 	}
 	if b, _ := js.Output(); string(b) != string(raw) {
 		t.Errorf("a --json consumer decoding stdout_b64 got % x, want % x", b, raw)
+	}
+}
+
+// "One command is one execution" is enforced in the console by the 403-only
+// fallback in sealedExec — but the transport sits a layer below that, and a
+// request net/http re-sent on its own initiative would run the command a second
+// time with nothing in the console able to see or report it.
+//
+// What was actually checked, so the next reader does not have to re-derive it:
+// net/http's shouldRetryRequest gates every retry on a *reused* connection, and
+// the only branch GetBody opens (`nothingWrittenError`) fires when the write
+// moved the connection's byte counter by nothing — the server received no part
+// of that attempt, so a retry there cannot be a second execution. Driving the
+// exact scenario the audit described (a server that reads the request, then
+// closes without answering) produced one server-side request in Go 1.27.1, with
+// GetBody set or not.
+//
+// So this is hardening rather than a bug fix: the guarantee is made structural
+// instead of resting on net/http's current rules. DisableKeepAlives closes the
+// retry path entirely, because a fresh connection is never retried; GetBody
+// being nil makes the request unreplayable even if that changes. Both are
+// asserted here, because both are one line away from being removed.
+func TestRequestsCannotBeReplayedByTheTransport(t *testing.T) {
+	c := New(&Config{Server: "https://control.example", APIKey: "mach_test"})
+
+	tr, ok := c.http.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport is %T, want *http.Transport", c.http.Transport)
+	}
+	if !tr.DisableKeepAlives {
+		t.Fatal("keep-alives are on: net/http may re-send a request on a reused connection")
+	}
+	// The rest of the default transport still applies, so a deployment behind a
+	// proxy keeps working — the clone is deliberate, not a bare Transport.
+	if tr.Proxy == nil {
+		t.Fatal("the default transport's proxy support was dropped by the clone")
+	}
+
+	req, err := c.newRequest("POST", "/v1/exec", map[string]any{"machine": "m", "command": "echo once"})
+	if err != nil {
+		t.Fatalf("newRequest: %v", err)
+	}
+	if req.GetBody != nil {
+		t.Fatal("the request carries a GetBody: net/http can rewind and re-send its body")
+	}
+	// The body is still there to send once.
+	if req.Body == nil {
+		t.Fatal("the request has no body at all")
 	}
 }
