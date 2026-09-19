@@ -118,6 +118,65 @@ func TestArgvModeDoesNotSplitOnSeparators(t *testing.T) {
 	}
 }
 
+// A newline ends a command in the shell, and Normalize folded it into a space
+// before splitCommands ever ran — which made the '\n' case there dead code and
+// left an allowlist bypassable by pasting a two-line command: the engine saw one
+// segment, `journalctl -u nginx rm -rf /`, which the `allow:journalctl -u`
+// prefix still satisfies, while the agent hands the original text to bash -c and
+// both lines run. The identical input with a ';' was always refused, which is
+// what makes this a gap rather than a design choice.
+func TestAllowOnlyRefusesNewlineSeparatedCommands(t *testing.T) {
+	p := New()
+	p.Replace("allowonly\nallow:journalctl -u\nallow:echo\n")
+	denied := []string{
+		"journalctl -u nginx\nrm -rf /",
+		"journalctl -u nginx\n\nrm -rf /", // a blank line between changes nothing
+		"journalctl -u nginx\r\nrm -rf /", // CRLF: the \r is a word byte to bash, the \n still splits
+		"echo hi\ncat /etc/shadow",
+		"journalctl -u nginx\ncat /etc/shadow & echo ok",
+		"journalctl -u nginx\nrm -rf / # and a comment",
+	}
+	for _, cmd := range denied {
+		if r := p.Evaluate(cmd, nil); r == "" {
+			t.Errorf("allowlist permitted a newline-separated command: %q", cmd)
+		}
+	}
+	// The semicolon form is the baseline this must not have changed.
+	if r := p.Evaluate("journalctl -u nginx;rm -rf /", nil); r == "" {
+		t.Fatal("semicolon-separated command was allowed — the baseline moved")
+	}
+	// Multi-line commands whose every line is allowed still run: the fix is a
+	// refusal of what cannot be seen through, not a refusal of newlines.
+	for _, cmd := range []string{
+		"journalctl -u nginx\njournalctl -u ssd",
+		"echo one\necho two",
+		"journalctl -u nginx\n",
+		"journalctl -u nginx\n\n",
+	} {
+		if r := p.Evaluate(cmd, nil); r != "" {
+			t.Errorf("legitimate multi-line command refused: %q (%s)", cmd, r)
+		}
+	}
+}
+
+// Deny rules matched across a newline because the collapse made them match
+// *more*, and splitting on newlines must not take that away. This is the
+// direction that fails open if it regresses, so it is asserted directly.
+func TestDenyRulesStillMatchAcrossNewlines(t *testing.T) {
+	p := New()
+	p.Replace("deny:rm -rf\n")
+	for _, cmd := range []string{
+		"rm -rf /",
+		"rm\n-rf /",
+		"echo hi\nrm -rf /",
+		"echo hi;\nrm -rf /",
+	} {
+		if r := p.Evaluate(cmd, nil); r == "" {
+			t.Errorf("deny rule missed a command: %q", cmd)
+		}
+	}
+}
+
 func TestEmptyPolicyAllowsEverything(t *testing.T) {
 	p := New()
 	if !p.Empty() {

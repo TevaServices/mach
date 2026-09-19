@@ -135,9 +135,19 @@ func (p *Policy) Evaluate(command string, argv []string) string {
 	p.mu.RUnlock()
 
 	shellMode := len(argv) == 0
-	joined := Normalize(command)
-	if !shellMode {
+	var joined string
+	var segments []string
+	if shellMode {
+		// Deny rules match the whole command as one normalized string, exactly
+		// as before — collapsing a newline there makes a deny match *more*, not
+		// less, which is the safe direction. The allowlist's segmentation is the
+		// check a collapsed newline can defeat, so that one splits on the raw
+		// text (splitLines) before Normalize folds the separator away.
+		joined = Normalize(command)
+		segments = splitLines(command)
+	} else {
 		joined = Normalize(strings.Join(argv, " "))
+		segments = []string{joined}
 	}
 
 	for _, d := range deny {
@@ -158,10 +168,6 @@ func (p *Policy) Evaluate(command string, argv []string) string {
 		return "denied by command policy (allowlist mode: backtick command substitution, which an allow rule cannot authorize)"
 	}
 
-	segments := []string{joined}
-	if shellMode {
-		segments = splitCommands(joined)
-	}
 	if len(segments) == 0 {
 		// Nothing to match against an allow rule: fail closed.
 		return "denied by command policy (allowlist mode: empty command)"
@@ -193,7 +199,7 @@ func (p *Policy) Evaluate(command string, argv []string) string {
 // hasSubstitution reports whether a normalized command can start a nested one.
 // It runs on the normalized text, where backticks have already been removed —
 // so the caller checks the pre-normalized command for those separately, through
-// hadBacktick, which Normalize cannot report.
+// the ContainsRune check in Evaluate, which Normalize cannot report.
 func hasSubstitution(seg string) bool {
 	return strings.Contains(seg, "$(") || strings.Contains(seg, "<(") || strings.Contains(seg, ">(")
 }
@@ -212,6 +218,35 @@ func allowedBy(allow []string, seg string) bool {
 		}
 	}
 	return false
+}
+
+// splitLines renders a raw shell command into the normalized segments an
+// allowlist is matched against, splitting on newlines BEFORE normalization.
+//
+// A newline ends a command in the shell, and Normalize collapses all whitespace
+// — newlines included — into single spaces. Splitting after normalizing
+// therefore could not see the separator at all: with `allowonly` +
+// `allow:journalctl -u`, the single string "journalctl -u nginx\nrm -rf /"
+// became one segment, `journalctl -u nginx rm -rf /`, which still satisfies the
+// prefix rule while the shell passes both lines to bash -c and runs them. The
+// identical input with a ';' was refused, so the one separator splitCommands
+// names was the one it could not reach — an allowlist trivially bypassed by any
+// pasted multi-line command.
+//
+// Only \n is a separator here, because only \n starts a new command in a shell.
+// The other whitespace characters Normalize folds (tab, \r, \v, \f) separate
+// words rather than commands there, so collapsing them is what lets the matcher
+// see through them rather than something to preserve.
+func splitLines(command string) []string {
+	var out []string
+	for _, line := range strings.Split(command, "\n") {
+		n := Normalize(line)
+		if n == "" {
+			continue
+		}
+		out = append(out, splitCommands(n)...)
+	}
+	return out
 }
 
 // splitCommands separates a normalized command line into the individual
