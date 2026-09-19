@@ -12,8 +12,12 @@ package server
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/TevaServices/mach/internal/store"
+	"github.com/gorilla/websocket"
 )
 
 // A refusal is visible to htmx and styled without it, with the status preserved
@@ -201,5 +205,83 @@ func TestUIRefusalsCarryNoEcho(t *testing.T) {
 	}
 	if strings.Contains(body, payload) || strings.Contains(body, "&lt;script&gt;") {
 		t.Error("the refusal echoes the submitted value")
+	}
+}
+
+// A scope refusal is the audit event a fleet most wants to see — an
+// exec-scoped key asking for a machine outside its allowlist is either a
+// mistake worth seeing or a stolen key finding out what else it can reach — and
+// it was the one refusal on the command paths that left no trace at all. A
+// policy refusal for an authorized key was recorded; a key probing machine
+// names was not.
+//
+// The row names the machine that was asked for, which is the fact that makes it
+// readable: "which names did this key try" is the question an operator has.
+func TestScopeRefusalsAreAudited(t *testing.T) {
+	s, st := newAuthTestServer(t)
+	srv := httptest.NewServer(s.Routes())
+	t.Cleanup(srv.Close)
+	if err := st.CreateMachine("bcross-web", "pub-web", "h", "linux", "amd64", "v", "", false); err != nil {
+		t.Fatalf("seed web: %v", err)
+	}
+	if err := st.CreateMachine("bcross-db", "pub-db", "h", "linux", "amd64", "v", "", false); err != nil {
+		t.Fatalf("seed db: %v", err)
+	}
+	// Scoped to web, probing db.
+	key := adminKey(t, s, "exec:bcross-web")
+
+	code, body := execReq(t, s, key, `{"machine":"bcross-db","command":"echo hi"}`)
+	if code != http.StatusForbidden {
+		t.Fatalf("out-of-scope exec returned %d, want 403 (%s)", code, body)
+	}
+	assertNotScopedRows(t, st, "bcross-db", 1)
+
+	// The streaming endpoint is command execution, so its scope refusal has to
+	// be as visible as the one-shot path's.
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/v1/console/stream?machine=bcross-db"
+	hd := http.Header{}
+	hd.Set("Authorization", "Bearer "+key)
+	if ws, resp, err := websocket.DefaultDialer.Dial(u, hd); err == nil {
+		ws.Close()
+		t.Fatal("an out-of-scope key opened a streaming session")
+	} else if resp == nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("out-of-scope streaming: resp = %v, want 403", resp)
+	}
+	assertNotScopedRows(t, st, "bcross-db", 2)
+
+	// Nothing was written against the machine the key *is* allowed to use: the
+	// row names what was asked for, not what was permitted.
+	if entries, _ := st.AuditList("bcross-web", 10); len(entries) != 0 {
+		t.Fatalf("a scope refusal was recorded against the wrong machine: %+v", entries)
+	}
+	// And the key's own machine still passes the scope gate, so recording the
+	// refusal did not quietly become a refusal by accident.
+	if !keyCanExecOn("exec:bcross-web", "bcross-web") {
+		t.Fatal("the scope rule stopped allowing the key's own machine")
+	}
+}
+
+// assertNotScopedRows checks every row recorded for a machine is a scope-refusal
+// row, and that there are exactly want of them. The marker and the refusal exit
+// code are what keep those rows distinguishable from a real command.
+func assertNotScopedRows(t *testing.T, st *store.Store, machine string, want int) {
+	t.Helper()
+	entries, err := st.AuditList(machine, 10)
+	if err != nil {
+		t.Fatalf("audit list: %v", err)
+	}
+	if len(entries) != want {
+		t.Fatalf("scope refusals for %s left %d audit rows, want %d", machine, len(entries), want)
+	}
+	for _, e := range entries {
+		if e.Command != auditNotScopedLabel {
+			t.Fatalf("scope refusal audited as %q, want the not-scoped marker", e.Command)
+		}
+		if !e.ExitCode.Valid || e.ExitCode.Int64 != execRefused {
+			t.Fatalf("scope refusal audited as exit %+v, want %d", e.ExitCode, execRefused)
+		}
+		if !strings.Contains(e.StderrSnip, "not scoped") {
+			t.Fatalf("scope refusal does not say why: %+v", e)
+		}
 	}
 }

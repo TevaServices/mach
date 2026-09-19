@@ -3,6 +3,7 @@ package server
 import (
 	"database/sql"
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -156,6 +157,11 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 		return
 	}
 	if !keyCanExecOn(scopes, req.Machine) {
+		// Recorded, because the record is the point: an exec-scoped key asking
+		// for a machine outside its allowlist is either a mistake worth seeing
+		// or a stolen key being used to find out what else it can reach, and
+		// this was the one refusal on the path that left no trace.
+		s.auditNotScoped(req.Machine, keyName)
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key is not scoped for machine " + req.Machine})
 		return
 	}
@@ -184,7 +190,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 	// block list off.
 	if req.Sealed != "" && !s.e2eStateFor(req.Machine).Enabled {
 		state := s.e2eStateFor(req.Machine)
-		s.st.AuditInsert(nowRFC3339(), req.Machine, auditSealedLabel, "console:"+keyName,
+		s.auditRow(req.Machine, auditSealedLabel, "console:"+keyName,
 			sqlNullInt(execRefused), "", "sealed exec refused: E2E is off for this machine's org")
 		writeJSON(w, http.StatusForbidden, map[string]string{
 			"error": "sealed exec is disabled on this control plane: " + state.Reason})
@@ -305,8 +311,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 			if reply.SealedExit != nil {
 				auditExit = sqlNullInt(*reply.SealedExit)
 			}
-			s.st.AuditInsert(nowRFC3339(), pe.machine, auditSealedLabel, pe.source,
-				auditExit, "", "")
+			s.auditRow(pe.machine, auditSealedLabel, pe.source, auditExit, "", "")
 			writeJSON(w, http.StatusOK, execReplyWire{ExitCode: reply.SealedExit, SealedB64: reply.Sealed})
 			return
 		}
@@ -320,6 +325,38 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 }
 
 const auditSealedLabel = "[E2E sealed command]"
+
+// auditNotScopedLabel is the command column of a row that records a refusal
+// which happened before any command existed: a key asking for a machine it is
+// not scoped for.
+//
+// That row is the most valuable thing a fleet's audit trail can hold — someone
+// probing with a stolen or misused key across machine names — and it was
+// invisible in the record, because the scope check returned before anything was
+// written. A marker says plainly that no command was involved, where an empty
+// column would read as a missing field.
+const auditNotScopedLabel = "[refused: key not scoped for this machine]"
+
+// auditRow writes one audit row and reports a failure rather than discarding
+// it. "Every dispatched command is audited" is invariant 16, and a discarded
+// error made that claim unfalsifiable: a full disk or a locked database left
+// commands dispatching with no row and no complaint, so the process kept saying
+// it recorded things it did not record. The insert still does not block the
+// dispatch — by the time most of these run the command has been dispatched or
+// has already finished, and refusing then would invent a new failure mode
+// rather than recover the record — but the operator hears about it.
+func (s *Server) auditRow(machine, command, source string, exit sql.NullInt64, stdout, stderr string) {
+	if err := s.st.AuditInsert(nowRFC3339(), machine, command, source, exit, stdout, stderr); err != nil {
+		log.Printf("server: AUDIT INSERT FAILED for machine %q (command %q): %v — the audit trail is "+
+			"no longer complete; every dispatched command is supposed to be recorded", machine, command, err)
+	}
+}
+
+// auditNotScoped records an attempt on a machine the key is not scoped for.
+func (s *Server) auditNotScoped(machine, keyName string) {
+	s.auditRow(machine, auditNotScopedLabel, "console:"+keyName, sqlNullInt(execRefused), "",
+		"refused: this key is not scoped for machine "+machine)
+}
 
 // e2ePubResponse is the control signal a console reads before it decides how to
 // send a command: whether this control plane accepts sealed exec at all, and
@@ -391,7 +428,7 @@ type execReplyWire struct {
 }
 
 func (s *Server) auditExec(pe *pendingExec, exitCode int, stdout, stderr string) {
-	s.st.AuditInsert(nowRFC3339(), pe.machine, pe.command, pe.source,
+	s.auditRow(pe.machine, pe.command, pe.source,
 		sql.NullInt64{Int64: int64(exitCode), Valid: true}, stdout, stderr)
 }
 

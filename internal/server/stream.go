@@ -322,6 +322,10 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 	// audit log, it does not run commands. Accepting "readonly" here would make
 	// the scope meaningless — streaming is command execution.
 	if !keyCanExecOn(scopes, machine) {
+		// Recorded like the one-shot path's refusal (see auditNotScoped): an
+		// exec-scoped key asking for a machine outside its allowlist is the
+		// signal a stolen key leaves, and this endpoint is command execution.
+		s.auditNotScoped(machine, keyName)
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key is not scoped for machine " + machine})
 		return
 	}
@@ -394,8 +398,7 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 				stderr += "\n"
 			}
 			stderr += "[mach: stream closed before the command reported an exit status]"
-			s.st.AuditInsert(nowRFC3339(), machine, command, source,
-				sqlNullInt(-1), stdout, stderr)
+			s.auditRow(machine, command, source, sqlNullInt(-1), stdout, stderr)
 		}
 	}()
 
@@ -457,8 +460,7 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 						}
 						stderr += "[mach: " + end.Error + "]"
 					}
-					s.st.AuditInsert(nowRFC3339(), machine, command, source,
-						sqlNullInt(end.ExitCode), stdout, stderr)
+					s.auditRow(machine, command, source, sqlNullInt(end.ExitCode), stdout, stderr)
 				}
 			case <-relay.Done:
 				return
@@ -486,7 +488,7 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 			// its own policy too, but a policy that only lives on the machine
 			// is not fleet-wide.
 			if reason := s.execPolicyCheck(start.Command, start.Argv); reason != "" {
-				s.st.AuditInsert(nowRFC3339(), machine, display, "console:"+keyName,
+				s.auditRow(machine, display, "console:"+keyName,
 					sqlNullInt(execRefused), "", "blocked by the server's global exec policy: "+reason)
 				s.streamRefuse(consoleConn, machine, "blocked by the server's global exec policy: "+reason)
 				continue
@@ -495,8 +497,7 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 			// connect only covers the moment the session opened, and a block set
 			// while it is idle must stop the next command too.
 			if ref := s.dispatchRefusal(machine); ref != nil {
-				s.st.AuditInsert(nowRFC3339(), machine, display, "console:"+keyName,
-					sqlNullInt(execRefused), "", ref.msg)
+				s.auditRow(machine, display, "console:"+keyName, sqlNullInt(execRefused), "", ref.msg)
 				s.streamRefuse(consoleConn, machine, ref.msg)
 				continue
 			}
@@ -505,7 +506,7 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 				// no way to attribute a second one's output or exit status. Refused
 				// and audited like any other declined dispatch, so the attempt is
 				// visible rather than silently run.
-				s.st.AuditInsert(nowRFC3339(), machine, display, "console:"+keyName,
+				s.auditRow(machine, display, "console:"+keyName,
 					sqlNullInt(execRefused), "", "refused: a command is already running in this session")
 				s.streamRefuse(consoleConn, machine,
 					"a command is already running in this session — wait for it to finish, or open another `mach console`")
