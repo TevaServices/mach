@@ -324,14 +324,17 @@ func (s *uiLoginStore) consume(state string) {
 // uiNotices maps a fixed code to a fixed sentence. The query parameter is never
 // reflected, so the page cannot be made to say anything an attacker chose.
 var uiNotices = map[string]string{
-	"blocked":    "Machine blocked. It stays connected, but no commands will be dispatched to it until you unblock it.",
-	"unblocked":  "Machine unblocked. Commands can be dispatched to it again.",
-	"revoked":    "Machine revoked. Its agent has been told to retire, its key can never re-enroll, and its name stays reserved.",
-	"deleted":    "Machine deleted. Its name and key are free to enroll again.",
-	"orgadded":   "Org added. Machines may now enroll under that prefix.",
-	"orgremoved": "Org removed. Existing machines keep working; new enrollment under that prefix stops.",
-	"e2eset":     "E2E setting updated for that org.",
-	"signedout":  "Signed out.",
+	"blocked":                "Machine blocked. It stays connected, but no commands will be dispatched to it until you unblock it.",
+	"unblocked":              "Machine unblocked. Commands can be dispatched to it again.",
+	"revoked":                "Machine revoked. Its agent has been told to retire, its key can never re-enroll, and its name stays reserved.",
+	"deleted":                "Machine deleted. Its name and key are free to enroll again.",
+	"orgadded":               "Org added. Machines may now enroll under that prefix.",
+	"orgremoved":             "Org removed. Existing machines keep working; new enrollment under that prefix stops.",
+	"e2eset":                 "E2E setting updated for that org.",
+	"signedout":              "Signed out.",
+	"approvalgranted":        "Approval granted. The command may run once; the grant is spent by that run.",
+	"approvalgrantedsession": "Approval granted for the session. The command may run in that session until it ends.",
+	"approvaldenied":         "Approval denied. The command stays refused.",
 }
 
 func uiNoticeText(code string) string { return uiNotices[code] }

@@ -488,10 +488,18 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 			// its own policy too, but a policy that only lives on the machine
 			// is not fleet-wide.
 			if reason := s.execPolicyCheck(start.Command, start.Argv); reason != "" {
-				s.auditRow(machine, display, "console:"+keyName,
-					sqlNullInt(execRefused), "", "blocked by the server's global exec policy: "+reason)
-				s.streamRefuse(consoleConn, machine, "blocked by the server's global exec policy: "+reason)
-				continue
+				// Not a final refusal: record or join a pending approval and
+				// hand the decision to the console (internal/server/approvals.go).
+				// An approved record dispatches as an exception to the mirrored
+				// ruleset; nothing approved, the attempt is audited and the
+				// command ends with ExitApprovalPending.
+				dispatch, fleetApproved := s.streamExecPolicyGate(consoleConn, machine, display, "console:"+keyName, &start, reason)
+				if fleetApproved {
+					start.FleetApproved = true
+				}
+				if !dispatch {
+					continue
+				}
 			}
 			// The operator's soft block, re-checked per command: the check at
 			// connect only covers the moment the session opened, and a block set
@@ -512,7 +520,13 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 					"a command is already running in this session — wait for it to finish, or open another `mach console`")
 				continue
 			}
+			// Re-marshal: an approved command carries FleetApproved, so the
+			// mirrored copy of the same ruleset on the machine stands down for
+			// it. The envelope's payload still holds the original JSON.
 			env.ReqID = sessionID // tag for the agent pump's routing
+			if start.FleetApproved {
+				env.Payload = mustJSON(start)
+			}
 			s.streamToAgent(sessionID, consoleConn, env)
 		case "stream_stdin", "stream_kill":
 			// Also gated. Refusing only exec_stream would leave a session that

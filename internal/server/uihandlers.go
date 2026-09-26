@@ -167,8 +167,18 @@ func (s *Server) handleUIFleet(w http.ResponseWriter, r *http.Request, sess uiSe
 		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 		return
 	}
+	// The approvals panel rides the page: pending rows are cheap (bounded at
+	// 50) and a decision should be visible the moment the page opens, not one
+	// panel-tick later. A store error here degrades to an empty panel rather
+	// than a 500 for the whole page — the fleet table is not hostage to the
+	// approvals query.
+	pending, perr := s.pendingApprovalRows()
+	if perr != nil {
+		pending = nil
+	}
 	notice := uiNoticeText(r.URL.Query().Get("n"))
-	s.renderPage(w, http.StatusOK, sess, notice, "Fleet", uiTmpl, "fleet", fleetData{Rows: rows, CSRF: sess.CSRF})
+	s.renderPage(w, http.StatusOK, sess, notice, "Fleet", uiTmpl, "fleet",
+		fleetData{Rows: rows, CSRF: sess.CSRF, Approvals: pending})
 }
 
 // handleUIMachines serves the table fragment the page polls, so online, blocked

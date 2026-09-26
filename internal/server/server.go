@@ -61,6 +61,14 @@ type Server struct {
 	policyMu   sync.Mutex
 	policyAcks map[string]string
 
+	// Command approvals (internal/server/approvals.go): the in-memory
+	// rendezvous for a pending approval — id → waiter. The DB row is the
+	// authority; this map is only the alarm that wakes a joined console the
+	// moment someone decides. Server-owned state, so Close stops nothing here:
+	// waiters time themselves out, and the map is swept by the hourly cleanup.
+	apprMu      sync.Mutex
+	apprWaiters map[int64]*approvalWaiter
+
 	// global exec policy: server-side block list applied to every client
 	execPolicy execPolicy
 
@@ -125,6 +133,7 @@ func New(st *store.Store, br *broker.Broker, org, keyPath string) *Server {
 		pairingTTL:  10 * time.Minute,
 		upgrader:    websocket.Upgrader{ReadBufferSize: 32 * 1024, WriteBufferSize: 32 * 1024},
 		pending:     map[string]*pendingExec{},
+		apprWaiters: map[int64]*approvalWaiter{},
 		pairStarts:  newIPLimiter(5, 10*time.Minute),
 		authFails:   newIPLimiter(20, 10*time.Minute),
 		agentDials:  newIPLimiter(maxAgentDialFailures, 10*time.Minute),
@@ -176,6 +185,16 @@ func New(st *store.Store, br *broker.Broker, org, keyPath string) *Server {
 				} else if n > 0 {
 					log.Printf("server: pairing cleanup: removed %d", n)
 				}
+				// Command approvals age out with the same hourly tick: terminal
+				// rows keep 24h for forensics, and pending rows nobody decided
+				// are swept with them — silence is not consent, so an undecided
+				// approval can never dispatch (internal/server/approvals.go).
+				if an, aerr := st.CleanupCommandApprovals(24 * time.Hour); aerr != nil {
+					log.Printf("server: approval cleanup: %v", aerr)
+				} else if an > 0 {
+					log.Printf("server: approval cleanup: removed %d", an)
+				}
+				s.sweepApprovalWaiters()
 			case <-pt.C:
 				s.pollPolicyOnce()
 			}
@@ -284,6 +303,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/admin/revoke", s.authConsole(s.handleRevokeMachine))
 	mux.HandleFunc("POST /v1/admin/block", s.authConsole(s.handleBlockMachine))
 	mux.HandleFunc("POST /v1/admin/delete", s.authConsole(s.handleDeleteMachine))
+	// Command approvals (internal/server/approvals.go): the queue a fleet-policy
+	// refusal lands in, and the two decisions an operator can make about one.
+	// Admin scope (exec:*) only — granting an exception to the fleet policy is
+	// exactly as fleet-wide and destructive as revocation.
+	mux.HandleFunc("GET /v1/admin/approvals", s.authConsole(s.handleListApprovals))
+	mux.HandleFunc("POST /v1/admin/approvals/{id}/approve", s.authConsole(s.handleApproveApproval))
+	mux.HandleFunc("POST /v1/admin/approvals/{id}/deny", s.authConsole(s.handleDenyApproval))
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok\n"))
@@ -319,6 +345,9 @@ func (s *Server) Routes() http.Handler {
 		mux.HandleFunc("POST /ui/unblock", s.uiPost(s.handleUIUnblock))
 		mux.HandleFunc("POST /ui/revoke", s.uiPost(s.handleUIRevoke))
 		mux.HandleFunc("POST /ui/delete", s.uiPost(s.handleUIDelete))
+		mux.HandleFunc("GET /ui/approvals", s.uiGet(s.handleUIApprovals))
+		mux.HandleFunc("POST /ui/approve", s.uiPost(s.handleUIApprove))
+		mux.HandleFunc("POST /ui/deny", s.uiPost(s.handleUIDeny))
 
 		mux.HandleFunc("POST /ui/orgs/add", s.uiPost(s.handleUIOrgAdd))
 		mux.HandleFunc("POST /ui/orgs/remove", s.uiPost(s.handleUIOrgRemove))

@@ -321,16 +321,31 @@ func TestFleetPolicyBlocksStreamedCommand(t *testing.T) {
 	execStream(t, console, "echo stream-blocked-marker")
 
 	env := nextFrame(t, console)
-	if env.Type != "stream_end" {
-		t.Fatalf("frame = %q, want stream_end (nothing may be dispatched)", env.Type)
+	// The relay's answer to a fleet-refused command is the typed approval
+	// frame plus a terminal record carrying ExitApprovalPending — a pending
+	// approval an operator can decide, not a silent dead end.
+	if env.Type != "approval_needed" {
+		t.Fatalf("frame = %q, want approval_needed (nothing may be dispatched)", env.Type)
+	}
+	var needed protocol.StreamApprovalNeeded
+	_ = json.Unmarshal(env.Payload, &needed)
+	if !strings.Contains(needed.Reason, "deny:stream-blocked-marker") {
+		t.Errorf("reason = %q, want it to name the rule", needed.Reason)
+	}
+	if needed.ApprovalID <= 0 {
+		t.Errorf("approval id = %d, want the row the operator acts on", needed.ApprovalID)
+	}
+	endEnv := nextFrame(t, console)
+	if endEnv.Type != "stream_end" {
+		t.Fatalf("frame = %q, want stream_end", endEnv.Type)
 	}
 	var end protocol.StreamEnd
-	_ = json.Unmarshal(env.Payload, &end)
-	if end.ExitCode != execRefused {
-		t.Errorf("exit code = %d, want %d", end.ExitCode, execRefused)
+	_ = json.Unmarshal(endEnv.Payload, &end)
+	if end.ExitCode != protocol.ExitApprovalPending {
+		t.Errorf("exit code = %d, want %d (ExitApprovalPending)", end.ExitCode, protocol.ExitApprovalPending)
 	}
-	if !strings.Contains(end.Error, "global exec policy") || !strings.Contains(end.Error, "deny:stream-blocked-marker") {
-		t.Errorf("refusal = %q, want it to name the policy and the rule", end.Error)
+	if !strings.Contains(end.Error, "global exec policy") {
+		t.Errorf("refusal = %q, want it to name the policy", end.Error)
 	}
 	// The command never reached the machine.
 	select {
@@ -616,8 +631,8 @@ func TestFleetPolicyChecksPlaintextWhileE2EIsOn(t *testing.T) {
 	key := adminKey(t, h.s, "exec:*")
 
 	code, body := execReq(t, h.s, key, `{"machine":"`+h.mach+`","command":"echo plain-marker","timeout":1}`)
-	if code != http.StatusForbidden || !strings.Contains(body, "deny:plain-marker") {
-		t.Fatalf("plaintext exec with E2E on: %d %s, want the block list to refuse it", code, body)
+	if code != http.StatusAccepted || !strings.Contains(body, "deny:plain-marker") {
+		t.Fatalf("plaintext exec with E2E on: %d %s, want the block list to hold it as a pending approval", code, body)
 	}
 }
 

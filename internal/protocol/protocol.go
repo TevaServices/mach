@@ -277,6 +277,17 @@ type ExecCommand struct {
 	Command string   `json:"command,omitempty"` // shell mode
 	Argv    []string `json:"argv,omitempty"`    // no-shell mode (argv[0..] via execve)
 	Timeout int      `json:"timeout,omitempty"` // seconds; 0 = 30
+	// FleetApproved marks a command the control plane dispatched under an
+	// explicit command approval (internal/server/approvals.go): the operator
+	// granted the very fleet rule that would otherwise have refused this exact
+	// normalized command. The agent skips the MIRRORED fleet ruleset for it —
+	// the control plane is that ruleset's author and has just excepted this one
+	// command from it, and an approval the machine overruled would be no
+	// approval at all. The machine's OWN policy (MACH_POLICY) is never skipped:
+	// no upstream, approved or not, can talk the machine out of it. A sealed
+	// command never carries this field — the control plane cannot read one, so
+	// it could never have judged, and approved, its text.
+	FleetApproved bool `json:"fleet_approved,omitempty"`
 }
 
 // SealedExecCommand is the E2E variant of ExecCommand relayed to the
@@ -293,9 +304,41 @@ type SealedExecCommand struct {
 // StreamStart initiates a streaming exec session (server → agent frame).
 // The agent runs the command, streaming chunks as they arrive, and
 // terminates with a stream_end frame carrying the exit code.
+//
+// FleetApproved means what it means on ExecCommand: the control plane
+// dispatched this command under an explicit command approval of the fleet rule
+// that would otherwise refuse it, and the mirrored copy of that ruleset stands
+// down for this one command — never for the machine's own policy.
 type StreamStart struct {
-	Command string   `json:"command,omitempty"`
-	Argv    []string `json:"argv,omitempty"`
+	Command       string   `json:"command,omitempty"`
+	Argv          []string `json:"argv,omitempty"`
+	FleetApproved bool     `json:"fleet_approved,omitempty"`
+}
+
+// ExitApprovalPending is the exit status a stream_end terminal record carries
+// when a command was refused by the control plane's fleet-wide exec policy and
+// a command approval was requested instead of dispatched. Nothing ran.
+//
+// It is a distinct status from 126 (execRefused, "blocked") because a client
+// that sees it can act differently: an interactive `mach console` offers to
+// approve on the spot, and a script sees a status it can tell apart from both
+// a refusal and a failure. The number lives here, in the wire package, and
+// both the relay and the console import it — a literal 250 on either side is
+// exactly the kind of drift this package exists to prevent.
+const ExitApprovalPending = 250
+
+// StreamApprovalNeeded is the typed frame the relay sends a console whose
+// command was refused by the fleet-wide exec policy with an approval pending.
+// The relay cannot hold the command and wait — a live session is a frame
+// relay, not a buffered request — so this tells the console what happened and
+// what id to approve, and the terminal stream_end (ExitApprovalPending) ends
+// that one command. The console may then approve via the admin API and send a
+// fresh exec_stream, which the relay treats as a new command.
+type StreamApprovalNeeded struct {
+	ApprovalID int64  `json:"approval_id"`
+	Command    string `json:"command"`
+	Reason     string `json:"reason"`
+	Timeout    int    `json:"timeout"` // seconds; how long the approval prompt stays open server-side
 }
 
 // StreamOut is a chunk of output (agent → server → console).
