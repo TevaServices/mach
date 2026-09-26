@@ -528,15 +528,15 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 					"a command is already running in this session — wait for it to finish, or open another `mach console`")
 				continue
 			}
-			// Re-marshal when this dispatch is an approved exception: the
-			// flag in the parsed frame is the only carrier of the gate's
-			// decision to the agent (it was stripped from the console's own
-			// JSON at parse time, above), so only an approved command ever
-			// reaches the agent with it set.
+			// The agent frame is re-marshaled unconditionally: what travels
+			// is the server's own serialization of the stripped struct, never
+			// the console's original bytes. On the approved path the parsed
+			// frame's flag is the only carrier of the gate's decision (it was
+			// stripped from the console's own JSON at parse time, above), so
+			// only an approved command ever reaches the agent with it set —
+			// and a forged flag cannot ride through in untouched bytes.
 			env.ReqID = sessionID // tag for the agent pump's routing
-			if start.FleetApproved {
-				env.Payload = mustJSON(start)
-			}
+			env.Payload = mustJSON(start)
 			s.streamToAgent(sessionID, consoleConn, env)
 		case "stream_stdin", "stream_kill":
 			// Also gated. Refusing only exec_stream would leave a session that

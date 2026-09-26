@@ -263,15 +263,15 @@ const fleetSource = `{{define "fleet"}}
 {{template "fleettable" .}}
 <div id="confirm"></div>
 </div>
-{{/* The approvals panel is NOT rendered from this template: the fleet
-     page's dot is fleetData and the panel reads approvalsData, and threading
-     the page's data through would 500 the whole page the moment the two
-     structs drifted. The slot below is empty markup; the panel's own five-
-     second poll (/ui/approvals, the htmx attribute on the element the poll
-     swaps in) fills it — on a scripting-off browser the operator reloads, and
-     the server-side render they get then includes the panel through the same
-     handler. */}}
-<div id="approvals" aria-label="Pending command approvals"></div>
+{{/* The approvals panel is not rendered from THIS template: the fleet page's
+     dot is fleetData and the panel reads approvalsData, and threading the
+     page's data through would 500 the whole page the moment the two structs
+     drifted. Instead the slot below bootstraps the panel's own five-second
+     poll: htmx fetches /ui/approvals into it, and the fragment that returns
+     (the approvals define) re-establishes the poll on itself, so the loop
+     sustains across swaps. The page render carries no approval data — the
+     first poll arrives within five seconds, before a decision is realistic. */}}
+<div id="approvals-panel" hx-get="/ui/approvals" hx-trigger="every 5s" hx-target="#approvals-panel" hx-swap="outerHTML" aria-label="Pending command approvals"></div>
 {{end}}`
 
 // deleteConfirmSource renders the typed-name confirmation into #confirm. It sits

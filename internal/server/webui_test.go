@@ -188,6 +188,62 @@ func TestUIPartialEnvIsFatal(t *testing.T) {
 
 // Every UI read requires a session, and sends the visitor to sign in rather than
 // rendering anything.
+// The fleet page must bootstrap the approvals panel's own poll: the page
+// render carries no approval data (its dot is fleetData), so the slot's htmx
+// attributes are the only thing that ever issues the first /ui/approvals
+// request. A render without them is a panel that never loads — regression
+// guard for exactly that failure.
+func TestUIFleetBootstrapsApprovalsPanel(t *testing.T) {
+	s, _, p := newUITestServer(t)
+	session, _ := uiSignIn(t, s, p)
+	h := s.Routes()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/ui", nil)
+	req.AddCookie(session)
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("fleet page returned %d", rec.Code)
+	}
+	page := rec.Body.String()
+	for _, want := range []string{
+		`id="approvals-panel"`,
+		`hx-get="/ui/approvals"`,
+		`hx-trigger="every 5s"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("fleet page missing %q — the approvals panel would never load", want)
+		}
+	}
+}
+
+// The fragment a poll fetches must render a pending row with its approve/deny
+// forms — it is what the operator sees and clicks; the e2e covers only the
+// admin API, so without this test nothing would notice the panel 200-ing empty.
+func TestUIApprovalsFragmentRendersPendingRow(t *testing.T) {
+	s, st, p := newUITestServer(t)
+	if _, err := st.CreateCommandApproval("org1-m1", "docker system prune -af", "docker system prune -af", "exec:*", "console"); err != nil {
+		t.Fatalf("seed pending approval: %v", err)
+	}
+	session, _ := uiSignIn(t, s, p)
+	h := s.Routes()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/ui/approvals", nil)
+	req.AddCookie(session)
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/ui/approvals returned %d", rec.Code)
+	}
+	page := rec.Body.String()
+	if !strings.Contains(page, "docker system prune -af") {
+		t.Error("panel fragment does not show the pending command")
+	}
+	if !strings.Contains(page, "/ui/approve") || !strings.Contains(page, "/ui/deny") {
+		t.Error("panel fragment missing the approve/deny action forms")
+	}
+}
+
 func TestUIRequiresSession(t *testing.T) {
 	s, _, _ := newUITestServer(t)
 	h := s.Routes()
