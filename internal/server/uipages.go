@@ -396,12 +396,12 @@ const approvalsSource = `{{define "approvals"}}
       <td class="muted">{{.CreatedAt}}</td>
       <td>
         <div class="row-actions">
-        <form class="inline" method="post" action="/ui/approve" hx-post="/ui/approve" hx-target="#approvals" hx-swap="outerHTML">
+        <form class="inline" method="post" action="/ui/approve" hx-post="/ui/approve" hx-target="#approvals-panel" hx-swap="outerHTML">
           <input type="hidden" name="id" value="{{.ID}}">
           <input type="hidden" name="csrf" value="{{$.CSRF}}">
           <button type="submit">Approve once</button>
         </form>
-        <form class="inline" method="post" action="/ui/deny" hx-post="/ui/deny" hx-target="#approvals" hx-swap="outerHTML">
+        <form class="inline" method="post" action="/ui/deny" hx-post="/ui/deny" hx-target="#approvals-panel" hx-swap="outerHTML">
           <input type="hidden" name="id" value="{{.ID}}">
           <input type="hidden" name="csrf" value="{{$.CSRF}}">
           <button type="submit" class="danger">Deny</button>
