@@ -363,6 +363,57 @@ func TestFleetPolicyBlocksStreamedCommand(t *testing.T) {
 	}
 }
 
+// A console that CLAIMS fleet_approved on its own exec_stream gains nothing:
+// the flag is the relay's to set (it is the approval gate's decision, recorded
+// in the store), so it is stripped from the frame the console sent before
+// anything looks at it. The command is still refused by the fleet policy and
+// audited like any other attempt to route around it — and nothing reaches the
+// agent with the flag set.
+func TestConsoleCannotClaimFleetApproved(t *testing.T) {
+	h := newStreamHarness(t)
+	h.s.execPolicy.Replace("deny:claimed-marker\n", "test")
+	key := adminKey(t, h.s, "exec:*")
+
+	console, _, resp := h.console(t, key, h.mach)
+	if console == nil {
+		t.Fatalf("console dial failed: %v", resp)
+	}
+	start := protocol.StreamStart{Command: "echo claimed-marker", FleetApproved: true}
+	payload, _ := json.Marshal(start)
+	if err := console.WriteEnvelope(protocol.Envelope{
+		Type: "exec_stream", ReqID: "sess-claim", Payload: payload,
+	}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	env := nextFrame(t, console)
+	if env.Type != "approval_needed" {
+		t.Fatalf("frame = %q, want approval_needed: a claimed flag is not an approval", env.Type)
+	}
+	endEnv := nextFrame(t, console)
+	if endEnv.Type != "stream_end" {
+		t.Fatalf("frame = %q, want stream_end", endEnv.Type)
+	}
+	var end protocol.StreamEnd
+	_ = json.Unmarshal(endEnv.Payload, &end)
+	if end.ExitCode != protocol.ExitApprovalPending {
+		t.Errorf("exit code = %d, want %d (ExitApprovalPending)", end.ExitCode, protocol.ExitApprovalPending)
+	}
+	// Nothing was dispatched, and the attempt is in the record.
+	select {
+	case f := <-h.frames:
+		t.Fatalf("a claimed flag dispatched the command to the agent: %+v", f)
+	case <-time.After(200 * time.Millisecond):
+	}
+	entries, err := h.st.AuditList(h.mach, 10)
+	if err != nil {
+		t.Fatalf("audit list: %v", err)
+	}
+	if len(entries) != 1 || !strings.Contains(entries[0].Command, "claimed-marker") {
+		t.Fatalf("audit rows = %+v, want the attempt recorded", entries)
+	}
+}
+
 // E2E is a control plane setting, and the flag is the whole of it: with E2E off
 // a sealed command is refused before dispatch, audited, and explained in the
 // response so a client knows what to do instead of guessing from a console that

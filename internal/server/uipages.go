@@ -1,7 +1,5 @@
 package server
 
-import "github.com/TevaServices/mach/internal/store"
-
 // Templates for the control-plane web UI, and for the enrollment page that now
 // renders through the same shell.
 //
@@ -42,10 +40,6 @@ import (
 type fleetData struct {
 	Rows []fleetRow
 	CSRF string
-	// Approvals is the pending-approval queue the page's panel shows. It rides
-	// the same data struct because the panel is embedded in the fleet page's
-	// template; the polled panel fragment carries its own approvalsData.
-	Approvals []store.CommandApproval
 	// Notice is the fixed sentence for the action that just happened. It is
 	// rendered out of band from an action's response (see noticeOOBSource) and
 	// inline by the shell on the no-JS path, from the same uiNotices map — so the
@@ -269,11 +263,15 @@ const fleetSource = `{{define "fleet"}}
 {{template "fleettable" .}}
 <div id="confirm"></div>
 </div>
-<div id="approvals">
-<div id="approvals-panel" hx-get="/ui/approvals" hx-trigger="every 5s" hx-target="#approvals-panel" hx-swap="outerHTML">
-{{with .Approvals}}{{template "approvals" .}}{{end}}
-</div>
-</div>
+{{/* The approvals panel is NOT rendered from this template: the fleet
+     page's dot is fleetData and the panel reads approvalsData, and threading
+     the page's data through would 500 the whole page the moment the two
+     structs drifted. The slot below is empty markup; the panel's own five-
+     second poll (/ui/approvals, the htmx attribute on the element the poll
+     swaps in) fills it — on a scripting-off browser the operator reloads, and
+     the server-side render they get then includes the panel through the same
+     handler. */}}
+<div id="approvals" aria-label="Pending command approvals"></div>
 {{end}}`
 
 // deleteConfirmSource renders the typed-name confirmation into #confirm. It sits
@@ -380,6 +378,7 @@ const deleteConfirmPageSource = `{{define "deleteconfirmpage"}}
 // through approvalsaction, whose response replaces the whole panel and carries
 // the notice out of band — the same shape every other fleet action uses.
 const approvalsSource = `{{define "approvals"}}
+<div id="approvals-panel" hx-get="/ui/approvals" hx-trigger="every 5s" hx-target="#approvals-panel" hx-swap="outerHTML">
 <div class="table-scroll" role="region" aria-label="Pending command approvals" tabindex="0">
 {{if not .Approvals}}
   <p class="muted">No commands are waiting for approval.</p>
@@ -414,6 +413,7 @@ const approvalsSource = `{{define "approvals"}}
   </tbody></table>
 {{end}}
   </div>
+</div>
 {{end}}`
 
 // approvalsActionSource is the response to an approve/deny: the refreshed

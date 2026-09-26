@@ -481,6 +481,14 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 				s.streamRefuse(consoleConn, machine, "bad exec_stream payload")
 				continue
 			}
+			// The flag is the SERVER's to set: it records a decision this
+			// relay made (the approval gate below), so it is stripped from
+			// whatever the console sent before anything else looks at it. A
+			// client claiming fleet_approved itself gains nothing — the gate
+			// still refuses the command and audits the attempt — but the
+			// claim must not survive to the agent, where the mirrored ruleset
+			// is what would stand down.
+			start.FleetApproved = false
 			display := commandForDisplay(start.Command, start.Argv)
 			// The fleet-wide block list, checked here for the same reason the
 			// buffered path checks it there: every client, every scope and
@@ -520,9 +528,11 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 					"a command is already running in this session — wait for it to finish, or open another `mach console`")
 				continue
 			}
-			// Re-marshal: an approved command carries FleetApproved, so the
-			// mirrored copy of the same ruleset on the machine stands down for
-			// it. The envelope's payload still holds the original JSON.
+			// Re-marshal when this dispatch is an approved exception: the
+			// flag in the parsed frame is the only carrier of the gate's
+			// decision to the agent (it was stripped from the console's own
+			// JSON at parse time, above), so only an approved command ever
+			// reaches the agent with it set.
 			env.ReqID = sessionID // tag for the agent pump's routing
 			if start.FleetApproved {
 				env.Payload = mustJSON(start)
