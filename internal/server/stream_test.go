@@ -321,16 +321,31 @@ func TestFleetPolicyBlocksStreamedCommand(t *testing.T) {
 	execStream(t, console, "echo stream-blocked-marker")
 
 	env := nextFrame(t, console)
-	if env.Type != "stream_end" {
-		t.Fatalf("frame = %q, want stream_end (nothing may be dispatched)", env.Type)
+	// The relay's answer to a fleet-refused command is the typed approval
+	// frame plus a terminal record carrying ExitApprovalPending — a pending
+	// approval an operator can decide, not a silent dead end.
+	if env.Type != "approval_needed" {
+		t.Fatalf("frame = %q, want approval_needed (nothing may be dispatched)", env.Type)
+	}
+	var needed protocol.StreamApprovalNeeded
+	_ = json.Unmarshal(env.Payload, &needed)
+	if !strings.Contains(needed.Reason, "deny:stream-blocked-marker") {
+		t.Errorf("reason = %q, want it to name the rule", needed.Reason)
+	}
+	if needed.ApprovalID <= 0 {
+		t.Errorf("approval id = %d, want the row the operator acts on", needed.ApprovalID)
+	}
+	endEnv := nextFrame(t, console)
+	if endEnv.Type != "stream_end" {
+		t.Fatalf("frame = %q, want stream_end", endEnv.Type)
 	}
 	var end protocol.StreamEnd
-	_ = json.Unmarshal(env.Payload, &end)
-	if end.ExitCode != execRefused {
-		t.Errorf("exit code = %d, want %d", end.ExitCode, execRefused)
+	_ = json.Unmarshal(endEnv.Payload, &end)
+	if end.ExitCode != protocol.ExitApprovalPending {
+		t.Errorf("exit code = %d, want %d (ExitApprovalPending)", end.ExitCode, protocol.ExitApprovalPending)
 	}
-	if !strings.Contains(end.Error, "global exec policy") || !strings.Contains(end.Error, "deny:stream-blocked-marker") {
-		t.Errorf("refusal = %q, want it to name the policy and the rule", end.Error)
+	if !strings.Contains(end.Error, "global exec policy") {
+		t.Errorf("refusal = %q, want it to name the policy", end.Error)
 	}
 	// The command never reached the machine.
 	select {
@@ -345,6 +360,57 @@ func TestFleetPolicyBlocksStreamedCommand(t *testing.T) {
 	}
 	if len(entries) != 1 || !strings.Contains(entries[0].Command, "stream-blocked-marker") {
 		t.Fatalf("audit rows = %+v, want the blocked attempt recorded", entries)
+	}
+}
+
+// A console that CLAIMS fleet_approved on its own exec_stream gains nothing:
+// the flag is the relay's to set (it is the approval gate's decision, recorded
+// in the store), so it is stripped from the frame the console sent before
+// anything looks at it. The command is still refused by the fleet policy and
+// audited like any other attempt to route around it — and nothing reaches the
+// agent with the flag set.
+func TestConsoleCannotClaimFleetApproved(t *testing.T) {
+	h := newStreamHarness(t)
+	h.s.execPolicy.Replace("deny:claimed-marker\n", "test")
+	key := adminKey(t, h.s, "exec:*")
+
+	console, _, resp := h.console(t, key, h.mach)
+	if console == nil {
+		t.Fatalf("console dial failed: %v", resp)
+	}
+	start := protocol.StreamStart{Command: "echo claimed-marker", FleetApproved: true}
+	payload, _ := json.Marshal(start)
+	if err := console.WriteEnvelope(protocol.Envelope{
+		Type: "exec_stream", ReqID: "sess-claim", Payload: payload,
+	}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	env := nextFrame(t, console)
+	if env.Type != "approval_needed" {
+		t.Fatalf("frame = %q, want approval_needed: a claimed flag is not an approval", env.Type)
+	}
+	endEnv := nextFrame(t, console)
+	if endEnv.Type != "stream_end" {
+		t.Fatalf("frame = %q, want stream_end", endEnv.Type)
+	}
+	var end protocol.StreamEnd
+	_ = json.Unmarshal(endEnv.Payload, &end)
+	if end.ExitCode != protocol.ExitApprovalPending {
+		t.Errorf("exit code = %d, want %d (ExitApprovalPending)", end.ExitCode, protocol.ExitApprovalPending)
+	}
+	// Nothing was dispatched, and the attempt is in the record.
+	select {
+	case f := <-h.frames:
+		t.Fatalf("a claimed flag dispatched the command to the agent: %+v", f)
+	case <-time.After(200 * time.Millisecond):
+	}
+	entries, err := h.st.AuditList(h.mach, 10)
+	if err != nil {
+		t.Fatalf("audit list: %v", err)
+	}
+	if len(entries) != 1 || !strings.Contains(entries[0].Command, "claimed-marker") {
+		t.Fatalf("audit rows = %+v, want the attempt recorded", entries)
 	}
 }
 
@@ -616,8 +682,8 @@ func TestFleetPolicyChecksPlaintextWhileE2EIsOn(t *testing.T) {
 	key := adminKey(t, h.s, "exec:*")
 
 	code, body := execReq(t, h.s, key, `{"machine":"`+h.mach+`","command":"echo plain-marker","timeout":1}`)
-	if code != http.StatusForbidden || !strings.Contains(body, "deny:plain-marker") {
-		t.Fatalf("plaintext exec with E2E on: %d %s, want the block list to refuse it", code, body)
+	if code != http.StatusAccepted || !strings.Contains(body, "deny:plain-marker") {
+		t.Fatalf("plaintext exec with E2E on: %d %s, want the block list to hold it as a pending approval", code, body)
 	}
 }
 

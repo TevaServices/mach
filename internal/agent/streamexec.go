@@ -43,7 +43,7 @@ func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{
 	}
 	ctl.announce("console: %q", describeCommandText(start.Command, start.Argv))
 
-	if reason := checkCommand(start.Command, start.Argv); reason != "" {
+	if reason := checkCommand(protocol.ExecCommand{Command: start.Command, Argv: start.Argv, FleetApproved: start.FleetApproved}); reason != "" {
 		end(protocol.StreamEnd{ExitCode: 126, Error: reason})
 		return
 	}

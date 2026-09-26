@@ -447,8 +447,12 @@ to run it, and for why the driver difference matters.
   `allowonly` mode against sealed commands (the rules judge a sealed command on
   the machine, so an allow-list must not refuse every one of them for having no
   text at the control plane), and checks that a quoted secret in a command is
-  redacted out of the audit row.
-  Green = 189 checks.
+  redacted out of the audit row. It exercises the command-approval flow end to
+  end: a fleet-refused command is held as a pending approval (retries join the
+  same row), an operator grants it through the admin API, the approved command
+  runs once (the mirror on the machine stands down for exactly that dispatch,
+  never for the machine's own rules), and the spent grant stays in the record.
+  Green = 201 checks.
 - Timing-sensitive e2e checks (streaming) use a real sleep and a real
   background process; if one flakes, make the sleep longer rather than
   weakening the assertion.
@@ -650,7 +654,9 @@ rule that would have prevented it.
   asserts the status you hand it, so whatever produces that status is the test.
 - **Update "Green = N checks" in the Testing section** when you add or remove a
   check. The number is the only thing telling the next agent whether the suite
-  they ran is the suite this file describes.
+  they ran is the suite this file describes. The printed total counts more
+  than the literal `check` lines (a few assertions go through `ok` inside
+  loops), so run the suite and quote the summary line rather than counting.
 - **`internal/console` tests touch the state dir.** Anything that execs resolves
   `MACH_STATE_DIR`, else `$HOME/.mach`. A client test that seals without
   `t.Setenv("MACH_STATE_DIR", t.TempDir())` writes real pin files into the

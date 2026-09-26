@@ -380,7 +380,7 @@ func runCommandResult(cmdPayload []byte, sem chan struct{}) protocol.ExecResult 
 	case <-time.After(10 * time.Second):
 		return protocol.ExecResult{Error: "too many concurrent commands on this machine", ExitCode: 126}
 	}
-	if reason := checkCommand(cmd.Command, cmd.Argv); reason != "" {
+	if reason := checkCommand(cmd); reason != "" {
 		return protocol.ExecResult{Error: reason, ExitCode: 126}
 	}
 	timeout := time.Duration(cmd.Timeout) * time.Second

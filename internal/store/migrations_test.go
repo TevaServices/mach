@@ -174,8 +174,12 @@ func TestAdoptionOfPreMigrationDatabase(t *testing.T) {
 	}
 	defer st.Close()
 	rows := appliedMigrationRows(t, st)
-	if len(rows) != 1 {
-		t.Fatalf("applied versions = %v, want exactly 0001_baseline", rows)
+	// Adoption stamps the baseline and then applies every migration this binary
+	// has that the adopted database does not — so the row count is the whole
+	// embedded set, and the assertion is written against that set rather than
+	// against a fixed number that the next migration would silently break.
+	if len(rows) != len(migrationSet) {
+		t.Fatalf("applied versions = %v, want every embedded migration (%d)", rows, len(migrationSet))
 	}
 	if _, ok := rows["0001_baseline"]; !ok {
 		t.Fatalf("applied versions = %v, want 0001_baseline", rows)
@@ -286,7 +290,10 @@ func TestUnknownAppliedMigrationRefusesStartup(t *testing.T) {
 	}
 	// A row that REPLACED the baseline: same sequence, different name. The
 	// database is not "newer", but this binary has never seen the step.
-	if _, err := st.db.Exec(`UPDATE schema_migrations SET version='0001_rewritten'`); err != nil {
+	// WHERE names the baseline row: the database now carries more than one
+	// migration, and an unqualified UPDATE would rewrite every version to the
+	// same string and die on the UNIQUE constraint instead of testing anything.
+	if _, err := st.db.Exec(`UPDATE schema_migrations SET version='0001_rewritten' WHERE version='0001_baseline'`); err != nil {
 		st.Close()
 		t.Fatalf("rewrite version row: %v", err)
 	}
@@ -305,11 +312,35 @@ func TestUnknownAppliedMigrationRefusesStartup(t *testing.T) {
 func syntheticTestShapeMigration() migration {
 	body := "CREATE TABLE test_shape (id {{ID}}, v TEXT NOT NULL);\n"
 	sum := sha256.Sum256([]byte(body))
+	// 0003, not 0002: the real 0002_command_approvals migration now occupies
+	// that sequence, and two migrations with one sequence would make the
+	// "unknown applied version" refusal below name whichever of them the map
+	// iteration happened to reach first.
 	return migration{
-		version:  "0002_test_shape",
-		filename: "0002_test_shape.sql",
+		version:  "0003_test_shape",
+		filename: "0003_test_shape.sql",
 		sql:      body,
 		sha256:   hex.EncodeToString(sum[:]),
+	}
+}
+
+// captureMigrationSet snapshots the embedded set as the original, once per
+// test. Every swap in that test then restores THIS snapshot, and
+// syntheticPlus builds from it.
+//
+// It must run before anything else in a test that swaps: the original used to
+// be captured inside swapMigrationSet's first call, which meant a helper
+// reading origMigrationSet to BUILD that first call's argument read a nil —
+// the "capture before the swap" rule has to include the capture itself.
+func captureMigrationSet(t *testing.T) {
+	t.Helper()
+	if !swappedOnce {
+		origMigrationSet = migrationSet
+		swappedOnce = true
+		t.Cleanup(func() {
+			migrationSet = origMigrationSet
+			swappedOnce = false
+		})
 	}
 }
 
@@ -322,14 +353,7 @@ func syntheticTestShapeMigration() migration {
 // untested.
 func swapMigrationSet(t *testing.T, set []migration) {
 	t.Helper()
-	if !swappedOnce {
-		origMigrationSet = migrationSet
-		swappedOnce = true
-		t.Cleanup(func() {
-			migrationSet = origMigrationSet
-			swappedOnce = false
-		})
-	}
+	captureMigrationSet(t)
 	migrationSet = set
 }
 
@@ -348,6 +372,26 @@ func copyMigrationSet() []migration {
 
 // baselineOnlySet returns the embedded set reduced to the baseline alone:
 // what a binary one step older than a database holds.
+//
+// syntheticPlus returns the full embedded set plus the given extra migration.
+//
+// It is built from the ORIGINAL embedded set (origMigrationSet) rather than
+// from copyMigrationSet(), and that difference is the whole point: mid-test,
+// after the baseline-only swap, migrationSet IS the baseline-only set, so a
+// copy of it would silently drop every real migration after the baseline —
+// the reopen in the test below would then refuse 0002_command_approvals, a
+// migration the binary under test is supposed to know. swapMigrationSet
+// restores the original only at cleanup, which is why the "captured BEFORE
+// the swap" rule exists; reading origMigrationSet is what that rule looks
+// like in code.
+func syntheticPlus(t *testing.T, extra migration) []migration {
+	t.Helper()
+	captureMigrationSet(t)
+	out := make([]migration, 0, len(origMigrationSet)+1)
+	out = append(out, origMigrationSet...)
+	return append(out, extra)
+}
+
 func baselineOnlySet() []migration {
 	var out []migration
 	for _, m := range migrationSet {
@@ -365,12 +409,13 @@ func baselineOnlySet() []migration {
 // The sets handed to swapMigrationSet are captured BEFORE the swap that
 // changes what copyMigrationSet would return: "the baseline-only set" is
 // built from the ORIGINAL embedded set (via cleanup restoration), never from
-// the synthetic set that is live mid-test.
+// the synthetic set that is live mid-test. syntheticPlus(t, …) enforces that
+// in code rather than by convention.
 func TestSyntheticMigrationOrderingAndNewerRefusal(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "shape.db")
 	synth := syntheticTestShapeMigration()
 
-	swapMigrationSet(t, append(copyMigrationSet(), synth))
+	swapMigrationSet(t, syntheticPlus(t, synth))
 	st, err := Open(path)
 	if err != nil {
 		t.Fatalf("open with synthetic set: %v", err)
@@ -379,7 +424,7 @@ func TestSyntheticMigrationOrderingAndNewerRefusal(t *testing.T) {
 	if _, ok := rows["0001_baseline"]; !ok {
 		t.Fatalf("baseline not applied: %v", rows)
 	}
-	if _, ok := rows["0002_test_shape"]; !ok {
+	if _, ok := rows["0003_test_shape"]; !ok {
 		t.Fatalf("synthetic migration not applied: %v", rows)
 	}
 	var tables int
@@ -399,17 +444,25 @@ func TestSyntheticMigrationOrderingAndNewerRefusal(t *testing.T) {
 		t.Fatal("opened a database with a migration this binary does not have")
 	}
 	// The refusal is the newer-database message OR the unknown-migration one
-	// (same condition, whichever check fires first); both name the version.
+	// (same condition, whichever check fires first). Which migration the
+	// message names is NOT asserted beyond the synthetic one being a legal
+	// answer: with more than one embedded migration, a binary holding fewer of
+	// them may stop at the FIRST unknown version its scan reaches, and the
+	// map-iteration order of that scan is not part of the contract —
+	// TestUnknownAppliedMigrationRefusesStartup pins the name of the row it
+	// rewrites itself.
+	//
+	// What must hold here is that the binary refused a database ahead of it and
+	// named *a* migration it does not have — the baseline row is the only one
+	// the baseline-only set holds, so its absence from the message is the only
+	// thing that could make the refusal unactionable.
 	if !strings.Contains(err.Error(), "newer than this binary") &&
 		!strings.Contains(err.Error(), "which this binary does not have") {
 		t.Fatalf("refusal does not say the database is ahead of the binary: %v", err)
 	}
-	if !strings.Contains(err.Error(), "0002_test_shape") {
-		t.Fatalf("refusal does not name the offending version: %v", err)
-	}
 
 	// And the right binary reopens it idempotently: nothing re-applied.
-	swapMigrationSet(t, append(copyMigrationSet(), synth))
+	swapMigrationSet(t, syntheticPlus(t, synth))
 	st3, err := Open(path)
 	if err != nil {
 		t.Fatalf("reopen with synthetic set: %v", err)
