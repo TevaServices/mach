@@ -697,6 +697,21 @@ rule that would have prevented it.
   reconciled in `c620a16`; the decisions that look odd in isolation (one-shot exec
   buffered while the console streams, E2E per org and refusable, the block list
   running on the machine) are recorded there with their reasoning.
+- **A websocket read deadline is refreshed by data frames only.** Control
+  frames (pings, pongs) are consumed inside the read and never surface — in
+  gorilla or in coder/websocket alike. So a deadline reset only when a frame
+  returns is a deadline nothing keeps alive, and this repo shipped exactly
+  that: the agent's pump refreshed on pongs from its own pinger, but the
+  control plane only refreshed when the agent sent *data*, so every idle
+  agent connection was cut at exactly 90s and the fleet reconnected forever
+  (seen as close 1006 on a fixed period). The rule now: every connection has
+  a designated pinger, and every deadline is refreshed by a pong (or a data
+  frame) — the agent path in `internal/server/keepalive.go` mirrors the
+  console stream's. If you add a websocket that a peer may leave idle, it
+  needs the pair, on both ends. When changing this, `keepalive_test.go`'s
+  positive and negative controls are the floor; the negative control exists
+  because the bug survived a green suite without one.
+
 - **The Postgres path is not exercised by default — and saying so is the point.**
   With no `MACH_TEST_POSTGRES`, `TestPostgresStoreEndToEnd` and the
   `postgres_concurrency_test.go` set skip, and the Postgres path is covered only

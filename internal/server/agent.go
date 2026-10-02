@@ -395,9 +395,26 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		s.pushQueuedUpdate(conn, machine.Name)
 	}
 
+	// Keepalive, server side. The agent pings every 30s and gorilla answers
+	// silently — but those pings are control frames this read loop never sees,
+	// so the read deadline the pump sets below was refreshed only by data
+	// frames, which an idle fleet never sends. Every idle agent connection was
+	// therefore cut at exactly 90s and reconnected forever (seen in production
+	// as close 1006 on a fixed period, both flapping machines alike). Mirror of
+	// the console stream's keepalive, with the same intervals: this pinger
+	// provokes pongs, and the pong (or any data frame) refreshes the deadline —
+	// so a healthy idle agent never trips it, and a dead or black-holed one is
+	// still detected within agentIdleTimeout.
+	pingDone := make(chan struct{})
+	defer close(pingDone)
+	ws.SetPongHandler(func(string) error {
+		return ws.SetReadDeadline(time.Now().Add(agentIdleTimeout))
+	})
+	go startPings(conn.Ping, agentPingInterval, pingDone)
+
 	// Pump: read envelopes from the agent until it disconnects.
 	for {
-		_ = ws.SetReadDeadline(time.Now().Add(90 * time.Second))
+		_ = ws.SetReadDeadline(time.Now().Add(agentIdleTimeout))
 		env, err := conn.ReadEnvelope()
 		if err != nil {
 			return
