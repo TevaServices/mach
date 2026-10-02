@@ -481,6 +481,14 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 				s.streamRefuse(consoleConn, machine, "bad exec_stream payload")
 				continue
 			}
+			// The flag is the SERVER's to set: it records a decision this
+			// relay made (the approval gate below), so it is stripped from
+			// whatever the console sent before anything else looks at it. A
+			// client claiming fleet_approved itself gains nothing — the gate
+			// still refuses the command and audits the attempt — but the
+			// claim must not survive to the agent, where the mirrored ruleset
+			// is what would stand down.
+			start.FleetApproved = false
 			display := commandForDisplay(start.Command, start.Argv)
 			// The fleet-wide block list, checked here for the same reason the
 			// buffered path checks it there: every client, every scope and
@@ -488,10 +496,18 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 			// its own policy too, but a policy that only lives on the machine
 			// is not fleet-wide.
 			if reason := s.execPolicyCheck(start.Command, start.Argv); reason != "" {
-				s.auditRow(machine, display, "console:"+keyName,
-					sqlNullInt(execRefused), "", "blocked by the server's global exec policy: "+reason)
-				s.streamRefuse(consoleConn, machine, "blocked by the server's global exec policy: "+reason)
-				continue
+				// Not a final refusal: record or join a pending approval and
+				// hand the decision to the console (internal/server/approvals.go).
+				// An approved record dispatches as an exception to the mirrored
+				// ruleset; nothing approved, the attempt is audited and the
+				// command ends with ExitApprovalPending.
+				dispatch, fleetApproved := s.streamExecPolicyGate(consoleConn, machine, display, "console:"+keyName, &start, reason)
+				if fleetApproved {
+					start.FleetApproved = true
+				}
+				if !dispatch {
+					continue
+				}
 			}
 			// The operator's soft block, re-checked per command: the check at
 			// connect only covers the moment the session opened, and a block set
@@ -512,7 +528,15 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 					"a command is already running in this session — wait for it to finish, or open another `mach console`")
 				continue
 			}
+			// The agent frame is re-marshaled unconditionally: what travels
+			// is the server's own serialization of the stripped struct, never
+			// the console's original bytes. On the approved path the parsed
+			// frame's flag is the only carrier of the gate's decision (it was
+			// stripped from the console's own JSON at parse time, above), so
+			// only an approved command ever reaches the agent with it set —
+			// and a forged flag cannot ride through in untouched bytes.
 			env.ReqID = sessionID // tag for the agent pump's routing
+			env.Payload = mustJSON(start)
 			s.streamToAgent(sessionID, consoleConn, env)
 		case "stream_stdin", "stream_kill":
 			// Also gated. Refusing only exec_stream would leave a session that

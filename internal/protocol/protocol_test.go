@@ -351,3 +351,51 @@ func TestMachineInfoBlockedField(t *testing.T) {
 		t.Fatalf("unblocked machine reported a blocked field: %s", raw)
 	}
 }
+
+// StreamApprovalNeeded is the typed frame that tells an interactive console a
+// fleet-refused command has an approval pending. Its field names are the wire
+// contract between relay and console, which update independently.
+func TestStreamApprovalNeededWireFormat(t *testing.T) {
+	in := StreamApprovalNeeded{ApprovalID: 42, Command: "echo hi", Reason: "denied by command policy (deny:rm -rf)", Timeout: 60}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, k := range []string{"approval_id", "command", "reason", "timeout"} {
+		if _, ok := fields[k]; !ok {
+			t.Errorf("StreamApprovalNeeded JSON is missing %q: %s", k, raw)
+		}
+	}
+	if string(fields["approval_id"]) != `42` {
+		t.Errorf("approval_id = %s, want the integer", fields["approval_id"])
+	}
+
+	var out StreamApprovalNeeded
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	if out.ApprovalID != in.ApprovalID || out.Command != in.Command ||
+		out.Reason != in.Reason || out.Timeout != in.Timeout {
+		t.Errorf("round trip = %+v, want %+v", out, in)
+	}
+}
+
+// ExitApprovalPending is a wire value, not a local constant: the relay writes
+// it into a stream_end and the console reads it back as the signal to offer an
+// approval. Pin the number so a change here is a decision, not an accident.
+func TestExitApprovalPendingIsTheWireValue(t *testing.T) {
+	if ExitApprovalPending != 250 {
+		t.Fatalf("ExitApprovalPending = %d, want 250", ExitApprovalPending)
+	}
+	raw, err := json.Marshal(StreamEnd{ExitCode: ExitApprovalPending})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"exit_code":250`) {
+		t.Errorf("stream_end JSON = %s, want the approval-pending status on the wire", raw)
+	}
+}

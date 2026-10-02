@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -24,18 +25,78 @@ func TestGlobalExecPolicyBlocksFleetWide(t *testing.T) {
 
 	for _, scopes := range []string{"exec:*", "exec:bcross-a"} {
 		key := adminKey(t, s, scopes)
+		// The first ask of a blocked command is answered with a pending
+		// approval (202), not a final refusal: an operator may decide to allow
+		// this exact command. Nothing is dispatched either way — the gate is
+		// still before dispatch, and the reason is still the policy's.
 		code, body := execReq(t, s, key, `{"machine":"bcross-a","command":"rm -rf / --no-preserve-root"}`)
-		if code != http.StatusForbidden {
-			t.Fatalf("scopes %q: blocked command returned %d, want 403 (%s)", scopes, code, body)
+		if code != http.StatusAccepted {
+			t.Fatalf("scopes %q: blocked command returned %d, want 202 pending_approval (%s)", scopes, code, body)
 		}
-		if !strings.Contains(body, "global exec policy") {
-			t.Errorf("scopes %q: refusal does not name the policy: %s", scopes, body)
+		if !strings.Contains(body, "pending_approval") || !strings.Contains(body, "approval_id") {
+			t.Errorf("scopes %q: 202 body is not a pending approval: %s", scopes, body)
 		}
-		// The refusal must be the policy's, not the "machine offline" path:
-		// the block happens first, so the reason is never "offline".
+		if !strings.Contains(body, "denied by command policy") {
+			t.Errorf("scopes %q: the body does not name the policy reason: %s", scopes, body)
+		}
 		if strings.Contains(body, "offline") {
 			t.Errorf("scopes %q: a blocked command reached dispatch (%s)", scopes, body)
 		}
+		// A retry joins the SAME pending approval — one row per normalized
+		// command — and gets the same 202 with the same id while it stays
+		// open; the refusal is the rule, the approval the exception, and the
+		// record is not duplicated by retries.
+		code, body = execReq(t, s, key, `{"machine":"bcross-a","command":"rm -rf / --no-preserve-root"}`)
+		if code != http.StatusAccepted {
+			t.Fatalf("scopes %q: the join returned %d, want 202 pending_approval (%s)", scopes, code, body)
+		}
+		if !strings.Contains(body, "pending_approval") || !strings.Contains(body, "approval_id") {
+			t.Errorf("scopes %q: join body is not a pending approval: %s", scopes, body)
+		}
+	}
+}
+
+// An approval turns the refusal into exactly one dispatch: approve the pending
+// record, retry the command, and it runs — the 'once' grant is consumed by
+// that run, so a second retry refuses again. This is the behavior the other
+// policy tests rely on indirectly (a refusal that stays a refusal until an
+// operator decides otherwise).
+func TestApprovedCommandDispatchesOnce(t *testing.T) {
+	s, st := newAuthTestServer(t)
+	s.SetExecPolicy("deny:rm -rf /")
+	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	key := adminKey(t, s, "exec:*")
+
+	// First ask: pending approval.
+	code, body := execReq(t, s, key, `{"machine":"bcross-a","command":"rm -rf / --no-preserve-root"}`)
+	if code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (%s)", code, body)
+	}
+	// Extract the approval id the body carried.
+	var pend struct {
+		ApprovalID int64 `json:"approval_id"`
+	}
+	if err := json.Unmarshal([]byte(body), &pend); err != nil || pend.ApprovalID == 0 {
+		t.Fatalf("202 body: %v (%s)", err, body)
+	}
+	// Approve it as an admin would, through the API.
+	if code, body := bearerJSON(t, s.Routes(), "POST", fmt.Sprintf("/v1/admin/approvals/%d/approve", pend.ApprovalID), key, `{}`); code != http.StatusOK {
+		t.Fatalf("approve: %d %s, want 200", code, body)
+	}
+	// The machine is offline in this test, so the dispatch reaches the
+	// "offline or unknown" answer — which is PROOF the gate let it through:
+	// the policy refusal would have answered 403 long before the broker wait.
+	code, body = execReq(t, s, key, `{"machine":"bcross-a","command":"rm -rf / --no-preserve-root"}`)
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("approved retry returned %d (%s), want dispatch (503 offline on this machine)", code, body)
+	}
+	// The 'once' grant is spent: the next identical ask is held as pending
+	// again rather than riding the old approval.
+	code, _ = execReq(t, s, key, `{"machine":"bcross-a","command":"rm -rf / --no-preserve-root"}`)
+	if code != http.StatusAccepted {
+		t.Fatalf("post-consumption retry returned %d, want a new pending approval (202)", code)
 	}
 
 	// A command the policy does not match is left alone. Asserted on the check
@@ -58,8 +119,10 @@ func TestGlobalExecPolicyRefusalIsAudited(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	key := adminKey(t, s, "exec:*")
-	if code, _ := execReq(t, s, key, `{"machine":"bcross-a","command":"shutdown -h now"}`); code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403", code)
+	// The first ask records a pending approval (202); the audit row is what
+	// this test is about, and it is written for the attempt either way.
+	if code, _ := execReq(t, s, key, `{"machine":"bcross-a","command":"shutdown -h now"}`); code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 pending_approval", code)
 	}
 	entries, err := st.AuditList("bcross-a", 10)
 	if err != nil {
@@ -95,8 +158,8 @@ func TestGlobalExecPolicyAndArgvMode(t *testing.T) {
 	// matches a shell command: the rule is about what is being asked for.
 	s.SetExecPolicy("deny:rm -rf /")
 	code, body := execReq(t, s, key, `{"machine":"bcross-a","argv":["rm","-rf","/"]}`)
-	if code != http.StatusForbidden {
-		t.Fatalf("argv-mode blocked command returned %d, want 403 (%s)", code, body)
+	if code != http.StatusAccepted {
+		t.Fatalf("argv-mode blocked command returned %d, want 202 pending_approval (%s)", code, body)
 	}
 
 	// allowonly: `echo a;b` in argv mode is one command whose text starts with
@@ -126,8 +189,8 @@ func TestGlobalExecPolicyAllowOnlyFleetWide(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	key := adminKey(t, s, "exec:*")
-	if code, _ := execReq(t, s, key, `{"machine":"bcross-a","command":"whoami"}`); code != http.StatusForbidden {
-		t.Fatalf("unlisted command returned %d, want 403", code)
+	if code, _ := execReq(t, s, key, `{"machine":"bcross-a","command":"whoami"}`); code != http.StatusAccepted {
+		t.Fatalf("unlisted command returned %d, want 202 pending_approval", code)
 	}
 	if why := s.execPolicyCheck("whoami", nil); why == "" {
 		t.Error("allowonly mode did not refuse an unlisted command")

@@ -313,14 +313,18 @@ machc exec "$MACHINE" "echo still-here" >/dev/null; check "primary agent unaffec
 step "fleet-wide policy: blocked for every key, on every machine"
 # The control plane's own block list. It applies to exec:* keys too — no scope
 # or allowlist exempts a caller — and it is checked before dispatch, so the
-# command never reaches the agent.
-OUT=$(machc exec "$MACHINE" 'echo fleet-blocked-marker' 2>&1)
-[[ "$OUT" == *"global exec policy"* ]]; check "fleet-wide deny refused via console" $?
+# command never reaches the agent. The refusal is held as a pending approval
+# (the next step exercises the grant path): the first ask is answered 202, the
+# console exits 3 and says so, and the raw API call answers 202 with the
+# pending_approval body — never a 2xx-looking success with an empty result.
+OUT=$(machc exec "$MACHINE" 'echo fleet-blocked-marker' 2>&1) && CODE=0 || CODE=$?
+[[ "$CODE" -ne 0 ]]; check "fleet-wide deny refused via console" $?
+grep -q "pending approval" <<<"$OUT"; check "the refusal names the pending approval" $?
 CODE=$(curl -s -o "$WORKDIR/blocked.json" -w '%{http_code}' -X POST "$BASE/v1/exec" \
   -H "Authorization: Bearer $ALLKEY" -H 'Content-Type: application/json' \
   -d "{\"machine\":\"$MACHINE\",\"command\":\"echo fleet-blocked-marker\"}")
-[[ "$CODE" == "403" ]]; check "fleet-wide deny refused an exec:* key" $?
-grep -q "global exec policy" "$WORKDIR/blocked.json"; check "refusal names the policy" $?
+[[ "$CODE" == "202" ]]; check "fleet-wide deny held as pending for an exec:* key" $?
+grep -q "pending_approval" "$WORKDIR/blocked.json"; check "the held answer names the pending approval" $?
 # The strongest assertion available here: the command was never dispatched. The
 # marker text does appear in this log — as a RULE, because the fleet policy is
 # mirrored onto the machine (that is how it applies to sealed commands) — so the
@@ -340,6 +344,54 @@ machc exec "$MACHINE" 'echo not-blocked' | grep -q not-blocked; check "unrelated
 # instead of passing it to exec.
 OUT=$(printf 'echo fleet-blocked-marker\n:quit\n' | machc console "$MACHINE" 2>&1)
 [[ "$OUT" == *"global exec policy"* ]]; check "fleet-wide deny refused on the stream path" $?
+
+step "command approvals: a refusal an operator can turn into one run"
+# A refusal by the fleet-wide list is recorded as a pending approval rather than
+# only an error: the same ask again answers with the SAME approval id (one row
+# per normalized command, retries join instead of piling up), an operator grants
+# it through the admin API, and the NEXT identical command runs — once. The
+# grant is spent by that run, so a third ask is held as pending again. The
+# refusal is the rule; the approval the exception, exactly one run wide.
+OUT=$(machc exec "$MACHINE" 'echo fleet-blocked-marker' 2>&1) && CODE=0 || CODE=$?
+[[ "$CODE" -ne 0 ]]; check "the first ask is still refused" $?
+grep -q "pending approval" <<<"$OUT"; check "the refusal names the pending approval" $?
+APPROVALS=$(curl -sS "$BASE/v1/admin/approvals" -H "Authorization: Bearer $ADMIN_KEY")
+APPROVAL_ID=$(printf '%s' "$APPROVALS" | python3 -c \
+  'import json,sys; rows=json.load(sys.stdin).get("approvals",[]); pending=[r for r in rows if r.get("status")=="pending" and "fleet-blocked-marker" in r.get("command","")]; print(pending[0]["id"] if pending else "")')
+[[ -n "$APPROVAL_ID" ]]; check "the blocked command has a pending approval row" $?
+# Retry joins the same row rather than creating a second one.
+BEFORE=$(printf '%s' "$APPROVALS" | python3 -c \
+  'import json,sys; print(len(json.load(sys.stdin).get("approvals",[])))')
+curl -sS -X POST "$BASE/v1/exec" -H "Authorization: Bearer $ADMIN_KEY" \
+  -H 'Content-Type: application/json' \
+  -d "{\"machine\":\"$MACHINE\",\"command\":\"echo fleet-blocked-marker\"}" >/dev/null
+sleep 1
+AFTER=$(curl -sS "$BASE/v1/admin/approvals" -H "Authorization: Bearer $ADMIN_KEY")
+AFTER_N=$(printf '%s' "$AFTER" | python3 -c \
+  'import json,sys; print(len(json.load(sys.stdin).get("approvals",[])))')
+[[ "$AFTER_N" == "$BEFORE" ]]; check "a retry joins the pending approval instead of duplicating it" $?
+# The operator grants it, through the API the UI runs.
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/admin/approvals/$APPROVAL_ID/approve" \
+  -H "Authorization: Bearer $ADMIN_KEY" -H 'Content-Type: application/json' -d '{}')
+[[ "$CODE" == "200" ]]; check "an operator can grant the pending approval" $?
+OUT=$(machc exec "$MACHINE" 'echo fleet-blocked-marker' 2>&1)
+[[ "$OUT" == *"fleet-blocked-marker"* && "$OUT" != *"exec policy"* ]]
+check "the approved command now runs" $?
+sleep 1
+AUDIT=$(machc audit "$MACHINE" 3 2>/dev/null)
+[[ "$AUDIT" == *"fleet-blocked-marker"* ]]; check "the approved run is in the audit like any other" $?
+# The 'once' grant is spent: the next identical ask is held again, not run.
+OUT=$(machc exec "$MACHINE" 'echo fleet-blocked-marker' 2>&1) && CODE=0 || CODE=$?
+[[ "$CODE" -ne 0 ]]; check "the one-time grant is spent by its run" $?
+[[ "$OUT" == *"pending approval"* ]]; check "and the next ask is a new pending approval" $?
+# The spent grant is kept in the record under its own status — the decision an
+# operator made and the run it allowed are part of the audit trail, not erased
+# by the use. It shows as 'spent', not 'approved': it cannot let anything
+# through anymore.
+STATUS=$(curl -sS "$BASE/v1/admin/approvals?status=spent&limit=1" -H "Authorization: Bearer $ADMIN_KEY")
+printf '%s' "$STATUS" | python3 -c \
+  'import json,sys; rows=json.load(sys.stdin).get("approvals",[]); raise SystemExit(0 if rows and rows[0].get("status")=="spent" else 1)'
+check "the spent grant shows as spent in the record" $?
 
 step "e2e: an org-scoped server setting the client is told about and obeys"
 # E2E is off fleet-wide (set before the server started). Sealing is switched on
@@ -413,8 +465,13 @@ OUT=$(machc exec --e2e "$MACHINE" 'echo must-not-run' 2>&1) && CODE=0 || CODE=$?
 grep -q must-not-run "$WORKDIR/agent1.log"; [[ $? -ne 0 ]]; check "the refused command never ran" $?
 # And with sealing off again, the fleet-wide block list is back in charge of
 # this org: the same command the placeholder hid above is refused outright now.
-OUT=$(machc exec "$MACHINE" 'echo fleet-blocked-marker' 2>&1)
-[[ "$OUT" == *"global exec policy"* ]]; check "policy governs again once sealing is off" $?
+# A pending approval for this exact command may exist from the approvals step —
+# that is the flow working, not the policy gone — so the answer here is either
+# the refusal (nothing pending) or the held-pending answer; either way the
+# command itself must not run.
+OUT=$(machc exec "$MACHINE" 'echo fleet-blocked-marker' 2>&1) && CODE=0 || CODE=$?
+[[ "$CODE" -ne 0 ]]; check "policy governs again once sealing is off" $?
+[[ "$OUT" == *"global exec policy"* || "$OUT" == *"pending approval"* ]]; check "the refusal is still the policy's, not a silent pass" $?
 
 step "the fleet block list applies to sealed commands too"
 # The headline property. The control plane cannot read a sealed command, so it

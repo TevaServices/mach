@@ -188,6 +188,109 @@ func TestUIPartialEnvIsFatal(t *testing.T) {
 
 // Every UI read requires a session, and sends the visitor to sign in rather than
 // rendering anything.
+// The fleet page must bootstrap the approvals panel's own poll: the page
+// render carries no approval data (its dot is fleetData), so the slot's htmx
+// attributes are the only thing that ever issues the first /ui/approvals
+// request. A render without them is a panel that never loads — regression
+// guard for exactly that failure.
+func TestUIFleetBootstrapsApprovalsPanel(t *testing.T) {
+	s, _, p := newUITestServer(t)
+	session, _ := uiSignIn(t, s, p)
+	h := s.Routes()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/ui", nil)
+	req.AddCookie(session)
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("fleet page returned %d", rec.Code)
+	}
+	page := rec.Body.String()
+	for _, want := range []string{
+		`id="approvals-panel"`,
+		`hx-get="/ui/approvals"`,
+		`hx-trigger="every 5s"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("fleet page missing %q — the approvals panel would never load", want)
+		}
+	}
+}
+
+// The fragment a poll fetches must render a pending row with its approve/deny
+// forms — it is what the operator sees and clicks; the e2e covers only the
+// admin API, so without this test nothing would notice the panel 200-ing empty.
+func TestUIApprovalsFragmentRendersPendingRow(t *testing.T) {
+	s, st, p := newUITestServer(t)
+	if _, err := st.CreateCommandApproval("org1-m1", "docker system prune -af", "docker system prune -af", "exec:*", "console"); err != nil {
+		t.Fatalf("seed pending approval: %v", err)
+	}
+	session, _ := uiSignIn(t, s, p)
+	h := s.Routes()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/ui/approvals", nil)
+	req.AddCookie(session)
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/ui/approvals returned %d", rec.Code)
+	}
+	page := rec.Body.String()
+	if !strings.Contains(page, "docker system prune -af") {
+		t.Error("panel fragment does not show the pending command")
+	}
+	if !strings.Contains(page, "/ui/approve") || !strings.Contains(page, "/ui/deny") {
+		t.Error("panel fragment missing the approve/deny action forms")
+	}
+
+	// The forms' hx-target must resolve INSIDE the fragment's own markup: an id
+	// the rename left dead makes htmx drop the whole response at click time
+	// (targetError) — refreshed panel and out-of-band notice included — while
+	// every existence assertion still passes. Assert resolution, not presence.
+	for _, target := range []string{`hx-target="#approvals-panel"`} {
+		if !strings.Contains(page, target) {
+			t.Errorf("panel forms do not %s — their target id must exist in the panel markup", target)
+		}
+	}
+	if id := `id="approvals-panel"`; !strings.Contains(page, id) {
+		t.Errorf("panel fragment missing %s — the forms' target would not resolve", id)
+	}
+}
+
+// The action response (approve/deny) is noticeoob + panel: its panel root id
+// must be the id the forms target, or the click's swap has nothing to replace
+// even though the decision landed server-side.
+func TestUIApprovalsActionResponseTargetsTheFormTarget(t *testing.T) {
+	s, st, p := newUITestServer(t)
+	id, err := st.CreateCommandApproval("org1-m1", "docker system prune -af", "docker system prune -af", "exec:*", "console")
+	if err != nil {
+		t.Fatalf("seed pending approval: %v", err)
+	}
+	session, csrf := uiSignIn(t, s, p)
+	h := s.Routes()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/ui/approve", strings.NewReader("id="+fmt.Sprint(id)+"&csrf="+csrf))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("HX-Request", "true")
+	req.AddCookie(session)
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/ui/approve returned %d", rec.Code)
+	}
+	body := rec.Body.String()
+	// The response must carry a swap target the form's hx-target can resolve,
+	// plus the out-of-band notice.
+	if !strings.Contains(body, `id="approvals-panel"`) {
+		t.Error("action response does not carry the panel root the forms target")
+	}
+	// The notice travels out of band (hx-swap-oob into #ui-notice); its text
+	// comes from uiNotices, so assert on the rendered sentence, not a code.
+	if !strings.Contains(body, `hx-swap-oob="innerHTML:#ui-notice"`) || !strings.Contains(body, "granted") {
+		t.Errorf("action response missing the out-of-band approval notice: %q", body[:min(len(body), 200)])
+	}
+}
+
 func TestUIRequiresSession(t *testing.T) {
 	s, _, _ := newUITestServer(t)
 	h := s.Routes()

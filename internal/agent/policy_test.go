@@ -113,13 +113,13 @@ func TestFleetRulesCannotWeakenLocalRules(t *testing.T) {
 		fleetRules.install("", "")
 	})
 
-	if reason := checkCommand("echo local-marker", nil); reason == "" {
+	if reason := checkCommand(protocol.ExecCommand{Command: "echo local-marker"}); reason == "" {
 		t.Fatal("an empty fleet ruleset displaced the machine's own rules")
 	}
 	// And a fleet ruleset that allows everything leaves the local deny in force.
 	fleetRules.install("allowonly\nallow:echo\n", policy.Fingerprint("allowonly\nallow:echo\n"))
 	fleetRules.install("", "")
-	if reason := checkCommand("echo local-marker", nil); reason == "" {
+	if reason := checkCommand(protocol.ExecCommand{Command: "echo local-marker"}); reason == "" {
 		t.Error("the local rule stopped applying")
 	}
 }
@@ -129,14 +129,48 @@ func TestFleetRulesCannotWeakenLocalRules(t *testing.T) {
 func TestClearedFleetRulesAreNotEnforced(t *testing.T) {
 	globalPolicy.install("")
 	fleetRules.install("deny:fleet-marker\n", policy.Fingerprint("deny:fleet-marker\n"))
-	if reason := checkCommand("echo fleet-marker", nil); reason == "" {
+	if reason := checkCommand(protocol.ExecCommand{Command: "echo fleet-marker"}); reason == "" {
 		t.Fatal("fleet rules were not applied")
 	}
 	fleetRules.install("", policy.Fingerprint(""))
-	if reason := checkCommand("echo fleet-marker", nil); reason != "" {
+	if reason := checkCommand(protocol.ExecCommand{Command: "echo fleet-marker"}); reason != "" {
 		t.Errorf("withdrawn fleet rule still refuses: %q", reason)
 	}
 	t.Cleanup(func() { fleetRules.install("", "") })
+}
+
+// An approved exception stands down only the mirrored fleet layer, and never
+// the machine's own rules: the control plane dispatches the approved command
+// with FleetApproved, and the mirror is the ruleset the approval exempted it
+// from. A local deny refuses an approved command exactly as it refuses any
+// other — nothing upstream can override the machine owner's rules.
+func TestFleetApprovedStandsDownOnlyTheMirror(t *testing.T) {
+	globalPolicy.install("deny:local-approval-marker\n")
+	fleetRules.install("deny:fleet-approval-marker\n", policy.Fingerprint("deny:fleet-approval-marker\n"))
+	t.Cleanup(func() {
+		globalPolicy.install("")
+		fleetRules.install("", "")
+	})
+
+	// The approved command passes the mirror.
+	if reason := checkCommand(protocol.ExecCommand{
+		Command: "echo fleet-approval-marker", FleetApproved: true,
+	}); reason != "" {
+		t.Fatalf("an approved command was still refused by the mirror: %q", reason)
+	}
+	// The machine's own rule refuses it even approved.
+	if reason := checkCommand(protocol.ExecCommand{
+		Command: "echo local-approval-marker", FleetApproved: true,
+	}); reason == "" {
+		t.Fatal("FleetApproved overrode the machine's own rules")
+	}
+	// And the flag without the approval context refuses nothing extra on an
+	// unblocked command — it is an exemption, not a new denial.
+	if reason := checkCommand(protocol.ExecCommand{
+		Command: "echo anything-else", FleetApproved: true,
+	}); reason != "" {
+		t.Errorf("an unrelated command was refused: %q", reason)
+	}
 }
 
 // The mirror is only trusted when it is self-consistent: a frame whose version
@@ -161,7 +195,7 @@ func TestPolicyFrameRejectsAMismatchedVersion(t *testing.T) {
 		t.Errorf("ack = %+v, want it to report the failure and claim no version", ack)
 	}
 	// Nothing was installed.
-	if reason := checkCommand("echo x", nil); reason != "" {
+	if reason := checkCommand(protocol.ExecCommand{Command: "echo x"}); reason != "" {
 		t.Errorf("a rejected frame changed the rules in force: %q", reason)
 	}
 
@@ -178,7 +212,7 @@ func TestPolicyFrameRejectsAMismatchedVersion(t *testing.T) {
 	if okAck.Version != policy.Fingerprint("deny:x\n") || okAck.Error != "" {
 		t.Errorf("ack = %+v, want the version now in force", okAck)
 	}
-	if reason := checkCommand("echo x", nil); reason == "" {
+	if reason := checkCommand(protocol.ExecCommand{Command: "echo x"}); reason == "" {
 		t.Error("the installed ruleset is not being enforced")
 	}
 	t.Cleanup(func() { fleetRules.install("", "") })
@@ -203,7 +237,7 @@ func TestPolicyFrameRejectsAnOversizeRuleset(t *testing.T) {
 	if !strings.Contains(ack.Error, "too large") {
 		t.Errorf("ack = %+v, want it to refuse the size", ack)
 	}
-	if reason := checkCommand("echo aaaa", nil); reason != "" {
+	if reason := checkCommand(protocol.ExecCommand{Command: "echo aaaa"}); reason != "" {
 		t.Errorf("an oversize frame changed the rules in force: %q", reason)
 	}
 }

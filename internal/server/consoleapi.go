@@ -214,12 +214,25 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 	// whole reason the mirror exists, and why a refusal on this path is audited
 	// as the sealed placeholder with exit 126 — the control plane can see that
 	// something was refused, but not which rule did it.
+	// fleetApproved rides the dispatch: an approved command reaches the agent
+	// with FleetApproved, so the mirrored copy of the same ruleset on the
+	// machine stands down for this one command (never for the machine's own
+	// policy). Sealed requests never set it — there is no plaintext there to
+	// judge or to approve; the mirror handles them on the machine.
+	fleetApproved := false
 	if req.Sealed == "" {
 		if reason := s.execPolicyCheck(req.Command, req.Argv); reason != "" {
-			s.auditExec(&pendingExec{machine: req.Machine, command: display, source: "console:" + keyName},
-				execRefused, "", reason)
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "blocked by the server's global exec policy: " + reason})
-			return
+			// The refusal is not final: an operator may approve this exact
+			// command (internal/server/approvals.go). The gate records or joins
+			// a pending approval, audits the attempt, and answers the caller —
+			// 202 with the approval id on the first ask, a plain refusal when
+			// nobody approves in time, or fall-through when an approved record
+			// covers this command.
+			var dispatch bool
+			dispatch, fleetApproved = s.execPolicyGate(w, &req, display, keyName, reason)
+			if !dispatch {
+				return
+			}
 		}
 	}
 	// The operator's soft block, checked after authorization and before anything
@@ -289,7 +302,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 			Timeout:   req.Timeout,
 		})
 	} else {
-		cmdPayload, _ = json.Marshal(protocol.ExecCommand{Command: req.Command, Argv: req.Argv, Timeout: req.Timeout})
+		cmdPayload, _ = json.Marshal(protocol.ExecCommand{Command: req.Command, Argv: req.Argv, Timeout: req.Timeout, FleetApproved: fleetApproved})
 	}
 	if err := ac.Conn.WriteEnvelope(protocol.Envelope{Type: "exec", ReqID: reqID, Payload: cmdPayload}); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent connection lost"})

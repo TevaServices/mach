@@ -456,6 +456,7 @@ func (s *Server) handleSelfRetire(name string) {
 		s.logf("agent %q self-retire failed: %v", name, err)
 		return
 	}
+	s.clearSessionApprovals(name)
 	s.logf("machine %q retired itself (temporary session ended)", name)
 }
 

@@ -128,6 +128,9 @@ func (s *Server) revokeMachine(name string, purgeAudit bool) error {
 	if n := s.killStreamsForMachine(name, "machine revoked by the operator"); n > 0 {
 		s.logf("machine revoked: %q, ended %d live console session(s)", name, n)
 	}
+	// A session-scoped command approval must not outlive the enrollment it was
+	// granted on — and a revoked machine is the end of one.
+	s.clearSessionApprovals(name)
 	if purgeAudit {
 		return s.st.RemoveMachineAudit(name)
 	}
@@ -166,6 +169,7 @@ func (s *Server) deleteMachine(name string) error {
 	if n := s.killStreamsForMachine(name, "machine deleted by the operator"); n > 0 {
 		s.logf("machine deleted: %q, ended %d live console session(s)", name, n)
 	}
+	s.clearSessionApprovals(name)
 	return nil
 }
 
@@ -187,6 +191,10 @@ func (s *Server) blockMachine(name string, blocked bool) error {
 		if n := s.killStreamsForMachine(name, "machine blocked by the operator"); n > 0 {
 			s.logf("machine blocked: %q, ended %d live console session(s)", name, n)
 		}
+		// Defense in depth: a block is a hard stop on its own (invariant 19),
+		// so a session approval behind it can never be spent while blocked —
+		// clearing it here keeps that true on the unblock path too.
+		s.clearSessionApprovals(name)
 		return nil
 	}
 	// An update held while the machine was blocked is delivered now rather than

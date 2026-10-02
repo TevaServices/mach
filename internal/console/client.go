@@ -180,12 +180,23 @@ func (c *client) do(method, path string, body any, out any) error {
 		// error; say what actually happened.
 		return fmt.Errorf("server response exceeded %d MiB", maxResp>>20)
 	}
-	if resp.StatusCode >= 300 {
+	// 202 is an error to this client even though the wire call succeeded:
+	// the server is the only caller that sends it, and it means "held, not
+	// done" — a pending approval the operator must decide (there is no
+	// ExecResult to parse). A body silently parsed into a zero-value result
+	// would print nothing and exit 0, reporting a refused command as a
+	// successful one.
+	if resp.StatusCode >= 300 || resp.StatusCode == http.StatusAccepted {
 		var e struct {
-			Error string `json:"error"`
+			Error  string `json:"error"`
+			Status string `json:"status"`
+			Reason string `json:"reason"`
 		}
 		_ = json.Unmarshal(data, &e)
 		msg := e.Error
+		if msg == "" && e.Status == "pending_approval" {
+			msg = "pending approval: " + e.Reason
+		}
 		if msg == "" {
 			msg = fmt.Sprintf("server returned %d", resp.StatusCode)
 		}
@@ -327,6 +338,20 @@ func (c *client) runExec(machine, command string, argv []string, timeout int, as
 	// Plaintext: what the server can read, refuse, and record in full.
 	var res protocol.ExecResult
 	if err := c.do("POST", "/v1/exec", buildBody(), &res); err != nil {
+		// A fleet-policy refusal is not always final: the control plane answers
+		// 202 with a pending approval an operator can grant (or has granted
+		// since — a concurrent retry that already dispatched would be a race
+		// this client cannot see, so it never assumes). Say what is pending
+		// rather than reporting a bare refusal.
+		var api *apiError
+		if errors.As(err, &api) && api.Status == http.StatusAccepted {
+			// The 202 rides the apiError's message, not a body this client
+			// parsed. Say what it means: a pending approval exists, and that is
+			// the path an operator uses to allow this exact command.
+			fmt.Fprintln(os.Stderr, "mach: "+err.Error())
+			fmt.Fprintln(os.Stderr, "mach: a pending approval was recorded — an operator can approve this exact command from the web UI's approvals panel")
+			return 3
+		}
 		fmt.Fprintln(os.Stderr, "mach: "+err.Error())
 		return 3
 	}

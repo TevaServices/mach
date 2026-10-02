@@ -176,11 +176,27 @@ func (f *fleetPolicy) Version() string {
 // checkCommand is the single guardrail evaluation every exec path goes through
 // — one-shot and streamed, sealed and plaintext. Two rule sets, both enforced,
 // in a fixed order so the machine's own rules always get the first word.
-func checkCommand(command string, argv []string) string {
-	if reason := globalPolicy.Evaluate(command, argv); reason != "" {
+// checkCommand judges a command against the agent's own guardrail and the
+// mirrored fleet rules. cmd.FleetApproved is honored only for the fleet layer:
+// the control plane dispatches an approved exception with it set, and the
+// mirrored copy of the same ruleset stands down for this one command — never
+// for the machine's own policy, which no upstream can override. A forged flag
+// from the machine's own shell cannot appear here: the field arrives on the
+// wire from the control plane, on a connection the agent pinned at enrollment,
+// and the agent's own dispatch of a plain command never sets it.
+func checkCommand(cmd protocol.ExecCommand) string {
+	if cmd.FleetApproved {
+		// Only the machine's own rules still judge it. The mirrored set is the
+		// one the approval exempted this command from.
+		if reason := globalPolicy.Evaluate(cmd.Command, cmd.Argv); reason != "" {
+			return reason
+		}
+		return ""
+	}
+	if reason := globalPolicy.Evaluate(cmd.Command, cmd.Argv); reason != "" {
 		return reason
 	}
-	if reason := fleetRules.Evaluate(command, argv); reason != "" {
+	if reason := fleetRules.Evaluate(cmd.Command, cmd.Argv); reason != "" {
 		// Name the layer: the operator who wrote the fleet rule and the one who
 		// wrote the local rule may be different people, and a refusal that does
 		// not say which rule refused it sends them to the wrong place.

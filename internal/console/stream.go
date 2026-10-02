@@ -154,6 +154,17 @@ func streamConsole(server, apiKey, machine, command string) int {
 			} else {
 				os.Stdout.Write(safeForTerminal(b, os.Stdout))
 			}
+		case "approval_needed":
+			// A fleet-refused streamed command: the relay recorded a pending
+			// approval and dispatched nothing. The terminal record below carries
+			// ExitApprovalPending, a status a script can tell apart from a plain
+			// refusal; here the frame names the id and the reason so a human (or
+			// an operator script) knows what to act on.
+			var needed protocol.StreamApprovalNeeded
+			if json.Unmarshal(env.Payload, &needed) != nil {
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "mach: a pending approval was recorded (id %d) — an operator can approve this exact command from the web UI's approvals panel\n", needed.ApprovalID)
 		case "stream_end":
 			var end protocol.StreamEnd
 			if json.Unmarshal(env.Payload, &end) != nil {

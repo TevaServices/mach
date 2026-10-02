@@ -263,6 +263,15 @@ const fleetSource = `{{define "fleet"}}
 {{template "fleettable" .}}
 <div id="confirm"></div>
 </div>
+{{/* The approvals panel is not rendered from THIS template: the fleet page's
+     dot is fleetData and the panel reads approvalsData, and threading the
+     page's data through would 500 the whole page the moment the two structs
+     drifted. Instead the slot below bootstraps the panel's own five-second
+     poll: htmx fetches /ui/approvals into it, and the fragment that returns
+     (the approvals define) re-establishes the poll on itself, so the loop
+     sustains across swaps. The page render carries no approval data — the
+     first poll arrives within five seconds, before a decision is realistic. */}}
+<div id="approvals-panel" hx-get="/ui/approvals" hx-trigger="every 5s" hx-target="#approvals-panel" hx-swap="outerHTML" aria-label="Pending command approvals"></div>
 {{end}}`
 
 // deleteConfirmSource renders the typed-name confirmation into #confirm. It sits
@@ -359,6 +368,58 @@ const deleteConfirmPageSource = `{{define "deleteconfirmpage"}}
 // the shell, and a live region has to be in the DOM before its content changes
 // for the change to be announced. Putting the role on the swapped-in node would
 // create the region and fill it in the same breath, which announces nothing.
+// approvalsSource is the pending-approvals panel on the fleet page. It sits
+// OUTSIDE the polled #fleet container (see fleetSource): the panel polls on its
+// own five-second tick into its own slot, so a table tick can never throw away
+// an approval decision mid-click, and an approval never fights the table's
+// polling for the same element.
+//
+// Approve posts to /ui/approve with the row's id; Deny the same. Both re-render
+// through approvalsaction, whose response replaces the whole panel and carries
+// the notice out of band — the same shape every other fleet action uses.
+const approvalsSource = `{{define "approvals"}}
+<div id="approvals-panel" hx-get="/ui/approvals" hx-trigger="every 5s" hx-target="#approvals-panel" hx-swap="outerHTML">
+<div class="table-scroll" role="region" aria-label="Pending command approvals" tabindex="0">
+{{if not .Approvals}}
+  <p class="muted">No commands are waiting for approval.</p>
+{{else}}
+  <table>
+  <caption class="sr-only">Commands the fleet-wide policy refused, waiting for a decision</caption>
+  <thead><tr>
+    <th scope="col">Machine</th><th scope="col">Command</th><th scope="col">Requested</th><th scope="col">Actions</th>
+  </tr></thead>
+  <tbody>
+  {{range .Approvals}}
+    <tr>
+      <td><code>{{.Machine}}</code></td>
+      <td><code>{{.Command}}</code></td>
+      <td class="muted">{{.CreatedAt}}</td>
+      <td>
+        <div class="row-actions">
+        <form class="inline" method="post" action="/ui/approve" hx-post="/ui/approve" hx-target="#approvals-panel" hx-swap="outerHTML">
+          <input type="hidden" name="id" value="{{.ID}}">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <button type="submit">Approve once</button>
+        </form>
+        <form class="inline" method="post" action="/ui/deny" hx-post="/ui/deny" hx-target="#approvals-panel" hx-swap="outerHTML">
+          <input type="hidden" name="id" value="{{.ID}}">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <button type="submit" class="danger">Deny</button>
+        </form>
+        </div>
+      </td>
+    </tr>
+  {{end}}
+  </tbody></table>
+{{end}}
+  </div>
+</div>
+{{end}}`
+
+// approvalsActionSource is the response to an approve/deny: the refreshed
+// panel plus the notice, out of band — the same shape as fleetaction.
+const approvalsActionSource = `{{define "approvalsaction"}}{{template "noticeoob" .}}{{template "approvals" .}}{{end}}`
+
 const uiErrorSource = `{{define "uierror"}}<p class="error">{{.Msg}}</p>{{end}}`
 
 // uiErrorPageSource is the same refusal as a page body, for a caller that cannot
@@ -580,6 +641,7 @@ persists check the control plane's log for the discovery error.</p>
 // from the template that includes it.
 var uiTmpl = template.Must(template.New("ui").Parse(
 	fleetInnerSource + fleetSource + fleetActionSource + deleteConfirmSource + deleteConfirmPageSource + confirmClearedSource +
+		approvalsSource + approvalsActionSource +
 		orgsSource + orgsActionSource + orgE2ESource + orgE2EActionSource +
 		memberSource + loginFailedSource + uiErrorSource + uiErrorPageSource + noticeOOBSource))
 
