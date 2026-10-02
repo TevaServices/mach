@@ -30,6 +30,11 @@ import (
 // differently by the two engines.
 var ErrOrgExists = errors.New("org already exists")
 
+// ErrUnknownAPIKey is returned by RevokeAPIKey when the named key does not
+// exist. Revoking is a security action an operator types by name: a typo must
+// be an error, never a printed success with nothing changed.
+var ErrUnknownAPIKey = errors.New("unknown API key")
+
 type Store struct {
 	db    *sql.DB
 	known string // "sqlite" or "postgres" — feature gating is driver-neutral
@@ -735,6 +740,36 @@ func (s *Store) ListAPIKeys() ([]APIKeyInfo, error) {
 		out = append(out, k)
 	}
 	return out, rows.Err()
+}
+
+// RevokeAPIKey sets revoked=1 on the named key, leaving the row in place:
+// revocation is a tombstone (that the key existed, and that it was deliberately
+// retired, is part of the record), while the auth lookup — the gate every
+// bearer-key request passes — stops resolving it.
+//
+// The returned error is ErrUnknownAPIKey when the name does not exist: like
+// RevokeMachine, an unknown name is an error rather than a printed success.
+// Revoking an already-revoked key succeeds — the command asks for an end state,
+// and that is the end state. RowsAffected is driver-neutral across SQLite and
+// Postgres; the query fallback exists only for a driver without it.
+func (s *Store) RevokeAPIKey(name string) (ok bool, err error) {
+	name = strings.TrimSpace(name)
+	res, err := s.exec(`UPDATE api_keys SET revoked=1 WHERE name=?`, name)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		var exists int
+		if e := s.queryRow(`SELECT COUNT(*) FROM api_keys WHERE name=?`, name).Scan(&exists); e != nil || exists == 0 {
+			return false, fmt.Errorf("%w: %q", ErrUnknownAPIKey, name)
+		}
+		return true, nil
+	}
+	if n == 0 {
+		return false, fmt.Errorf("%w: %q", ErrUnknownAPIKey, name)
+	}
+	return true, nil
 }
 
 // ---- orgs ----

@@ -42,6 +42,16 @@ func main() {
 		}
 		fmt.Printf("api key created: name=%q scopes=%q\n", storedName, storedScopes)
 		fmt.Printf("KEY (shown once, store it now): %s\n", key)
+	case "revoke-api-key":
+		// mach-server revoke-api-key <name>
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: mach-server revoke-api-key <name>")
+			os.Exit(2)
+		}
+		if err := controlplane.RevokeAPIKey(args[1]); err != nil {
+			fmt.Fprintln(os.Stderr, "mach-server: "+err.Error())
+			os.Exit(1)
+		}
 	case "e2e":
 		// mach-server e2e [on|off|inherit] [--org ORG] — whether this control
 		// plane accepts sealed (E2E) exec commands, per org. Reports the
@@ -162,6 +172,8 @@ func usage() {
                                                  are told which it is and obey or refuse to run.
   mach-server add-api-key <name> <scopes>        create a key: enroll | readonly | exec:* | exec:m1|m2
                                                  (secret generated server-side, printed once)
+  mach-server revoke-api-key <name>              revoke a key: it stops authenticating (row is kept;
+                                                 an unknown name errors out)
   mach-server revoke-machine <name> [--purge-audit]
                                                  revoke a machine; its agent self-retires
   mach-server delete-machine <name> [--purge-audit]
