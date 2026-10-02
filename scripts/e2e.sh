@@ -156,6 +156,23 @@ mkdir -p "$CONSOLE_DIR"
 printf '{"server": "%s", "api_key": "%s"}\n' "$BASE" "$CONSOLE_KEY" > "$CONSOLE_DIR/console.json"
 ok "console.json written"
 
+step "api-key revocation (admin)"
+# A revoked key stops authenticating THE MOMENT it is revoked: the auth lookup
+# is the gate every bearer-key request passes, and nothing may keep serving a
+# retirement on the strength of an in-memory cache. The row stays — revocation
+# is a tombstone, not a delete — and the list says so.
+REVOKED_KEY=$(MACH_DB="$DB" "$WORKDIR/mach-server" add-api-key doomed exec:"$ORG-test-01" | grep -oE 'mach_[a-f0-9]+')
+[[ -n "$REVOKED_KEY" ]]; check "doomed key created" $?
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/machines" -H "Authorization: Bearer $REVOKED_KEY")
+[[ "$CODE" == "200" ]]; check "doomed key works before revocation" $?
+MACH_DB="$DB" "$WORKDIR/mach-server" revoke-api-key doomed >/dev/null 2>&1
+check "revoke-api-key accepts the name" $?
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/machines" -H "Authorization: Bearer $REVOKED_KEY")
+[[ "$CODE" != "200" ]]; check "revoked key no longer authenticates" $?
+CODE=0
+MACH_DB="$DB" "$WORKDIR/mach-server" revoke-api-key never-existed >/dev/null 2>&1 || CODE=$?
+[[ "$CODE" -ne 0 ]]; check "revoking an unknown name errors" $?
+
 step "api-key enrollment (org-prefixed)"
 MACH_STATE_DIR="$WORKDIR/agent1" "$WORKDIR/mach" register \
   --server "$BASE" --api-key "$ENROLL_KEY" --name "$ORG-test-01" >/dev/null 2>&1
