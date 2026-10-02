@@ -188,7 +188,34 @@ func AddAPIKey(name, scopes string) (key, storedName, storedScopes string, err e
 	return key, storedName, scopes, nil
 }
 
-// E2E reports or changes the control plane's end-to-end-encryption setting:
+// RevokeAPIKey marks a stored API key revoked so it stops authenticating.
+//
+// An unknown name is an error rather than a silent success — the same rule
+// RevokeMachine states: revoking is a security action typed by name, and a
+// typo that prints "revoked" and exits 0 leaves the operator reporting a
+// retirement that never happened. Revoking an already-revoked key is a
+// success: the command asks for an end state, and that is the end state.
+func RevokeAPIKey(name string) error {
+	// Fold here, not in the store: add-api-key stores the lowercased name
+	// (AddAPIKey's doc), so the revoke side must match what was stored.
+	name = strings.ToLower(strings.TrimSpace(name))
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	ok, err := st.RevokeAPIKey(name)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("unknown API key %q", name)
+	}
+	fmt.Printf("api key %q revoked (it stops authenticating immediately; the row is kept)\n", name)
+	return nil
+}
+
+// E2E reports or changes the control plane'slane's end-to-end-encryption setting:
 // whether it accepts sealed (E2E) exec commands, per org.
 //
 //	set is "" (report only), "on", "off", or "inherit" (drop an org's override
