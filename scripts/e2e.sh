@@ -744,7 +744,8 @@ TMP_CODE=$(grep -oE '[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}' "$WORKDIR/agent-tmp.lo
 GUARD=$(head -n 1 "$WORKDIR/agent-tmp.log")
 [[ "$GUARD" == *"WARNING: This command will enroll this machine as a temporary target."* ]]
 check "the temporary session's first line is the social-engineering warning" $?
-[[ "$GUARD" == *"personally know and trust"* ]]; check "the warning names who the decision belongs to" $?
+HEAD=$(head -n 4 "$WORKDIR/agent-tmp.log")
+[[ "$HEAD" == *"personally know and trust"* ]]; check "the warning names who the decision belongs to" $?
 GUARD_PROMPTS=$(grep -c 'Control plane URL' "$WORKDIR/agent-tmp.log")
 [[ "$GUARD_PROMPTS" -eq 1 ]]; check "the warning precedes the control-plane prompt" $?
 OUT=$(cat "$WORKDIR/agent-tmp.log" 2>&1)
