@@ -64,4 +64,26 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
-      - run: mise run e2e
+      - run: |
+          set -o pipefail
+          mise run e2e | tee /tmp/e2e.log
+      # The Testing rule makes AGENTS.md's count line load-bearing ("Green =
+      # N checks", updated by every PR that adds or removes checks) — so it
+      # is asserted against the suite's own result here, not left to the
+      # reviewer's round-1 pass. Observed twice that unguarded number
+      # costing a review round (and, when two PRs in flight each bumped it,
+      # a CONFLICTING merge): a red job now, catchable before handoff.
+      - name: AGENTS.md count matches the suite
+        run: |
+          n=$(grep -oE 'e2e: [0-9]+ passed' /tmp/e2e.log | grep -oE '[0-9]+' | tail -1)
+          declared=$(grep -cE 'Green = [0-9]+ checks' AGENTS.md)
+          if [ "$declared" -ne 1 ]; then
+            echo "::error::AGENTS.md must carry exactly one 'Green = N checks' line (found $declared), and the Testing rule's update note must not embed a number"
+            exit 1
+          fi
+          want=$(grep -oE 'Green = [0-9]+ checks' AGENTS.md | grep -oE '[0-9]+')
+          if [ "$n" != "$want" ]; then
+            echo "::error::count drift: e2e ran $n checks, AGENTS.md says Green = $want checks. Update AGENTS.md in the same commit that added/removed checks."
+            exit 1
+          fi
+          echo "count ok: $n == AGENTS.md"

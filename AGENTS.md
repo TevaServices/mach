@@ -665,6 +665,12 @@ rule that would have prevented it.
   they ran is the suite this file describes. The printed total counts more
   than the literal `check` lines (a few assertions go through `ok` inside
   loops), so run the suite and quote the summary line rather than counting.
+  CI's e2e job asserts the declared number against the suite's own result, so
+  a stale count is a red job at handoff rather than a reviewer finding —
+  observed twice (a one-line fix round each, and a CONFLICTING merge when two
+  in-flight PRs both bumped the line). That conflict resolves as MAIN's count
+  plus your delta: main already holds the other PR's bump, and re-deriving the
+  total from your own branch's history double-counts it.
 - **`internal/console` tests touch the state dir.** Anything that execs resolves
   `MACH_STATE_DIR`, else `$HOME/.mach`. A client test that seals without
   `t.Setenv("MACH_STATE_DIR", t.TempDir())` writes real pin files into the
