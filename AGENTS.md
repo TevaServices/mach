@@ -49,6 +49,14 @@ This is `mach`: remote CLI access to registered machines, outbound-only
   unreachable symbol, and silently nothing if the symbol path is misspelled, so
   `scripts/e2e.sh` asserts a stamp actually took.
 
+- **Every commit carries a DCO `Signed-off-by:` trailer** matching its
+  author or committer — one flag, `git commit -s`. CI's `dco` job rejects
+  each commit that lacks the trailer, independently of lint/test/e2e, and
+  it is the one gate a local `mise run` never exercises, so a green suite
+  is not evidence of it. The full contract, and how to fix commits that
+  were already made: `CONTRIBUTING.md → Sign your work (DCO)`. Read that
+  section before your first commit, not after a red check.
+
 ## Security invariants (do not regress)
 
 1. Agents are **outbound-only**: never add an inbound listener to the agent.
