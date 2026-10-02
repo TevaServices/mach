@@ -460,7 +460,7 @@ to run it, and for why the driver difference matters.
   same row), an operator grants it through the admin API, the approved command
   runs once (the mirror on the machine stands down for exactly that dispatch,
   never for the machine's own rules), and the spent grant stays in the record.
-  Green = 206 checks.
+  Green = 213 checks.
 - Timing-sensitive e2e checks (streaming) use a real sleep and a real
   background process; if one flakes, make the sleep longer rather than
   weakening the assertion.
