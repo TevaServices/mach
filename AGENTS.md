@@ -638,6 +638,12 @@ rule that would have prevented it.
   The suite no longer leaves this to the reader: both servers are checked after
   startup, and a run whose own control plane did not bind stops with a FATAL
   naming the port instead of reporting failures about somebody else's database.
+  And the collision itself is avoided first: when a DEFAULT port (8099/8098/8097)
+  is already bound, the run shifts to the next free port — one probe picks all
+  three, so the run's own servers never collide — and prints the triple it is
+  using (`MACH_TEST_{PORT,UI_PORT,IDP_PORT}` overrides remain verbatim). The
+  probes bind-and-close, so a process landing on a picked port first is still
+  exactly what the FATAL guards are for.
   Reproduced deliberately to be sure of the diagnosis — with a stale server on
   8099 the suite reported 77 failures, every one of them about the other database.
   The check is two conditions because either alone is fooled: the process must
