@@ -1,32 +1,74 @@
 # Release pipeline for mach.
 #
-# Trigger: push a tag named v* (e.g. `git tag v0.3.0 && git push origin v0.3.0`).
+# Trigger: push a tag named v* (e.g. `git tag v0.6.6 && git push origin v0.6.6`).
 #
-# What it publishes, on the GitHub release for that tag:
-#   - the mach client (agent + console) for linux/darwin/windows on amd64/arm64
+# GoReleaser is the build+package engine for the CLIENT (cmd/mach): the six
+# platform binaries, the zip archives, the Linux packages (.deb/.rpm/.apk via
+# the bundled nfpm; three nfpms entries — apk ships OpenRC, see
+# .goreleaser.yaml). It runs with --skip=publish: the GitHub release itself
+# stays in this workflow so its body can carry the GHCR image digests, and so
+# the attestation bundle is assembled and verified BEFORE anything uploads.
+#
+# What is published, on the GitHub release for that tag:
+#   - mach client zips (linux/darwin/windows, amd64/arm64) + checksums.txt
+#   - the Linux packages: .deb, .rpm, .apk
 #   - mach-attestations.intoto.jsonl — one in-toto attestation bundle, a DSSE
 #     envelope per line (one per binary). Each statement carries its binary's
-#     sha256, so the bundle is the release's signed integrity record; before it
-#     is assembled, every envelope is checked against the binary it names.
-#     Envelopes are made with `mach-server attest` and re-verified per matrix
-#     leg — a build from a dirty tree or with no VCS revision fails the release.
+#     sha256, so the bundle is the release's signed integrity record.
+#     Envelopes are produced per goreleaser BUILD TARGET by the post hook
+#     (packaging/goreleaser/attest-hook.sh), which runs mach-server attest on
+#     the exact bytes just built and FAILS the release if verify-attestation
+#     reports a WARNING (dirty tree / missing VCS revision). The publish job
+#     re-verifies every envelope against the artifact set before uploading.
+#   - mach-x64.msi / mach-arm64.msi — Windows installers built from the SAME
+#     goreleaser-attested windows binaries (downloaded, not rebuilt),
+#     registering the `machd` Task Scheduler job. The MSIs themselves are not
+#     attested this round; the winget manifest pins InstallerSha256 (see
+#     packaging/winget/README.md).
 #   - the signing key's public half (hex ed25519) in the release notes
 # and to GHCR: multi-arch (linux/amd64 + linux/arm64) mach-server and
 # mach-agent containers.
 #
-# Signing: attestations are signed with an ed25519 key supplied through the
-# MACH_RELEASE_SIGNING_KEY secret (hex-encoded private key; generate one with
-# scripts/gen-release-key.sh). Without that secret the release FAILS rather
-# than shipping unattested binaries — the same rule the server applies to an
-# unreadable policy file: refusing to start is better than starting silently
-# unguarded. The key is a release/audit control; a live control plane
-# re-attests with its own identity key (see the Dockerfile footer).
+# After the release: linux-repo-sync regenerates the apt/rpm/apk repository
+# metadata from the release's packages and deploys them to GitHub Pages (#45;
+# brew-bump renders the tap formula from checksums.txt and pushes it to
+# TevaServices/homebrew-mach (#42); brew-smoke installs from the tap on a
+# macOS runner and exercises the service lifecycle (#42 validation).
+#
+# Unsigned this round (deliberate, documented on PR #46): no GPG key exists
+# for the Linux repos (consumers use [trusted=yes] / gpgcheck=0 /
+# --allow-untrusted — scripts/repo-sync.sh documents the three signing steps
+# to add when a key lands) and no Authenticode cert for the MSIs. Adding the
+# secrets later is additive: sign the Release/repomd/APKINDEX in repo-sync,
+# sign the MSI in the msi job — no layout changes.
+#
+# Attestation signing (unchanged): the ed25519 key comes from
+# MACH_RELEASE_SIGNING_KEY (hex; generate with scripts/gen-release-key.sh —
+# MACH_SERVER_KEY must name the FILE the hook loads, never the hex value).
+# Without the secret the release FAILS rather than shipping unattested
+# binaries — the same rule the server applies to an unreadable policy file:
+# refusing to start is better than starting silently unguarded. The
+# goreleaser post hook enforces it per binary.
 #
 # VCS stamping matters here: Go embeds the revision and dirty flag in each
 # binary, `mach-server attest` reads it back, and push-update --attestation
 # refuses a modified-tree build. Actions/checkout leaves a clean tree, and
 # .git must reach the Docker build (the Dockerfile explains why there is no
-# .dockerignore excluding it).
+# .dockerignore excluding it); the goreleaser post hook re-checks per binary.
+#
+# Enabling the tap (#42) — needs the repo owner, once:
+#   1. create TevaServices/homebrew-mach (public; a Formula/ layout will be
+#      created for you on the first bump)
+#   2. add secret GORELEASER_GH_TOKEN: a fine-grained PAT with
+#      content:write on that repo (GITHUB_TOKEN is scoped to THIS repo and
+#      cannot push to another)
+#   3. done — brew-bump auto-detects and starts publishing formulas.
+# Pages (#45): enable once via Settings→Pages→"Deploy from a branch"→
+# dist.mach.teva.services (root); linux-repo-sync deploys the repo tree there.
+# NOTE: shell steps avoid heredocs on purpose — a heredoc delimiter cannot
+# sit at a non-zero indent inside a run block, and an unterminated one
+# swallows the rest of the step (observed on the pre-goreleaser pipeline's
+# release body).
 name: release
 
 on:
@@ -37,6 +79,14 @@ on:
 permissions:
   contents: write
   packages: write
+  pages: write # linux-repo-sync -> actions/deploy-pages (Pages source=workflow)
+  id-token: write # deploy-pages OIDC
+
+env:
+  # Pinned toolchain: .goreleaser.yaml is validated against THIS version, so
+  # an upstream deprecation/behavior change lands as a planned bump (mise run
+  # pack locally first), never as a surprise at tag time.
+  GORELEASER_VERSION: v2.18.2
 
 jobs:
   # Gate: the tagged commit must pass lint and the unit tests. CI covers
@@ -50,41 +100,19 @@ jobs:
       - run: mise run lint
       - run: mise run test
 
-  binaries:
-    name: client ${{ matrix.goos }}-${{ matrix.goarch }}
+  # Build, attest, package — goreleaser with publishing disabled. Dist is
+  # staged with its per-target DIRECTORY STRUCTURE intact: the publish job's
+  # verify loop maps every envelope to the binary next to it, and the MSI
+  # job takes the staged windows exe from its target dir.
+  goreleaser:
+    name: client binaries + linux packages (goreleaser)
     runs-on: ubuntu-latest
     needs: gate
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - {goos: linux,   goarch: amd64}
-          - {goos: linux,   goarch: arm64}
-          - {goos: darwin,  goarch: amd64}
-          - {goos: darwin,  goarch: arm64}
-          - {goos: windows, goarch: amd64, ext: ".exe"}
-          - {goos: windows, goarch: arm64, ext: ".exe"}
-    env:
-      CGO_ENABLED: "0"
-      MACH_SERVER_KEY: "signing.key"
     steps:
       - uses: actions/checkout@v7
-
+        with:
+          fetch-depth: 0
       - uses: jdx/mise-action@v4
-
-      - name: Build
-        run: |
-          mkdir -p dist
-          # The tag is the only version source in this workflow: this same VER
-          # stamps the binary and is handed to `attest` below, so the artifact
-          # and the attestation that describes it cannot disagree.
-          VER="${GITHUB_REF_NAME#v}"
-          LDFLAGS="-s -w -X github.com/TevaServices/mach/internal/version.Version=$VER"
-          go build -trimpath -ldflags "$LDFLAGS" \
-            -o "dist/mach-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}" ./cmd/mach
-          # attest/verify-attestation live in mach-server; a native copy is
-          # all this job needs it for (the container job builds the image).
-          go build -trimpath -ldflags "$LDFLAGS" -o dist/mach-server ./cmd/mach-server
 
       - name: Write release signing key
         env:
@@ -99,43 +127,44 @@ jobs:
           printf '%s' "$KEY" > signing.key
           chmod 600 signing.key
 
-      - name: Attest
-        run: |
-          VER="${GITHUB_REF_NAME#v}"
-          BIN="mach-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
-          dist/mach-server attest "dist/$BIN" "$VER" --out "dist/$BIN.intoto.jsonl"
+      - name: Install goreleaser (${{ env.GORELEASER_VERSION }})
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: ${{ env.GORELEASER_VERSION }}
+          install-only: true
 
-      # verify-attestation checks the signature against the key we just signed
-      # with and the subject digest against the file on disk; exit 0 with a
-      # WARNING means a modified-tree or VCS-less build, which must not ship.
-      # (Captured and compared rather than piped to grep -q: with pipefail a
-      # grep that exits early SIGPIPEs the writer and reads as failure — see
-      # the working note in AGENTS.md.)
-      - name: Verify attestation (and refuse a dirty or untraceable build)
-        run: |
-          BIN="mach-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
-          out=$(dist/mach-server verify-attestation "dist/$BIN.intoto.jsonl" "dist/$BIN") || exit 1
-          echo "$out"
-          if echo "$out" | grep -q "WARNING"; then
-            echo "::error::attestation reports a warning (modified tree or missing VCS revision) — refusing to publish this build"
-            exit 1
-          fi
+      - name: Validate config
+        run: goreleaser check
 
-      - name: Derive the signing key's public half
-        run: |
-          # ed25519.PrivateKey is seed(32) || pub(32); the last 64 hex chars
-          # are the public key. It is what a verifier checks DSSE against.
-          awk '{print substr($0, length($0)-63)}' signing.key > dist/mach-release-signing-key.pub
+      # The hook attests each of the six targets as it is built (it builds
+      # mach-server once as the attest tool, stamped from the tag — see
+      # packaging/goreleaser/attest-hook.sh).
+      - name: Build, attest and package
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MACH_SERVER_KEY: "${{ github.workspace }}/signing.key"
+        run: goreleaser release --clean --skip=publish
 
-      # Only the client binary, its attestation and the pubkey file are
-      # published — the `mach-server` built above is this job's tool, not a
-      # release artifact, so the glob here stops at the client's own name.
+      - name: Stage artifacts
+        run: |
+          mkdir -p stage
+          (cd dist && find . \( \
+              -name 'mach'          -o \
+              -name 'mach.exe'      -o \
+              -name '*.intoto.jsonl' -o \
+              -name '*.zip'         -o \
+              -name '*.deb'         -o \
+              -name '*.rpm'         -o \
+              -name '*.apk'         -o \
+              -name 'checksums.txt' \) -type f -print0 \
+            | tar --null -cf - -T -) | tar -xf - -C stage
+          find stage -type f | sort
+
       - uses: actions/upload-artifact@v7
         with:
-          name: client-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: |
-            dist/mach-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}*
-            dist/mach-release-signing-key.pub
+          name: goreleaser-dist
+          path: stage/
 
   container:
     name: multi-arch server image (ghcr)
@@ -247,62 +276,177 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
+  # Windows installers (#43): the MSI wraps the goreleaser-BUILT windows
+  # binary (staged above — the same bytes its attestation names; NOT a
+  # rebuild), registers the machd Task Scheduler job, and is validated right
+  # here: silent install, the task exists and points at the installed
+  # binary, silent uninstall removes it.
+  msi:
+    name: windows MSI (${{ matrix.arch }})
+    runs-on: windows-latest
+    needs: goreleaser
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   goreleaser: windows_amd64_v1 }
+          - { arch: arm64, goreleaser: windows_arm64_v8.0 }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: goreleaser-dist
+          path: staged
+
+      - name: Build MSI (WiX v5)
+        shell: pwsh
+        env:
+          VER: ${{ github.ref_name }}
+        run: |
+          dotnet tool install --global wix
+          wix extension add WixToolset.Util.wixext
+          $ver = "$env:VER".TrimStart("v")
+          $exe = (Resolve-Path "staged/${{ matrix.goreleaser }}/mach.exe").Path
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "mach.exe (windows/${{ matrix.arch }}) sha256: $hash" |
+            Out-File -Encoding utf8 "mach-exe-sha256-${{ matrix.arch }}.txt"
+          # The verbose install log is where the shipped MSI's ProductCode
+          # lands (WiX mints a fresh code per build; the winget manifest
+          # points at the code the actual artifact registers).
+          wix build -ext WixToolset.Util.wixext -arch ${{ matrix.arch }} `
+            -define Version=$ver `
+            -define MachExeSource=$exe `
+            packaging/wix/mach.wxs -o "mach-${{ matrix.arch }}.msi"
+          Get-ChildItem *.msi
+
+      - name: Validate on the runner (install, task, uninstall)
+        shell: pwsh
+        run: |
+          $msi = (Resolve-Path "mach-${{ matrix.arch }}.msi").Path
+          $log = (Join-Path (Get-Location) "msi-log-${{ matrix.arch }}.txt")
+          Start-Process msiexec -ArgumentList "/i","`"$msi`"","/quiet","/norestart","/l*v","`"$log`"" -Wait
+          if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { Write-Error "msiexec install failed"; exit 1 }
+          schtasks /Query /TN machd /FO LIST
+          if ($LASTEXITCODE -ne 0) { Write-Error "machd task not registered after install"; exit 1 }
+          if (-not (Test-Path "$env:ProgramFiles\mach\mach.exe")) {
+            Write-Error "mach.exe not at the expected install path"; exit 1
+          }
+          Start-Process msiexec -ArgumentList "/x","`"$msi`"","/quiet","/norestart" -Wait
+          schtasks /Query /TN machd 2>$null
+          if ($LASTEXITCODE -eq 0) { Write-Error "machd task survived uninstall"; exit 1 }
+          "install + task + uninstall OK"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: msi-${{ matrix.arch }}
+          path: |
+            mach-*.msi
+            mach-exe-sha256-*.txt
+            msi-log-*.txt
+
+  # Publish: the ONE job that touches the GitHub release. Re-verifies every
+  # attestation envelope against the artifact set being uploaded, assembles
+  # the bundle, clears the verify-only raw binaries (the zips are what
+  # ships), and publishes binaries + packages + MSIs + bundle + checksums.
   release:
     name: publish GitHub release
     runs-on: ubuntu-latest
-    needs: [binaries, container, agent-container]
+    needs: [goreleaser, container, agent-container, msi]
     steps:
+      - uses: actions/checkout@v7
+
+      - uses: jdx/mise-action@v4
+
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
-          # The client binaries and their attestations only. Without a pattern
-          # this step downloads every artifact the run produced — and buildx's
-          # gha cache uploads a .dockerbuild build record per container job,
-          # which is neither a release artifact nor something this job should
-          # stall on downloading.
-          pattern: client-*
 
-      - name: Assemble the attestation bundle and release body
+      - name: Assemble and verify the attestation bundle
+        env:
+          KEY: ${{ secrets.MACH_RELEASE_SIGNING_KEY }}
         run: |
-          cd dist
-          PUB=$(cat mach-release-signing-key.pub)
-          rm mach-release-signing-key.pub
-          # One attestation bundle in the in-toto bundle layout: newline-
-          # delimited JSON, one DSSE envelope per line. Each statement carries
-          # the sha256 of the binary it names, so the bundle is the signed
-          # integrity record and no separate checksum file is needed. Verify
-          # each envelope against its binary while assembling: a signed
-          # statement describing the wrong bytes must not ship.
-          n=0
-          for f in mach-*.intoto.jsonl; do
-            jq -c . "$f" >> ../bundle.jsonl
-            name=$(jq -r '.payload | @base64d | fromjson | .subject[0].name' "$f")
-            dig=$(jq -r '.payload | @base64d | fromjson | .subject[0].digest.sha256' "$f")
-            actual=$(sha256sum "$name" | cut -d' ' -f1)
-            if [ "$dig" != "$actual" ]; then
-              echo "::error::$f names $name at sha256 $dig, but the binary hashes to $actual"
-              exit 1
-            fi
-            rm "$f"
-            n=$((n+1))
-          done
-          if [ "$n" != 6 ]; then
-            echo "::error::expected 6 attestations, collected $n"
+          set -eu
+          VER="${GITHUB_REF_NAME#v}"
+          if [ -z "$KEY" ]; then
+            echo "::error::MACH_RELEASE_SIGNING_KEY is not set — refusing to publish unattested"
             exit 1
           fi
-          mv ../bundle.jsonl mach-attestations.intoto.jsonl
-          cat > ../release-body.md <<EOF
-          **Container images** (linux/amd64 + linux/arm64):
-          - \`ghcr.io/${{ needs.container.outputs.image }}:${{ needs.container.outputs.version }}\` (also \`:latest\`) — the control plane; image digest \`${{ needs.container.outputs.digest }}\`
-          - \`ghcr.io/${{ needs.agent-container.outputs.image }}:${{ needs.container.outputs.version }}\` (also \`:latest\`) — the outbound-only agent, for machines that run as containers; image digest \`${{ needs.agent-container.outputs.digest }}\`. Enrolls headlessly from \`MACH_SERVER\` / \`MACH_API_KEY\` / \`MACH_NAME\` and state lives entirely in the \`/data\` volume; pushed updates are refused inside it (see Dockerfile.agent) — update by pulling the next image.
+          printf '%s' "$KEY" > signing.key
+          chmod 600 signing.key
+          # ed25519.PrivateKey is seed(32) || pub(32); the last 64 hex chars
+          # are the public key — what a DSSE verifier checks against.
+          awk '{print substr($0, length($0)-63)}' signing.key > dist/mach-release-signing-key.pub
 
-          **Client:** the mach binary (agent + console) for linux / darwin / windows, amd64 + arm64.
+          # The attest tool, rebuilt from the tagged tree (mise pins go): the
+          # same revision the binaries carry.
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X github.com/TevaServices/mach/internal/version.Version=$VER" \
+            -o .attest-tool ./cmd/mach-server
 
-          **Attestations:** \`mach-attestations.intoto.jsonl\` is one in-toto attestation bundle — a DSSE envelope per line, one per binary. Each statement carries its binary's sha256, the toolchain and build flags, the module graph and the VCS revision, so the bundle is the release's signed integrity record. Verify with any DSSE-aware tool against this release's ed25519 public key (hex; each envelope names its sha256-derived keyid): \`$PUB\`. \`mach-server verify-attestation\` reads one envelope per file — extract the line for the binary you are checking.
+          # Verify EVERY envelope against the staged binary it names (its own
+          # dist-relative path), fold into the bundle at ../bundle.jsonl —
+          # outside dist, so the cleanup below cannot eat it. An envelope
+          # without its binary, a digest mismatch, a verify failure or a
+          # WARNING fails the release here.
+          n=0
+          for env_file in $(find dist -name '*.intoto.jsonl' | sort); do
+            rel="${env_file#dist/}"
+            bin="dist/${rel%.intoto.jsonl}"
+            if [ ! -f "$bin" ]; then
+              echo "::error::$rel attests a binary that is not among the staged artifacts: $bin"
+              exit 1
+            fi
+            if ! out=$(.attest-tool verify-attestation "$env_file" "$bin"); then
+              echo "::error::attestation verify failed for $rel"
+              exit 1
+            fi
+            case "$out" in
+              *WARNING*)
+                echo "::error::$rel reports a WARNING (dirty tree / no VCS revision) — refusing to publish"
+                exit 1 ;;
+            esac
+            jq -c . "$env_file" >> bundle.jsonl
+            n=$((n+1))
+          done
+          if [ "$n" -lt 6 ]; then
+            echo "::error::expected 6 attested binaries (the goreleaser target matrix), got $n"
+            exit 1
+          fi
 
-          **Note:** the darwin and windows binaries are not code-signed (no signing certificate in this pipeline).
-          EOF
+          # Raw binaries + envelopes were verify-only; the zips are what
+          # ships. Clear them BEFORE the bundle moves in (it matches
+          # *.intoto.jsonl too).
+          find dist \( -name 'mach' -o -name 'mach.exe' -o -name '*.intoto.jsonl' \) -type f -delete
+          mv bundle.jsonl dist/mach-attestations.intoto.jsonl
+          rm -f .attest-tool signing.key
+          find dist -maxdepth 2 -type f | sort
+
+      - name: Build the release body
+        env:
+          SERVER_IMAGE: ${{ needs.container.outputs.image }}
+          SERVER_VERSION: ${{ needs.container.outputs.version }}
+          SERVER_DIGEST: ${{ needs.container.outputs.digest }}
+          AGENT_IMAGE: ${{ needs.agent-container.outputs.image }}
+          AGENT_DIGEST: ${{ needs.agent-container.outputs.digest }}
+        run: |
+          set -eu
+          PUB=$(cat dist/mach-release-signing-key.pub)
+          # printf'ed line by line on purpose — no heredoc inside a run block.
+          {
+            printf '**Container images** (linux/amd64 + linux/arm64):\n'
+            printf -- '- `ghcr.io/%s:%s` (also `:latest`) — the control plane; image digest `%s`\n' "$SERVER_IMAGE" "$SERVER_VERSION" "$SERVER_DIGEST"
+            printf -- '- `ghcr.io/%s:%s` (also `:latest`) — the outbound-only agent, for machines that run as containers; image digest `%s`. Enrolls headlessly from `MACH_SERVER` / `MACH_API_KEY` / `MACH_NAME` and state lives entirely in the `/data` volume; pushed updates are refused inside it (see Dockerfile.agent) — update by pulling the next image.\n' "$AGENT_IMAGE" "$SERVER_VERSION" "$AGENT_DIGEST"
+            printf '\n'
+            printf '**Client:** the mach binary (agent + console) — per-platform zips below, or through a package manager: Linux packages (.deb/.rpm/.apk here and in the dist.mach.teva.services package repos — see README "Installing the client"), Homebrew `brew install tevaservices/mach/mach`, Windows MSIs (also `winget install TevaServices.mach`).\n'
+            printf '\n'
+            printf '**Linux package repositories:** after this release, repo-sync refreshes https://dist.mach.teva.services/ (apt/rpm/apk). Currently UNSIGNED — apt consumers pass `[trusted=yes]`, dnf `gpgcheck=0`, apk `--allow-untrusted`.\n'
+            printf '\n'
+            printf '**Attestations:** `mach-attestations.intoto.jsonl` is one in-toto attestation bundle — a DSSE envelope per line, one per binary. Each statement carries its binary'"'"'s sha256, the toolchain and build flags, the module graph and the VCS revision, so the bundle is the release'"'"'s signed integrity record. Verify with any DSSE-aware tool against this release'"'"'s ed25519 public key (hex; each envelope names its sha256-derived keyid): `%s`. `mach-server verify-attestation` reads one envelope per file — extract the line for the binary you are checking.\n' "$PUB"
+            printf '\n'
+            printf '**Note:** the darwin and windows binaries and the MSIs are not code-signed (no signing certificate in this pipeline).\n'
+          } > release-body.md
 
       - uses: softprops/action-gh-release@v3
         with:
@@ -310,3 +454,142 @@ jobs:
           generate_release_notes: true
           files: |
             dist/mach-*
+            dist/checksums.txt
+
+  # Linux repo sync (#45): regenerate the apt/rpm/apk metadata from this
+  # release's packages and deploy them to Pages (source=GitHub Actions,
+  # domain dist.mach.teva.services — set by the owner, verified via API).
+  # dpkg-scanpackages and createrepo_c come from apt on the runner; apk
+  # index runs inside an alpine container (the runner has docker;
+  # apk-tools is alpine-native).
+  linux-repo-sync:
+    name: linux repo metadata -> Pages
+    runs-on: ubuntu-latest
+    needs: release
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install repo tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dpkg-dev createrepo-c
+
+      - name: Pull this release's packages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
+            -p '*.deb' -p '*.rpm' -p '*.apk' -D release-pkgs
+          find release-pkgs -type f | sort
+
+      - name: Build apt + rpm metadata
+        run: MODE=no-apk bash scripts/repo-sync.sh release-pkgs pages
+
+      - name: Build apk metadata (alpine container)
+        run: |
+          docker run --rm -v "$PWD/pages:/w" -v "$PWD:/src" alpine:3.22 sh -c '
+            set -eu
+            sh /src/scripts/repo-apk.sh /w
+          '
+
+      # Validate what was just built (same repo layout a consumer resolves):
+      # apk from an alpine container (the trust model refuses an unsigned
+      # index outside a keys-dir context, so the container IS the apk
+      # validation); apt + dnf resolve the local tree with their own tooling.
+      - name: Validate the generated repos
+        run: |
+          # apt: the runner's own apt consumes a file:// repo (sudo is
+          # passwordless on hosted runners).
+          echo "deb [trusted=yes] file://$PWD/pages/apt stable main" \
+            | sudo tee /etc/apt/sources.list.d/mach-local.list
+          sudo apt-get update 2>&1 | grep -iE "mach|err" | head -5 || true
+          apt-cache policy mach | head -6
+          sudo rm -f /etc/apt/sources.list.d/mach-local.list
+          # rpm repodata parses (createrepo_c --repo-dir revalidates its own
+          # output; dnf/rpmdb resolve per-arch at install time on the target).
+          createrepo_c --check --repo-dir pages/rpm >/dev/null 2>&1 \
+            && echo "rpm repodata valid"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: pages
+
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  # Homebrew tap (#42): render the formula from checksums.txt and push it to
+  # the tap. Auto-skips (a notice, not a failure) until the tap repo + the
+  # GORELEASER_GH_TOKEN secret are provisioned — that is an owner step, not
+  # a release property.
+  brew-bump:
+    name: homebrew tap formula
+    runs-on: ubuntu-latest
+    needs: release
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check tap + token are provisioned
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAP_TOKEN: ${{ secrets.GORELEASER_GH_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::notice::GORELEASER_GH_TOKEN not set — tap publishing skipped (see release.yml header: create TevaServices/homebrew-mach + the secret, once)"
+            echo "SKIP=1" >> "$GITHUB_ENV"
+          elif ! gh api repos/TevaServices/homebrew-mach >/dev/null 2>&1; then
+            echo "::notice::tap TevaServices/homebrew-mach does not exist — tap publishing skipped (repo creation is an owner step)"
+            echo "SKIP=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Fetch the release checksums
+        if: env.SKIP != '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" -p 'checksums.txt' -D dist
+
+      - name: Render + push the formula
+        if: env.SKIP != '1'
+        env:
+          TAP_TOKEN: ${{ secrets.GORELEASER_GH_TOKEN }}
+        run: |
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/TevaServices/homebrew-mach" tap
+          bash scripts/brew-bump.sh "$GITHUB_REF_NAME" dist "$PWD/tap"
+
+  # Homebrew validation (#42): on a macOS runner, install from the tap and
+  # exercise the service lifecycle. Also skips until the tap exists.
+  brew-smoke:
+    name: brew install + services (macos)
+    runs-on: macos-latest
+    needs: brew-bump
+    steps:
+      - name: Check the tap exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh api repos/TevaServices/homebrew-mach >/dev/null 2>&1; then
+            echo "tap present"
+          else
+            echo "::notice::tap TevaServices/homebrew-mach does not exist yet; brew-smoke skipped (provisioning step, not a release failure)"
+            echo "SKIP=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install + service lifecycle
+        if: env.SKIP != '1'
+        run: |
+          # The formula's URLs+shas come from THIS release (brew-bump.sh), so
+          # a successful install validates the URLs, the shas and the
+          # formula's service DSL (brew services generates launchd here).
+          brew install tevaservices/mach/mach
+          mach version
+          brew services start mach
+          sleep 3
+          # brew services list is tabular and stable to parse (started/stopped
+          # in the status column) — brew services info is newer and varies.
+          brew services list | tee /dev/stderr | grep -E "^mach .*started"
+          brew services stop mach
+          brew services list | tee /dev/stderr | grep -E "^mach .*(stopped|none)"
