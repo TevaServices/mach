@@ -717,8 +717,12 @@ step "plain mach on a target is the temporary session"
 TMP_NAME="$ORG-tmp-01"
 TMP_PART="tmp-01"
 TMP_STATE="$WORKDIR/agent-tmp"
+# The social-engineering guard (#23) blocks at start; ENTER (a fifo held open,
+# then one newline) is what a person who means it presses.
+rm -f "$WORKDIR/agent-tmp.in"; mkfifo "$WORKDIR/agent-tmp.in"
+(exec 3>"$WORKDIR/agent-tmp.in"; printf '\n\n\n' >&3; sleep 30) &
 MACH_SERVER="$BASE" MACH_ORG="$ORG" MACH_STATE_DIR="$TMP_STATE" \
-  "$WORKDIR/mach" >"$WORKDIR/agent-tmp.log" 2>&1 &
+  "$WORKDIR/mach" <"$WORKDIR/agent-tmp.in" >"$WORKDIR/agent-tmp.log" 2>&1 &
 TMP_PID=$!
 
 # Drive the phone side of the pairing from here, exactly as an operator would:
@@ -735,6 +739,15 @@ done
 [[ -n "$TMP_TOKEN" ]]; check "temporary session published a pairing" $?
 TMP_CODE=$(grep -oE '[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}' "$WORKDIR/agent-tmp.log" | head -1)
 [[ -n "$TMP_CODE" ]]; check "temporary session printed its challenge code" $?
+# The temporary session's FIRST output is the warning a person must confirm
+# (#23): before any prompt for a control plane URL or org prefix.
+GUARD=$(head -n 1 "$WORKDIR/agent-tmp.log")
+[[ "$GUARD" == *"WARNING: This command will enroll this machine as a temporary target."* ]]
+check "the temporary session's first line is the social-engineering warning" $?
+HEAD=$(head -n 4 "$WORKDIR/agent-tmp.log")
+[[ "$HEAD" == *"personally know and trust"* ]]; check "the warning names who the decision belongs to" $?
+GUARD_PROMPTS=$(grep -c 'Control plane URL' "$WORKDIR/agent-tmp.log")
+[[ "$GUARD_PROMPTS" -eq 1 ]]; check "the warning precedes the control-plane prompt" $?
 OUT=$(cat "$WORKDIR/agent-tmp.log" 2>&1)
 [[ "$OUT" == *"TEMPORARY session"* ]]; check "plain mach announces that it is temporary" $?
 
@@ -808,8 +821,10 @@ OUT=$(cat "$WORKDIR/agent-tmp.log" 2>&1)
 
 # And the next run takes that name straight back over — no revoke, no delete,
 # which is the whole point of recording it as temporary.
+rm -f "$WORKDIR/agent-tmp2.in"; mkfifo "$WORKDIR/agent-tmp2.in"
+(exec 3>"$WORKDIR/agent-tmp2.in"; printf '\n\n\n' >&3; sleep 30) &
 MACH_SERVER="$BASE" MACH_ORG="$ORG" MACH_STATE_DIR="$TMP_STATE" \
-  "$WORKDIR/mach" >"$WORKDIR/agent-tmp2.log" 2>&1 &
+  "$WORKDIR/mach" <"$WORKDIR/agent-tmp2.in" >"$WORKDIR/agent-tmp2.log" 2>&1 &
 TMP2_PID=$!
 TMP_TOKEN=""
 for i in $(seq 1 30); do
@@ -826,12 +841,25 @@ OUT=$(curl -sS "$BASE/v1/machines" -H "Authorization: Bearer $ADMIN_KEY" 2>&1)
 [[ "$OUT" == *'"temporary":true'* ]]; check "and is recorded temporary again" $?
 kill -TERM "$TMP2_PID" 2>/dev/null
 wait "$TMP2_PID" 2>/dev/null
+rm -f "$WORKDIR/agent-tmp.in" "$WORKDIR/agent-tmp2.in"
 
 # An installed host must not get a second identity from someone typing `mach` at
 # its console. (agent1 is the state dir of the installed agent above.)
 OUT=$(MACH_STATE_DIR="$WORKDIR/agent1" "$WORKDIR/mach" 2>&1)
 [[ $? -ne 0 ]]; check "plain mach on an installed host refuses" $?
 [[ "$OUT" == *"already enrolled"* ]]; check "and explains why, pointing at mach run/install" $?
+
+# The guard is the only door: a typed answer aborts before anything prompts.
+OUT=$(printf 'no\n' | MACH_SERVER="$BASE" MACH_ORG="$ORG" MACH_STATE_DIR="$TMP_STATE" "$WORKDIR/mach" 2>&1)
+[[ "$OUT" == *"personally know and trust"* ]]; check "a typed answer still sees the warning" $?
+[[ "$OUT" == *"aborted"* && "$OUT" == *"nothing was enrolled"* ]]; check "a typed answer aborts before any enrollment" $?
+# And an EOF (piped-empty stdin) is also a refusal, not a silent continue.
+OUT=$(MACH_SERVER="$BASE" MACH_ORG="$ORG" MACH_STATE_DIR="$TMP_STATE" "$WORKDIR/mach" </dev/null 2>&1)
+[[ "$OUT" == *"aborted"* ]]; check "EOF aborts the temporary session at the warning" $?
+# The guard sits only on the temporary path: an already-enrolled host refuses
+# WITHOUT asking for ENTER — capture that run's own output, not the EOF run's.
+OUT=$(MACH_STATE_DIR="$WORKDIR/agent1" "$WORKDIR/mach" 2>&1)
+[[ "$OUT" != *"WARNING"* ]]; check "an enrolled host is refused without any confirmation prompt" $?
 
 step "release attestation (in-toto) and attested update push"
 # Built with -buildvcs=false so the artifact carries no VCS state: the e2e

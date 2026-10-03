@@ -25,7 +25,6 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"strconv"
@@ -105,6 +104,15 @@ func bootStrap() {
 	// QR (one URL prompt), holds the live connection, and keeps everything in
 	// memory — so Ctrl-C ends it and running `mach` again enrolls from scratch.
 	// Surviving reboots is the separate, explicit `mach install`.
+	//
+	// Before ANY prompt for server details, the social-engineering guard
+	// (#23): enrollment is a standing capability on this host, and the person
+	// running this command may have been talked into it. ENTER to continue,
+	// anything else to abort.
+	if err := confirmTrustedOrigin(os.Stdout); err != nil {
+		fmt.Fprintln(os.Stderr, "mach: "+err.Error())
+		os.Exit(2)
+	}
 	if err := agent.RunEphemeral(promptServer(), promptOrg()); err != nil {
 		fmt.Fprintln(os.Stderr, "mach: "+err.Error())
 		os.Exit(1)
@@ -116,15 +124,13 @@ func bootStrap() {
 func promptServer() string {
 	if v := os.Getenv("MACH_SERVER"); v != "" {
 		fmt.Printf("Control plane URL [%s]: ", v)
-		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-		if s := strings.TrimSpace(line); s != "" {
+		if s := readLine(); s != "" {
 			return s
 		}
 		return v
 	}
 	fmt.Print("Control plane URL (e.g. https://mach.example.com): ")
-	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-	s := strings.TrimSpace(line)
+	s := readLine()
 	if s == "" {
 		fmt.Fprintln(os.Stderr, "mach: a control plane URL is required (set MACH_SERVER to skip the prompt)")
 		os.Exit(2)
@@ -136,15 +142,13 @@ func promptServer() string {
 func promptOrg() string {
 	if v := os.Getenv("MACH_ORG"); v != "" {
 		fmt.Printf("Org prefix for machine names [%s]: ", v)
-		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-		if s := strings.TrimSpace(line); s != "" {
+		if s := readLine(); s != "" {
 			return s
 		}
 		return v
 	}
 	fmt.Print("Org prefix for machine names (e.g. bcross): ")
-	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-	s := strings.TrimSpace(line)
+	s := readLine()
 	if s == "" {
 		fmt.Fprintln(os.Stderr, "mach: an org prefix is required (set MACH_ORG to skip the prompt)")
 		os.Exit(2)
