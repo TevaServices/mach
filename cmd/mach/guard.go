@@ -10,7 +10,7 @@ package main
 // requires a conscious ENTER: it names what is about to happen and who the
 // decision should belong to. It is deliberately not skippable by a flag: a
 // script that could bypass it is exactly the instruction an attacker would
-// recite. (mach register / mach install stay prompt-free — headless paths.)
+// recite. (mach register stays prompt-free — a headless path.)
 //
 // EOF aborts as well: a closed terminal is not a confirmation.
 

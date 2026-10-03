@@ -154,7 +154,7 @@ func RegisterQR(server, org, stateDir string) (*Config, error) {
 	if err := SaveConfig(stateDir, cfg); err != nil {
 		return nil, err
 	}
-	fmt.Println("Run the agent with:  mach run   (or make it permanent with: mach install)")
+	fmt.Println("Run the agent with:  mach run   (survive reboots via the distribution package's service)")
 	return cfg, nil
 }
 

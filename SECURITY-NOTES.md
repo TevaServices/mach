@@ -173,7 +173,7 @@ from the broker; nothing protects content from the machine's own operator.
 | **Non-reserving delete**: removes the machine row and its key, tells a connected agent to retire (so it exits rather than reconnecting), and keeps the audit trail; ordering is delete-then-notify so a failed notice cannot leave a live authenticated socket for a row that is gone | server/machineadmin.go deleteMachine, store.DeleteMachine |
 | **Org management**: orgs stored in the database with `MACH_ORG`/`MACH_ORGS` as a non-removable pin; an org with machines cannot be removed; adding one is validated by the same label rule the naming invariant uses | server/orgadmin.go, orgs.go, store.ValidOrgLabel |
 | The API-key listing the membership view renders has no field for `salt`, `key_lookup` or `key_hash` — the absent fields, not a promise, are what stops a leak | store.ListAPIKeys, org_test.go |
-| **Agent supervision restarts on failure, not on any exit**, so exit 0 means stop: a retirement actually retires, and the update path's detached replacement is not raced by a resurrected old image | agent/install.go systemdUnit, launchdPlist |
+| **Agent supervision restarts on failure, not on any exit**, so exit 0 means stop: a retirement actually retires, and the update path's detached replacement is not raced by a resurrected old image | the distribution packages' unit/plist/task (this contract) |
 | Hourly pairing cleanup (24h retention) | server.New goroutine |
 
 ## Command policy: where it is enforced, and what it can promise
@@ -511,7 +511,8 @@ signature protects delivery, the attestation records provenance.
     which is visible (the row shows revoked) and recoverable (re-enroll).
 
 18. **A remote command runs as the same user that owns the agent's state dir.**
-    After `mach install`, the agent and the commands it runs share one uid, and
+    Once the packaged service has registered the agent, the agent and the
+    commands it runs share one uid, and
     that uid owns `agent.key`, `e2e.key`, `config.json` and `policy.txt`. So one
     command can read both keys and rewrite the pinned `server_key` — redirecting
     the agent to another control plane — and nothing detects it: the console's
@@ -540,10 +541,11 @@ signature protects delivery, the attestation records provenance.
     client secret, which is the case where PKCE is optional rather than
     required, and the login CSRF is covered by the state cookie. It is a
     one-line BCP upgrade away and is not done.
-22. **Windows runs no privilege drop, and the task requests the highest
-    privileges available.** `installWindows` creates the scheduled task with
-    `/RL HIGHEST`, so an agent installed by an administrator runs commands with
-    that administrator's full token. `MACH_USER` and the drop are Linux-only.
+22. **Windows runs no privilege drop, and the packaged task can request the
+    highest privileges available.** The binary no longer self-installs (#40); the
+    distribution package creates the scheduled task, and if it uses `/RL HIGHEST`
+    an agent installed by an administrator runs commands with that
+    administrator's full token. `MACH_USER` and the drop are Linux-only.
     This is the same-uid gap (#18) taken to its conclusion, and it is a Windows
     deployment's own decision what account the task runs as.
 23. **A daemonizing command escapes the tree kill.** The process-group kill

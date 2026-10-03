@@ -7,8 +7,9 @@ This is `mach`: remote CLI access to registered machines, outbound-only
   prompts for the control-plane URL, enrolls via QR, then holds the live
   connection — as a **temporary session**, keeping every secret in memory, so
   Ctrl-C ends it and running it again enrolls from scratch (#23).
-  `mach install` registers the OS service (systemd/launchd/Task Scheduler) and
-  is what makes a connection survive reboots. On an admin box, bare `mach`
+  A connection survives reboots only through the OS packages (removed, #40 —
+  the binary does not self-install; the packages register
+  systemd/launchd/Task Scheduler). On an admin box, bare `mach`
   prints the fleet table. On a target that is already installed, bare `mach`
   refuses rather than starting a second identity.
 - `mach-server` (cmd/mach-server) — the control plane; the ONLY publicly
@@ -331,7 +332,8 @@ This is `mach`: remote CLI access to registered machines, outbound-only
 | `MACH_EXEC_POLICY_FILE` | fleet-wide block list from a file, re-read on mtime change every 15s; unreadable at startup is fatal |
 
 Agent side: `MACH_SERVER`, `MACH_ORG`, `MACH_STATE_DIR`, `MACH_POLICY`,
-`MACH_USER`, `MACH_KEEP_PRIVILEGES`.
+`MACH_USER`, `MACH_KEEP_PRIVILEGES` (`MACH_USER`/drop are `mach run`-time, not
+service-creation time — the packaged units set User=/RunAs themselves).
 
 `MACH_VERSION` is **not** a runtime variable and is deliberately absent from the
 table above: no process reads a version from the environment, because a version

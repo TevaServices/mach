@@ -15,9 +15,10 @@
 //
 //	mach                      → if not enrolled: QR enrollment, then the
 //	                            live connection held in this console
-//	                            (Ctrl-C stops it). `mach install` makes it
-//	                            a persistent OS service; `mach run` re-runs
-//	                            the daemon.
+//	                            (Ctrl-C stops it). The distribution
+//	                            packages register the OS service that re-runs
+//	                            it across reboots (`mach run` runs the daemon
+//	                            by hand).
 //	mach register [...]       → enrollment only
 //
 // Nothing else is required: enrollment config, console config, and keys all
@@ -47,7 +48,7 @@ func main() {
 		case "list", "exec", "console", "audit", "trust":
 			consoleMain(args)
 			return
-		case "register", "run", "install", "service", "version", "help":
+		case "register", "run", "version", "help":
 			agentMain(args)
 			return
 		default:
@@ -64,13 +65,13 @@ func usage() {
 	fmt.Fprint(os.Stderr, `mach — remote CLI access to registered machines (agent + console in one binary)
 
 On a machine to wire in:   mach            (enroll via QR, then hold the live connection)
-Make it permanent:         mach install    (register the OS service)
+Permanent (reboots):       the distribution package's service
 On an admin machine:       mach            (first run: setup wizard; then: live fleet status)
 Run commands:              mach exec <m> <cmd...>   |   mach exec <m> -- <argv>  (byte-exact)
                            mach console <m>         |   mach list, mach audit [m] [n]
 Sealed exec (E2E):         mach exec --e2e <m> <cmd...>  (fail rather than send plaintext)
                            mach trust               pinned E2E keys for each machine
-Agent/service:             mach register [--server URL | --api-key K --name N], mach run, mach version
+Agent:                     mach register [--server URL | --api-key K --name N], mach run, mach version
 
 The control plane is a separate binary: mach-server (runs in a container).
 `)
@@ -93,7 +94,7 @@ func bootStrap() {
 	if agent.IsEnrolled(stateDir) {
 		fmt.Fprintf(os.Stderr, "This host is already enrolled as a permanent agent (%s).\n", stateDir)
 		fmt.Fprintln(os.Stderr, "  mach run                 reconnect that agent")
-		fmt.Fprintln(os.Stderr, "  mach install             keep it running across reboots")
+		fmt.Fprintln(os.Stderr, "  (keep it running across reboots: the distribution package's service)")
 		fmt.Fprintln(os.Stderr)
 		fmt.Fprintln(os.Stderr, "Plain `mach` is the TEMPORARY session and would enroll this host as a")
 		fmt.Fprintln(os.Stderr, "second, separate machine. Delete the enrollment above if that is what you want.")
@@ -103,7 +104,7 @@ func bootStrap() {
 	// Nothing installed: plain `mach` is a temporary session. It enrolls over
 	// QR (one URL prompt), holds the live connection, and keeps everything in
 	// memory — so Ctrl-C ends it and running `mach` again enrolls from scratch.
-	// Surviving reboots is the separate, explicit `mach install`.
+	// Surviving reboots is the distribution package's service.
 	//
 	// Before ANY prompt for server details, the social-engineering guard
 	// (#23): enrollment is a standing capability on this host, and the person

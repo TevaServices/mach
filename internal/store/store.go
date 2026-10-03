@@ -574,8 +574,9 @@ type execer interface {
 // only the SQL can promise that.
 //
 // The new enrollment states whether it is temporary, so it OVERWRITES the flag:
-// re-enrolling a throwaway session permanently — `mach install` on a host that
-// ran plain `mach` — records it as permanent, which is the point of recording it.
+// re-enrolling the same host with a persistent enrollment — a packaged service
+// installing over a session that ran plain `mach` — records it as permanent,
+// which is the point of recording it.
 //
 // blocked is deliberately left alone. It is an independent axis — neither block
 // nor revoke writes the other's field — and a block left in place announces
