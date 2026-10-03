@@ -121,13 +121,14 @@ sudo rc-service machd start      # Alpine (OpenRC)
 retires itself and stays retired, and a pushed update hands off with a clean
 exit.)
 
-**Linux package repositories** are synced from GitHub Releases to this
-repo's `gh-pages` branch after each tag (`repo-sync.yml`):
+**Linux package repositories** are synced from GitHub Releases to
+**dist.mach.teva.services** (GitHub Pages, deployed by the release
+workflow after each tag):
 
 ```text
-deb  deb https://tevaservices.github.io/mach stable main
-rpm  https://tevaservices.github.io/mach/rpm/  (gpgcheck=0 today; signed once a release key exists)
-apk  https://tevaservices.github.io/mach/apk/  (add with --allow-untrusted until signing lands)
+deb  deb [trusted=yes] https://dist.mach.teva.services/apt stable main
+rpm  https://dist.mach.teva.services/rpm/  (gpgcheck=0 today; signed once a release key exists)
+apk  https://dist.mach.teva.services/apk/  (add with --allow-untrusted until signing lands)
 ```
 
 **QR (interactive):** `mach` on the new machine prints a QR whose URL points

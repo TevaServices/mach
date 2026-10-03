@@ -2,10 +2,10 @@
 # repo-sync.sh — build Linux package-repo metadata from release artifacts.
 #
 # Input: a directory of *.deb / *.rpm / *.apk (downloaded from a GitHub
-# Release by repo-sync.yml). Output: the gh-pages tree layout
+# Release by release.yml's linux-repo-sync job). Output: the Pages tree layout
 # (apt/pool + apt/dists, rpm/ + repodata, apk/x86_64 + APKINDEX).
 #
-# Layout on gh-pages (see README "Linux package repositories"):
+# Layout on Pages (dist.mach.teva.services; see README "Installing the client"):
 #   apt/pool/main/m/mach/<files>.deb            all debs live here
 #   apt/dists/stable/main/binary-<arch>/Packages[.gz]
 #   apt/dists/stable/Release
@@ -23,8 +23,8 @@
 # Each is an additive step; the layout does not change.
 set -eu
 
-IN="${1:?usage: repo-sync.sh <dir-with-deb-rpm-apk> <gh-pages-checkout-dir>}"
-PAGES="${2:?usage: repo-sync.sh <dir-with-deb-rpm-apk> <gh-pages-checkout-dir>}"
+IN="${1:?usage: repo-sync.sh <dir-with-deb-rpm-apk> <pages-output-dir>}"
+PAGES="${2:?usage: repo-sync.sh <dir-with-deb-rpm-apk> <pages-output-dir>}"
 
 APT="$PAGES/apt"
 YUM="$PAGES/rpm"
