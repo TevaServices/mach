@@ -23,12 +23,21 @@ manifests must be submitted from a fork with the real version folder.
    or render ours and copy them into
    `manifests/T/Tevaservices/mach/<version>/`.
 3. Validate locally: `winget validate`.
-4. Open the PR. The automated pipeline runs `winget validate` + SmartScreen
-   scanning on the installer; unsigned installers are accepted for
-   packages without a signing certificate today, but the PR is flagged for
-   manual moderator review — expect that round to take days, and possibly a
-   request for a signed binary. If signing is added later, update
-   InstallerUrl/InstallerSha256 in a new version folder and resubmit.
+4. Open the PR. The automated pipeline validates the manifest and runs
+   install/uninstall testing; per the repository policies (learn.microsoft.com:
+   windows/package-manager/package/windows-package-manager-policies), a
+   code-signing certificate is NOT a submission requirement — policy 1.2
+   bans malware per Microsoft's PUA criteria, not unsigned binaries. What
+   IS required: the InstallerUrl must be the ISV's own release location
+   (our GitHub Releases URL qualifies — no redirectors), silent
+   install/uninstall must work, and every submission passes multi-engine
+   antivirus scanning. NOTE for mach specifically: an unsigned
+   remote-access daemon is the exact category Defender PUA heuristics
+   flag — if the PR draws Validation-Defender-Error, the documented
+   remedy is submitting the installer to the Microsoft Defender team for
+   analysis (microsoft.com/wdsi/filesubmission) and commenting on the PR;
+   a signed MSI would preempt this class of failure. Expect manual
+   moderator review (days) regardless.
 5. After merge: `winget install TevaServices.mach` resolves.
 
 ## Why the MSI, and what it registers
