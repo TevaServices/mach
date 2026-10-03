@@ -304,17 +304,31 @@ jobs:
         env:
           VER: ${{ github.ref_name }}
         run: |
-          dotnet tool install --global wix
-          wix extension add WixToolset.Util.wixext
+          # Pinned to the last open-source v5 CLI (#47): unpinned, the tool
+          # resolved to WiX v7.0.0, whose OSMF EULA gate (WIX7015) aborts
+          # non-interactive CI. v5.0.2 builds the v4-schema authoring used by
+          # packaging/wix/mach.wxs; the util extension is pinned to the same
+          # series, matching the CLI. Bumping the pin = a deliberate change
+          # to the EULA/OSMF posture, not an accident of "latest".
+          dotnet tool install --global wix --version 5.0.2
+          # Slash-version in the extensionRef is how the wix CLI pins an
+          # extension (no -version switch exists) — matching the CLI pin.
+          wix extension add -g WixToolset.Util.wixext/5.0.2
           $ver = "$env:VER".TrimStart("v")
-          $exe = (Resolve-Path "staged/${{ matrix.goreleaser }}/mach.exe").Path
+          # The staged layout is goreleaser's own dist tree: its target dirs
+          # carry the project name (mach_...), not the bare target id (v0.7.0
+          # run failed resolving staged/windows_amd64_v1; actual layout
+          # staged/mach_windows_amd64_v1/mach.exe, verified from that run's
+          # goreleaser-dist artifact — #47). The publish job's verify loop
+          # walks the same mach_-prefixed form, so one shape everywhere.
+          $exe = (Resolve-Path "staged/mach_${{ matrix.goreleaser }}/mach.exe").Path
           $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
           "mach.exe (windows/${{ matrix.arch }}) sha256: $hash" |
             Out-File -Encoding utf8 "mach-exe-sha256-${{ matrix.arch }}.txt"
           # The verbose install log is where the shipped MSI's ProductCode
           # lands (WiX mints a fresh code per build; the winget manifest
           # points at the code the actual artifact registers).
-          wix build -ext WixToolset.Util.wixext -arch ${{ matrix.arch }} `
+          wix build -ext WixToolset.Util.wixext/5.0.2 -arch ${{ matrix.arch }} `
             -define Version=$ver `
             -define MachExeSource=$exe `
             packaging/wix/mach.wxs -o "mach-${{ matrix.arch }}.msi"
