@@ -10,8 +10,6 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
-PORT="${MACH_TEST_PORT:-8099}"
-BASE="http://127.0.0.1:$PORT"
 ORG="${MACH_TEST_ORG:-bcross}"
 WORKDIR="$(mktemp -d /tmp/mach-e2e.XXXXXX)"
 SERVER_PID=""
@@ -89,6 +87,44 @@ OUT=$("$WORKDIR/mach" version); [[ "$OUT" == "mach "* ]]
 check "the agent binary reports a version too" $?
 [[ "${OUT#mach }" == "$("$WORKDIR/mach-server" version | sed 's/^mach-server //')" ]]
 check "both binaries report the same version" $?
+
+# Free-port fallback (#37), PORT — picked seconds before the bind, not at
+# script start: another concurrent run is still building when this script
+# starts, and a pick that early races its own bind (observed: two staggered
+# runs both picked 8099 because neither server was up yet; the second bind
+# failed). When the default is busy the run shifts up to 100 ports and says
+# so. An explicit MACH_TEST_PORT override stays authoritative and never
+# silently moves — whoever pinned it pins the port, even if taken (the FATAL
+# guard below then names the interloper, as before). Probes bind-and-close:
+# for the tiny remaining window between pick and bind, the FATAL guard remains
+# exactly the defense it always was.
+if [[ -n "${MACH_TEST_PORT:-}" ]]; then
+  PORT="$MACH_TEST_PORT" # override: authoritative, taken or not
+else
+  PORT=$(python3 - <<'PYPORTS'
+import socket
+
+d = 8099
+for p in range(d, d + 101):
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", p))
+        ok = True
+    except OSError:
+        ok = False
+    finally:
+        s.close()
+    if ok:
+        print(p)
+        break
+else:
+    print(d)  # nothing free in range: keep the default; the FATAL guard explains
+PYPORTS
+)
+fi
+[[ -n "$PORT" ]] || { echo "FATAL: port pick failed"; exit 1; }
+[[ "$PORT" == 8099 ]] || echo "default 8099 busy — this run uses PORT=$PORT (MACH_TEST_PORT overrides are honored verbatim)"
+BASE="http://127.0.0.1:$PORT"
 
 step "control plane up"
 # E2E is turned off for the fleet before the server starts, so that the
@@ -928,8 +964,67 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/partials/enroll/linux/amd64
 check "the platform fragment the tabs call answers" $?
 
 step "web UI: OIDC sign-in, block/revoke/delete, org management (loopback)"
-UI_PORT="${MACH_TEST_UI_PORT:-8098}"
-IDP_PORT="${MACH_TEST_IDP_PORT:-8097}"
+# Same fallback, for this section's two servers — picked here, seconds before
+# their binds, for the reason the primary's pick is late: at script start the
+# occupant may not be bound yet. MACH_TEST_UI_PORT / MACH_TEST_IDP_PORT
+# override verbatim, as everywhere.
+if [[ -n "${MACH_TEST_UI_PORT:-}" ]]; then
+  UI_PORT="$MACH_TEST_UI_PORT" # override: authoritative, taken or not
+else
+  UI_PORT=$(python3 - <<'PYPORTS'
+import socket
+
+d = 8098
+for p in range(d, d + 101):
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", p))
+        ok = True
+    except OSError:
+        ok = False
+    finally:
+        s.close()
+    if ok:
+        print(p)
+        break
+else:
+    print(d)
+PYPORTS
+)
+fi
+if [[ -n "${MACH_TEST_IDP_PORT:-}" ]]; then
+  IDP_PORT="$MACH_TEST_IDP_PORT" # override: authoritative, taken or not
+else
+  # UI_PORT was picked moments ago by the same run: exclude it as a candidate
+  # (two servers of one run on one port is the bug this fallback exists to
+  # prevent), then shift as usual.
+  IDP_PORT=$(UI_PORT="$UI_PORT" python3 - <<'PYPORTS'
+import os
+import socket
+
+d = 8097
+taken = int(os.environ["UI_PORT"])
+for p in range(d, d + 101):
+    if p == taken:
+        continue
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", p))
+        ok = True
+    except OSError:
+        ok = False
+    finally:
+        s.close()
+    if ok:
+        print(p)
+        break
+else:
+    print(d)
+PYPORTS
+)
+fi
+[[ "$UI_PORT" == 8098 && "$IDP_PORT" == 8097 ]] \
+  || echo "UI defaults busy — this run uses UI_PORT=$UI_PORT IDP_PORT=$IDP_PORT (MACH_TEST_UI_PORT/MACH_TEST_IDP_PORT override verbatim)"
 UI_BASE="http://127.0.0.1:$UI_PORT"
 IDP_BASE="http://127.0.0.1:$IDP_PORT"
 go build -o "$WORKDIR/fakeidp" ./scripts/fakeidp || { echo "build fakeidp failed"; exit 1; }
