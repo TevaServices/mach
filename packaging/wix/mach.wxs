@@ -51,16 +51,17 @@
     </StandardDirectory>
 
     <!-- v4/v5 schema: a Directory takes no ComponentGroup child (WIX0005,
-         hit by the v0.8.0 run — #49). The group lives in a Fragment and
-         points its Component at INSTALLFOLDER via the Directory attribute;
-         the Feature's ComponentGroupRef needs nothing else. -->
-    <Fragment>
-      <ComponentGroup Id="MachComponents">
-        <Component Directory="INSTALLFOLDER" Id="MachExe" Guid="*">
-          <File Id="MachExeFile" Source="$(var.MachExeSource)" KeyPath="yes" />
-        </Component>
-      </ComponentGroup>
-    </Fragment>
+         hit by the v0.8.0 run — #49); and Package takes no Fragment child
+         either (WIX0005 again, caught by the new wix-smoke job on this very
+         PR — the guard already paying for itself). The legal v4/v5 shape:
+         ComponentGroup as a DIRECT child of Package, its Component pointed
+         at INSTALLFOLDER via the Directory attribute; the Feature's
+         ComponentGroupRef needs nothing else. -->
+    <ComponentGroup Id="MachComponents">
+      <Component Directory="INSTALLFOLDER" Id="MachExe" Guid="*">
+        <File Id="MachExeFile" Source="$(var.MachExeSource)" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
 
     <!-- The task's action line, quoted (Formatted string: the &quot; pairs
          are literal). Referenced by the schtasks command below. -->
