@@ -2,26 +2,32 @@
 <!--
   mach.wxs — the Windows MSI for the mach agent (#43).
 
-  Built by release.yml's msi job: wix build -arch x64|arm64
-    -define Version=<tag version>  -define MachExeSource=<staged mach.exe>
+  Built by release.yml's msi job:
+    wix build -ext WixToolset.Util.wixext -arch x64|arm64 \
+      -define Version=<tag version> -define MachExeSource=<staged mach.exe>
 
   What it does:
     - per-machine install of mach.exe into Program Files\mach\
-    - registers the `machd` Task Scheduler job at install (and refreshes it
-      on upgrade): ONLOGON trigger, run level HIGHEST, restart every minute
-      on failure — mirroring the Linux service contract (restart on
-      failure; exit 0 means stop. schtasks /RI only fires on failure
-      because the task's action exiting cleanly ends the task instance —
-      see packaging/README.md for the honest caveat about schtasks
-      restart semantics)
+    - registers the `machd` Task Scheduler job on install (refreshed on
+      upgrade): ONLOGON trigger, run level HIGHEST, /RI 1 restart interval
+      (see packaging/README.md's caveat on what /RI can honestly promise —
+      the restart-on-failure-only contract lives in the agent's exit codes)
     - deletes the task on uninstall
 
-  Validation is in release.yml's msi job: silent install, schtasks query,
-  silent uninstall, task gone.
+  Custom actions are WixQuietExec (WixToolset.Util.wixext), deferred with
+  Impersonate=no so the HIGHEST run-level task can be registered — the
+  documented v4/v5 pattern: a SetProperty stages the command into the
+  CustomActionData (property named exactly like the deferred action), and
+  the deferred WixQuietExec runs it (docs.firegiant.com/wix/tools/wixext/
+  quietexec — BinaryRef Wix4UtilCA_$(sys.BUILDARCHSHORT) covers x64/arm64).
 
-  Version note: MSI ProductVersion is numeric-only (major.minor.build);
-  the mach semver (e.g. 0.6.5) maps cleanly. The mach binary itself stays
-  internally stamped with the full version (AGENTS.md "one version string").
+  /TR quoting: the task's action must be the quoted path plus its argument
+  ("C:\Program Files\mach\mach.exe" run). MSI Formatted strings escape a
+  literal quote with a backslash (\"), so the nested argument is staged in
+  its own property (MACH_RUN_CMD) and embedded with \&quot;...&quot; —
+  the backslash pairs survive formatting, yielding
+    /TR ""C:\Program Files\mach\mach.exe" run"
+  which schtasks stores as the quoted command line.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package
@@ -31,14 +37,11 @@
       UpgradeCode="97A3604A-39DA-4238-B138-1D054D701DBF"
       Scope="perMachine"
       Compressed="yes"
-      Language="1033"
-      Codepage="1252">
+      Language="1033">
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
-
     <MediaTemplate EmbedCab="yes" />
 
-    <!-- Feature with the whole product; no UI sequence (silent install only). -->
     <Feature Id="Main" Level="1">
       <ComponentGroupRef Id="MachComponents" />
     </Feature>
@@ -53,43 +56,39 @@
       </Directory>
     </StandardDirectory>
 
-    <!-- The installed path, visible to the custom actions (formatted). -->
-    <Property Id="MACHEXE_PATH" Value="[(INSTALLFOLDER)mach.exe]" />
+    <!-- The task's action line, quoted (Formatted string: the &quot; pairs
+         are literal). Referenced by the schtasks command below. -->
+    <Property Id="MACH_RUN_CMD" Value="&quot;[(INSTALLFOLDER)mach.exe]&quot; run" />
 
-    <!-- schtasks argument: /TR needs the program path INTERNALLY quoted
-         (a path with spaces is one program token). The XML attribute uses
-         &quot; to put literal double quotes INSIDE the formatted value;
-         schtasks then stores the quoted command line in the task. -->
-    <Property Id="SCHTASKS_CREATE_ARGS"
-              Value="/Create /F /TN machd /RL HIGHEST /SC ONLOGON /RI 1 /TR &quot;[(INSTALLFOLDER)mach.exe] run&quot;" />
-    <Property Id="SCHTASKS_DELETE_ARGS" Value="/Delete /F /TN machd" />
+    <SetProperty
+        Id="RegisterMachd"
+        Value="&quot;[SystemFolder]schtasks.exe&quot; /Create /F /TN machd /RL HIGHEST /SC ONLOGON /RI 1 /TR \&quot;[MACH_RUN_CMD]\&quot;"
+        Before="RegisterMachd"
+        Sequence="execute" />
+    <CustomAction Id="RegisterMachd"
+                  BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
 
-    <!-- Deferred, no-impersonate: needs the machine-wide (HIGHEST) task
-         registration; runs after file placement (After=InstallFiles). -->
-    <CustomAction Id="RegisterMachdTask"
-                  DllEntry="CAQuietExec"
+    <SetProperty
+        Id="UnregisterMachd"
+        Value="&quot;[SystemFolder]schtasks.exe&quot; /Delete /F /TN machd"
+        Before="UnregisterMachd"
+        Sequence="execute" />
+    <CustomAction Id="UnregisterMachd"
+                  BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec"
                   Execute="deferred"
-                  Return="check"
-                  Impersonate="no" />
-    <CustomAction Id="SetRegisterMachdTask"
-                  Property="RegisterMachdTask"
-                  Value="&quot;[SystemFolder]schtasks.exe&quot; [SCHTASKS_CREATE_ARGS]"
-                  HideTarget="no" />
-    <CustomAction Id="UnregisterMachdTask"
-                  DllEntry="CAQuietExec"
-                  Execute="deferred"
-                  Return="ignore"
-                  Impersonate="no" />
-    <CustomAction Id="SetUnregisterMachdTask"
-                  Property="UnregisterMachdTask"
-                  Value="&quot;[SystemFolder]schtasks.exe&quot; [SCHTASKS_DELETE_ARGS]"
-                  HideTarget="no" />
+                  Impersonate="no"
+                  Return="ignore" />
 
     <InstallExecuteSequence>
-      <Custom Action="SetRegisterMachdTask" After="InstallFiles" Condition="NOT Installed" Condition2="NOT REMOVE" />
-      <Custom Action="RegisterMachdTask" After="SetRegisterMachdTask" Condition="NOT Installed" />
-      <Custom Action="SetUnregisterMachdTask" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL" />
-      <Custom Action="UnregisterMachdTask" After="SetUnregisterMachdTask" Condition="REMOVE~=&quot;ALL" />
+      <!-- Fresh install and upgrade both (re)register the task; uninstall
+           deletes it. A repair (REINSTALL) also refreshes it. -->
+      <Custom Action="RegisterMachd" After="InstallFiles" Condition="NOT REMOVE" />
+      <Custom Action="UnregisterMachd" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL" />
     </InstallExecuteSequence>
   </Package>
 </Wix>

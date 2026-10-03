@@ -6,9 +6,13 @@
 # Expects repo-sync.sh (MODE=no-apk copy of the apks) to have already
 # placed the .apk files under <pages>/apk/<arch>/.
 #
-# Index is UNSIGNED this round: consumers add the repo with
-# --allow-untrusted. When a key lands: abuild-sign APKINDEX.tar.gz (needs
-# the public key in /etc/apk/keys on consumers) — see repo-sync.sh header.
+# Index is UNSIGNED this round. apk's local validation of an unsigned
+# index refused it even under --allow-untrusted on a bare apk-tools 2.14
+# invocation (trust model wants per-repo context); the release workflow
+# therefore validates the built repos INSIDE an alpine container, and the
+# consumer line stays `apk add --repository <url> --allow-untrusted` until
+# signing lands. When a key exists: abuild-sign APKINDEX.tar.gz (public key
+# ships to /etc/apk/keys on consumers) — see repo-sync.sh header.
 set -eu
 PAGES="${1:?usage: repo-apk.sh <pages-root>}"
 

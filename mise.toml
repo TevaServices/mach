@@ -5,6 +5,7 @@
 [tools]
 go = "1.26"
 jq = "1.7"
+goreleaser = "2.18"
 
 [env]
 CGO_ENABLED = "0"

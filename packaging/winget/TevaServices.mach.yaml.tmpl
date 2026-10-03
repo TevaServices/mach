@@ -1,0 +1,24 @@
+# The winget version manifest (schema 1.9.0 as of 2026-10; bump deliberately
+# — validated by winget validate, see the runbook).
+PackageIdentifier: TevaServices.mach
+PackageVersion: __VER__
+PackageLocale: en-US
+Publisher: TevaServices
+PackageName: mach
+PackageUrl: https://github.com/TevaServices/mach
+License: Apache-2.0
+ShortDescription: mach agent - outbound-only remote access daemon (remote CLI access to enrolled machines)
+Description: |-
+  mach enrolls a machine to a mach-server control plane (outbound-only
+  connection, no inbound firewall holes) and serves remote CLI access to
+  it: exec, interactive console, streaming, with command audit and per-machine
+  command policies. The MSI registers the machd scheduled task so the agent
+  survives reboots.
+Moniker: mach
+Tags:
+  - remote-access
+  - agent
+  - security
+  - cli
+ManifestType: version
+ManifestVersion: 1.9.0

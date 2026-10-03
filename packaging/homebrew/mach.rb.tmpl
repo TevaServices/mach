@@ -52,7 +52,7 @@ class Mach < Formula
     keep_alive successful_exit: false
     log_path var/"log/mach.log"
     error_log_path var/"log/mach.log"
-    environment_variables MACH_STATE_DIR: var/"mach" # <RECONCILE service DSL env key with docs.brew.sh>
+    environment_variables MACH_STATE_DIR: "#{var}/mach"
   end
 
   test do
