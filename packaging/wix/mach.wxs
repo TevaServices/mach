@@ -47,14 +47,20 @@
     </Feature>
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="mach">
-        <ComponentGroup Id="MachComponents">
-          <Component Id="MachExe" Guid="*">
-            <File Id="MachExeFile" Source="$(var.MachExeSource)" KeyPath="yes" />
-          </Component>
-        </ComponentGroup>
-      </Directory>
+      <Directory Id="INSTALLFOLDER" Name="mach" />
     </StandardDirectory>
+
+    <!-- v4/v5 schema: a Directory takes no ComponentGroup child (WIX0005,
+         hit by the v0.8.0 run — #49). The group lives in a Fragment and
+         points its Component at INSTALLFOLDER via the Directory attribute;
+         the Feature's ComponentGroupRef needs nothing else. -->
+    <Fragment>
+      <ComponentGroup Id="MachComponents">
+        <Component Directory="INSTALLFOLDER" Id="MachExe" Guid="*">
+          <File Id="MachExeFile" Source="$(var.MachExeSource)" KeyPath="yes" />
+        </Component>
+      </ComponentGroup>
+    </Fragment>
 
     <!-- The task's action line, quoted (Formatted string: the &quot; pairs
          are literal). Referenced by the schtasks command below. -->
