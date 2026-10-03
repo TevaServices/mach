@@ -463,6 +463,18 @@ to run it, and for why the driver difference matters.
   runs once (the mirror on the machine stands down for exactly that dispatch,
   never for the machine's own rules), and the spent grant stays in the record.
   Green = 213 checks.
+- **The service-registration properties live in the shipped packaging
+  artifacts** (`cmd/mach/packaging_test.go`), not in agent code: since the
+  packages took over service registration (#44 removed `mach install`), the
+  assertions the old `internal/agent/install_test.go` carried on the
+  *generated* unit pin the *shipped* files — `machd.service`'s
+  `Restart=on-failure` (invariant 22: exit 0 means stop), the OpenRC
+  script's no-unconditional-respawn, the brew template's
+  `keep_alive successful_exit: false`, enable-never-start in the deb/rpm/apk
+  maintainer scripts, and the attest hook's WARNING refusal. A packaging
+  change that silently changes supervision semantics turns these red.
+  `mise run pack` runs goreleaser check + a snapshot build locally (no
+  attest without a release key; the release pipeline enforces it).
 - Timing-sensitive e2e checks (streaming) use a real sleep and a real
   background process; if one flakes, make the sleep longer rather than
   weakening the assertion.

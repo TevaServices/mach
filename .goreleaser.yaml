@@ -179,41 +179,14 @@ nfpms:
       postinstall: packaging/nfpm/apk/post-install.sh
       preremove: packaging/nfpm/apk/pre-deinstall.sh
 
+
 # --- Homebrew tap (#42) ----------------------------------------------------
-# goreleaser generates the formula into the dedicated tap; binaries are
-# fetched from this repo's GitHub Releases. `service` is the Homebrew
-# service DSL verbatim (docs.brew.sh Formula-Coookbook service block):
-# keep_alive successful_exit: false is the launchd semantic matching
-# Restart=on-failure (invariant 22) and brew services generates BOTH the
-# launchd plist (macOS) and a systemd unit (Linuxbrew) from it.
-# The tap repo (TevaServices/homebrew-mach) must exist; the workflow passes
-# GORELEASER_GH_TOKEN with content-write on it (a GITHUB_TOKEN is scoped to
-# one repo and cannot push to another).
-brews:
-  - name: mach
-    repository:
-      owner: TevaServices
-      name: homebrew-mach
-    commit_author:
-      name: tevaservices-hermes-dev[bot]
-      email: 332528159+tevaservices-hermes-dev[bot]@users.noreply.github.com
-    commit_msg_template: "Brew formula update for {{ .ProjectName }} version {{ .Tag }}"
-    directory: Formula
-    homepage: https://github.com/TevaServices/mach
-    description: "mach agent — outbound-only remote access daemon (remote CLI access to enrolled machines)"
-    license: "Apache-2.0"
-    caveats: |-
-      Permanent install (survives reboots): enroll first — `mach` performs
-      the QR enrollment — then `brew services start mach`.
-      Without brew services, `mach run` starts the daemon by hand.
-      State dir: <prefix>/var/mach (override with MACH_STATE_DIR).
-    test: |
-      system "#{bin}/mach", "version"
-    install: |
-      bin.install "mach"
-    service: |-
-      run [opt_bin/"mach", "run"]
-      keep_alive successful_exit: false
-      log_path var/"log/mach.log"
-      error_log_path var/"log/mach.log"
-      environment_variables MACH_STATE_DIR: var/"mach"
+# NOT goreleaser's brews: it is deprecated upstream (v2.10, casks are the
+# replacement) and `goreleaser check` fails on any deprecated property, which
+# would turn config validation into a permanent, unfixable red. The formula
+# lives as a template at packaging/homebrew/mach.rb.tmpl and is generated +
+# pushed to TevaServices/homebrew-mach by a release job (scripts/brew-bump.sh)
+# — the URLs and sha256s come from the goreleaser artifacts this same run
+# produced, so the tap is never hand-edited. The service block in the
+# template is the Homebrew service DSL (keep_alive successful_exit: false —
+# the launchd semantic matching Restart=on-failure, invariant 22).

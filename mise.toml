@@ -83,6 +83,16 @@ run = "go vet ./..."
 description = "End-to-end test: spins up control plane + agents on 127.0.0.1 (script builds its own binaries)"
 run = "bash scripts/e2e.sh"
 
+# Local packaging check (no publishing): validates .goreleaser.yaml and
+# produces dist/ packages + archives without attest hooks needing a release
+# key. The full release path (attest) is exercised by CI on a tag.
+[tasks.pack]
+description = "goreleaser check + snapshot build of archives and deb/rpm/apk packages into dist/ (attest skipped without a release key)"
+run = '''
+goreleaser check
+CGO_ENABLED=0 goreleaser release --snapshot --clean --skip=validate
+'''
+
 # The store has two drivers and one schema, and they are not the same concurrency
 # model (SQLite opens with MaxOpenConns(1), Postgres with 25) — so the same suite
 # runs against both, and a change that is correct only because nothing can

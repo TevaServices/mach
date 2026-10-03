@@ -72,7 +72,7 @@ A machine's output goes to stdout verbatim; mach's own messages go to stderr
 with a `mach: ` prefix, so a script never has to guess which is which.
 
 Advanced flags still exist for automation (`mach register --api-key K --name N`,
-`mach install`, `mach run`), but nothing *requires* them. Everything on the
+`mach run`), but nothing *requires* them. Everything on the
 control plane — API keys, revocation, update pushes, release attestations —
 lives in the separate `mach-server` binary, which is what runs in the container.
 
@@ -89,7 +89,46 @@ lives in the separate `mach-server` binary, which is what runs in the container.
   `~/.mach` (user), `%APPDATA%\mach`-equivalent user dir on Windows.
 - **Binaries:** static, CGO-free; linux/macOS/Windows × amd64/arm64.
 
-## Enrollment
+## Installing the client (distribution packages)
+
+The binary no longer self-installs — the OS package managers own service
+registration. All packages create a dedicated unprivileged `mach` account
+and a state dir it owns (`/var/lib/mach` on Linux; Homebrew-prefix-relative
+`var/mach` on brew; `%APPDATA%\mach` on Windows), and **enable but do not
+start** the service: enrollment is a person at the machine.
+
+| Platform | Install | Then |
+|---|---|---|
+| Debian/Ubuntu (apt) | from the package repo (see below) — the packages are also attached to each GitHub Release | enroll + start via systemd |
+| Fedora/RHEL (dnf) | same | same |
+| Alpine (apk) | same | same (OpenRC instead of systemd) |
+| macOS / Linuxbrew | `brew install tevaservices/mach/mach` | `brew services start mach` |
+| Windows | `winget install TevaServices.mach` (MSI registers the `machd` Task Scheduler job) | runs at logon |
+
+Enrollment is unchanged and works the same on every platform: run `mach` on
+the machine (QR enrollment, temporary session), or headlessly with a key
+(see below). For the permanent service on Linux, enroll **as the service
+account** so the state files it needs end up owned by it:
+
+```bash
+sudo -u mach mach register --server https://… --api-key KEY --name web-01
+sudo systemctl start machd        # Fedora/RHEL/Debian/Ubuntu
+sudo rc-service machd start      # Alpine (OpenRC)
+```
+
+(`mach run` runs the daemon by hand anywhere. The systemd unit keeps
+`Restart=on-failure` — exit 0 always means stop: a revoked machine's agent
+retires itself and stays retired, and a pushed update hands off with a clean
+exit.)
+
+**Linux package repositories** are synced from GitHub Releases to this
+repo's `gh-pages` branch after each tag (`repo-sync.yml`):
+
+```text
+deb  deb https://tevaservices.github.io/mach stable main
+rpm  https://tevaservices.github.io/mach/rpm/  (gpgcheck=0 today; signed once a release key exists)
+apk  https://tevaservices.github.io/mach/apk/  (add with --allow-untrusted until signing lands)
+```
 
 **QR (interactive):** `mach` on the new machine prints a QR whose URL points
 at the **control plane** (the phone never needs to reach the agent), plus a

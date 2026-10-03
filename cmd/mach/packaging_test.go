@@ -219,13 +219,43 @@ func TestApkShipsOpenRCWithoutUnconditionalRestart(t *testing.T) {
 	mustNotContain(t, post, "apk post-install", "rc-service machd start")
 }
 
-// The apk must not ship the systemd unit (no systemd on alpine) — pinned
-// at the goreleaser config level via per-format overrides.
-func TestGoreleaserOverridesApkContentsOffSystemdUnit(t *testing.T) {
+// goreleaser config: the apk entry must not carry the systemd unit (no
+// systemd on alpine) — split off as its own nfpms entry (per-format
+// maintainer scripts), shipping the OpenRC script instead.
+func TestGoreleaserApkEntryShipsOpenRCNotSystemd(t *testing.T) {
 	s := readPackaging(t, ".goreleaser.yaml")
-	if !strings.Contains(s, "overrides:") {
-		t.Fatalf(".goreleaser.yaml: no overrides section")
+	idx := strings.Index(s, "id: packages-apk")
+	if idx < 0 {
+		t.Fatalf(".goreleaser.yaml: no packages-apk nfpms entry")
 	}
+	apkEntry := s[idx:]
+	mustContain(t, apkEntry, "packages-apk entry",
+		"formats: [apk]", "packaging/openrc/machd", "/etc/init.d/machd")
+	mustNotContain(t, apkEntry, "packages-apk entry", "machd.service")
+
+	// deb/rpm entries ship the systemd unit.
+	for _, id := range []string{"id: packages-deb", "id: packages-rpm"} {
+		i := strings.Index(s, id)
+		if i < 0 {
+			t.Fatalf(".goreleaser.yaml: missing nfpms entry %s", id)
+		}
+		mustContain(t, s[i:], id, "machd.service")
+	}
+}
+
+// The Homebrew formula template carries the supervision contract in the
+// service DSL: keep_alive successful_exit: false — restart on failure only
+// (invariant 22; brew services renders it as launchd's
+// KeepAlive SuccessfulExit=false and as the matching systemd unit on Linuxbrew).
+func TestBrewTemplateServiceKeepsFailureOnlyRestart(t *testing.T) {
+	s := readPackaging(t, "packaging/homebrew/mach.rb.tmpl")
+	mustContain(t, s, "mach.rb.tmpl",
+		"keep_alive successful_exit: false",
+		"service do",
+		"MACH_STATE_DIR",
+		"system \"#{bin}/mach\", \"version\"", // test block: the formula validates itself
+	)
+	mustNotContain(t, s, "mach.rb.tmpl", "keep_alive true", "__VER__\n  ")
 }
 
 // attest hook refuses to ship an attestation that reports a WARNING

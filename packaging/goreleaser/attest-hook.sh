@@ -15,12 +15,21 @@
 set -eu
 
 BIN="$1"; VER="$2"; OS="$3"; ARCH="$4"
+NAME="$(basename "$BIN")"
 
-# Dist root: the binary lives in dist/<binary>_<os>_<arch>/<name>;
+# Dev/snapshot builds run without a release key: attest is the release-time
+# control and release.yml always sets MACH_SERVER_KEY (it fails the release
+# when the secret is missing), so absence here means a local/snapshot run —
+# note it and skip, don't fail. With a key present, a WARNING is fatal.
+if [ -z "${MACH_SERVER_KEY:-}" ]; then
+    echo "attest-hook: $NAME ($OS/$ARCH) skipped: no MACH_SERVER_KEY (dev/snapshot build, not attested)"
+    exit 0
+fi
+
+# Dist root: the binary lives in dist/<name>_<arch id>/<name>;
 # hooks run from the repo root.
 DIST="$(pwd)/dist"
 MARKER="$DIST/.mach-server-$VER.attest-tool"
-NAME="$(basename "$BIN")"
 
 if [ ! -x "$MARKER" ]; then
     mkdir -p "$DIST"

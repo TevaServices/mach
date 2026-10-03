@@ -6,4 +6,4 @@
 *.key
 console.json
 # written by `mise run test -coverprofile=coverage.out`, at the repo root
-coverage.out
+coverage.outdist/
