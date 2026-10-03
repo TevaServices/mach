@@ -101,7 +101,6 @@ nfpms:
           group: mach
           mode: 0700
     scripts:
-      preinstall: packaging/nfpm/deb/preinst
       postinstall: packaging/nfpm/deb/postinst
       preremove: packaging/nfpm/deb/prerm
       postremove: packaging/nfpm/deb/postrm
