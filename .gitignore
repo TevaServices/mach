@@ -6,4 +6,6 @@
 *.key
 console.json
 # written by `mise run test -coverprofile=coverage.out`, at the repo root
-coverage.outdist/
+coverage.out
+# goreleaser build output (local `mise run pack` / snapshot runs)
+dist/
