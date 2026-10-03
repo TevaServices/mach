@@ -1,0 +1,23 @@
+#!/bin/sh
+# deb postrm — remove state only on PURGE. On plain remove, the enrollment
+# (agent identity + config) stays — re-installing re-enrolls nothing and
+# keeps the machine's identity. `dpkg -P mach` is the "this machine is
+# leaving the fleet" path.
+
+set -e
+
+if [ "$1" = "purge" ]; then
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable machd.service >/dev/null 2>&1 || true
+    fi
+    rm -rf /var/lib/mach
+    # The service account is removed only on purge as well.
+    if getent passwd mach >/dev/null; then
+        deluser --system mach || true
+    fi
+    if getent group mach >/dev/null; then
+        delgroup --system mach || true
+    fi
+fi
+
+#DEBHELPER#

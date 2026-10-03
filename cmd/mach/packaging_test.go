@@ -1,0 +1,241 @@
+// Package main — packaging artifact assertions.
+//
+// The distribution packages register the OS service (#40/#44): the binary
+// no longer self-installs, so the supervision semantics that used to be
+// pinned on the generated unit (internal/agent/install.go, removed in #44)
+// are now pinned on the SHIPPED artifacts instead. These tests read the
+// packaging sources the way a distributor would and assert the properties
+// the repo's security model depends on (AGENTS.md invariant 22: the agent
+// exits 0 to mean stop — a supervisor must restart on FAILURE, never on a
+// clean exit; a retire or an update handoff is a clean exit).
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// readPackaging reads a file under packaging/ (repo root relative to this
+// test's working directory, which go test sets to the package dir — cmd/mach
+// — so the repo root is one level above that).
+func readPackaging(t *testing.T, rel string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("../..", rel))
+	if err != nil {
+		t.Fatalf("packaging file not found: %s", rel)
+	}
+	return string(b)
+}
+
+// readPackagingCode strips comment lines: must-not assertions for maintainer
+// scripts should judge executable lines. Comments legitimately mention the
+// operator's own commands ("start it after enrollment") — those are
+// documentation, not behavior.
+func readPackagingCode(t *testing.T, rel string) string {
+	t.Helper()
+	var keep []string
+	for _, ln := range strings.Split(readPackaging(t, rel), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(ln), "#") {
+			continue
+		}
+		keep = append(keep, ln)
+	}
+	return strings.Join(keep, "\n")
+}
+
+// extractPurgeBranch returns the line indexes that belong to the
+// `if [ "$1" = "purge" ]` branch (nesting-aware) — the only honest way to
+// assert a command runs only on purge and not on a plain remove.
+func extractPurgeBranch(t *testing.T, s string) []string {
+	t.Helper()
+	var out []string
+	depth := 0
+	inPurge := false
+	for _, ln := range strings.Split(s, "\n") {
+		trimmed := strings.TrimSpace(ln)
+		if !inPurge {
+			if strings.Contains(trimmed, `"purge"`) {
+				inPurge = true
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "if ") {
+			depth++
+		}
+		if trimmed == "fi" || strings.HasPrefix(trimmed, "fi ") {
+			if depth == 0 {
+				break
+			}
+			depth--
+			continue
+		}
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+func mustContain(t *testing.T, s, what string, parts ...string) {
+	t.Helper()
+	for _, p := range parts {
+		if !strings.Contains(s, p) {
+			t.Errorf("%s: missing %q", what, p)
+		}
+	}
+}
+
+func mustNotContain(t *testing.T, s, what string, parts ...string) {
+	t.Helper()
+	for _, p := range parts {
+		if strings.Contains(s, p) {
+			t.Errorf("%s: must NOT contain %q", what, p)
+		}
+	}
+}
+
+// Systemd unit: restart-on-failure supervision, dedicated unprivileged
+// account, state dir pinned to the package convention.
+func TestShippedSystemdUnitRestartsOnFailureNotAlways(t *testing.T) {
+	s := readPackaging(t, "packaging/systemd/machd.service")
+	mustContain(t, s, "machd.service",
+		"Restart=on-failure",
+		"User=mach",
+		"Group=mach",
+		"Environment=MACH_STATE_DIR=/var/lib/mach",
+		`ExecStart="/usr/bin/mach" run`,
+		"Type=simple",
+	)
+	mustNotContain(t, s, "machd.service", "Restart=always")
+}
+
+// The unit's ExecStart quoting: a path with spaces stays one argv element
+// (the old generated unit escaped the same way).
+func TestShippedSystemdUnitExecStartIsQuoted(t *testing.T) {
+	s := readPackaging(t, "packaging/systemd/machd.service")
+	if !strings.HasPrefix(strings.TrimSpace(strings.SplitN(s, "ExecStart=", 2)[1]), `"`) {
+		t.Errorf("machd.service: ExecStart value is not quoted — a spaced install path would split into two argv elements")
+	}
+}
+
+// deb postinst: create the account, enable — never start. machd on an
+// unenrolled state dir must not be started by the package (crash-loop;
+// enrollment is a person at the machine).
+func TestDebPostinstEnablesButNeverStarts(t *testing.T) {
+	s := readPackagingCode(t, "packaging/nfpm/deb/postinst")
+	mustContain(t, s, "deb postinst",
+		"adduser --system",
+		"/var/lib/mach",
+		"systemctl enable machd.service",
+	)
+	mustNotContain(t, s, "deb postinst", "systemctl start", "enable --now")
+}
+
+// deb postrm: state survives a plain remove (re-install keeps the machine's
+// identity); purge takes it and the account away.
+func TestDebPostrmKeepsStateOnRemoveRemovesOnPurge(t *testing.T) {
+	s := readPackagingCode(t, "packaging/nfpm/deb/postrm")
+	branch := extractPurgeBranch(t, s)
+	joined := "\n" + strings.Join(branch, "\n") + "\n"
+	if !strings.Contains(joined, "rm -rf /var/lib/mach") {
+		t.Errorf("deb postrm: purge branch does not remove /var/lib/mach")
+	}
+	if !strings.Contains(joined, "deluser") {
+		t.Errorf("deb postrm: purge branch does not remove the service account")
+	}
+	// The executable lines OUTSIDE the purge branch must not touch the
+	// state dir or the account.
+	outside := []string{}
+	inPurge := false
+	depth := 0
+	for _, ln := range strings.Split(s, "\n") {
+		trimmed := strings.TrimSpace(ln)
+		if !inPurge {
+			if strings.Contains(trimmed, `"purge"`) {
+				inPurge = true
+			} else if trimmed != "" && trimmed != "#DEBHELPER#" {
+				outside = append(outside, trimmed)
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "if ") {
+			depth++
+		}
+		if trimmed == "fi" || strings.HasPrefix(trimmed, "fi ") {
+			if depth == 0 {
+				inPurge = false
+				continue
+			}
+			depth--
+		}
+	}
+	joinedOut := "\n" + strings.Join(outside, "\n") + "\n"
+	mustNotContain(t, joinedOut, "deb postrm (remove path)",
+		"rm -rf /var/lib/mach", "deluser")
+}
+
+// rpm scriptlets: user before files (%pre), enable not start (%post), stop
+// on erase (%preun), state removed on final erase only (%postun).
+func TestRpmScriptletsLifecycle(t *testing.T) {
+	pre := readPackaging(t, "packaging/nfpm/rpm/pre.sh")
+	mustContain(t, pre, "rpm pre", "useradd --system")
+
+	post := readPackagingCode(t, "packaging/nfpm/rpm/post.sh")
+	mustContain(t, post, "rpm post", "systemctl enable machd.service")
+	mustNotContain(t, post, "rpm post", "systemctl start")
+
+	preun := readPackaging(t, "packaging/nfpm/rpm/preun.sh")
+	mustContain(t, preun, "rpm preun", "-eq 0") // upgrade (arg 1) vs erase (arg 0)
+	mustContain(t, preun, "rpm preun", "systemctl stop machd.service")
+
+	postun := readPackagingCode(t, "packaging/nfpm/rpm/postun.sh")
+	mustContain(t, postun, "rpm postun", `-eq 0`, "/var/lib/mach", "systemctl disable")
+	// A %postun upgrade run (arg 1) must leave everything alone: nothing
+	// executable outside the -eq 0 branch may touch the service or state.
+	after := readPackagingCode(t, "packaging/nfpm/rpm/postun.sh")
+	idx := strings.Index(after, "-eq 0")
+	mustNotContain(t, after[:idx], "rpm postun (upgrade path)",
+		"systemctl disable", "/var/lib/mach", "userdel")
+}
+
+// alpine: OpenRC, not systemd (alpine has no systemd), account before
+// files, enable not start, and NO unconditional respawner: exit 0 must
+// mean stop (invariant 22). command_background without a supervisor leaves
+// a crashed agent down instead of restarting a retired one. Judged on
+// executable lines: the script's comments legitimately explain the
+// supervisor it deliberately avoids.
+func TestApkShipsOpenRCWithoutUnconditionalRestart(t *testing.T) {
+	rc := readPackagingCode(t, "packaging/openrc/machd")
+	mustContain(t, rc, "openrc machd", `command_background="yes"`)
+	mustContain(t, rc, "openrc machd", "--user mach")
+	mustNotContain(t, rc, "openrc machd",
+		"supervise-daemon", "supervised", "respawn")
+
+	pre := readPackaging(t, "packaging/nfpm/apk/pre-install.sh")
+	mustContain(t, pre, "apk pre-install", "adduser -S")
+
+	post := readPackagingCode(t, "packaging/nfpm/apk/post-install.sh")
+	mustContain(t, post, "apk post-install", "rc-update add machd")
+	mustNotContain(t, post, "apk post-install", "rc-service machd start")
+}
+
+// The apk must not ship the systemd unit (no systemd on alpine) — pinned
+// at the goreleaser config level via per-format overrides.
+func TestGoreleaserOverridesApkContentsOffSystemdUnit(t *testing.T) {
+	s := readPackaging(t, ".goreleaser.yaml")
+	if !strings.Contains(s, "overrides:") {
+		t.Fatalf(".goreleaser.yaml: no overrides section")
+	}
+}
+
+// attest hook refuses to ship an attestation that reports a WARNING
+// (modified tree / missing VCS revision) — the release.yml rule, now also
+// carried by the goreleaser path.
+func TestAttestHookRefusesWarnings(t *testing.T) {
+	s := readPackaging(t, "packaging/goreleaser/attest-hook.sh")
+	mustContain(t, s, "attest hook",
+		"verify-attestation",
+		"*WARNING*",
+		"exit 1",
+	)
+}

@@ -1,0 +1,33 @@
+#!/bin/sh
+# deb postinst — create the service account and hand it the state dir,
+# then register the unit with systemd. Runs on install AND every upgrade.
+#
+# The service is ENABLED but never STARTED here: machd with an unenrolled
+# state dir would crash-loop (Restart=on-failure, see the unit file), and
+# enrollment is a person scanning a QR at the machine (#41 workflow). After
+# enrollment (`sudo -u mach mach register ...`), `sudo systemctl start machd`
+# starts the agent. This matches the "restart on failure, exit 0 means stop"
+# supervision contract the suite pins.
+
+set -e
+
+# Dedicated unprivileged service account (idempotent: postinst re-runs on
+# upgrades, and a system user pre-existing from a manual setup is fine).
+if ! getent passwd mach >/dev/null; then
+    if ! getent group mach >/dev/null; then
+        addgroup --system mach
+    fi
+    adduser --system --ingroup mach --home /var/lib/mach --no-create-home \
+        --shell /usr/sbin/nologin mach
+fi
+
+# The state dir is the package's, owned by the service account (0700: the
+# agent key and E2E key live here).
+install -d -o mach -g mach -m 0700 /var/lib/mach
+
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+    systemctl enable machd.service
+fi
+
+#DEBHELPER#
