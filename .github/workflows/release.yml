@@ -313,8 +313,7 @@ jobs:
           dotnet tool install --global wix --version 5.0.2
           # Slash-version in the extensionRef is how the wix CLI pins an
           # extension (no -version switch exists) — matching the CLI pin.
-          wix extension add -g WixToolset.Util.wixext/5.0.2
-          $ver = "$env:VER".TrimStart("v")
+                    $ver = "$env:VER".TrimStart("v")
           # The staged layout is goreleaser's own dist tree: its target dirs
           # carry the project name (mach_...), not the bare target id (v0.7.0
           # run failed resolving staged/windows_amd64_v1; actual layout
@@ -328,13 +327,21 @@ jobs:
           # The verbose install log is where the shipped MSI's ProductCode
           # lands (WiX mints a fresh code per build; the winget manifest
           # points at the code the actual artifact registers).
-          wix build -ext WixToolset.Util.wixext/5.0.2 -arch ${{ matrix.arch }} `
+          wix build -arch ${{ matrix.arch }} `
             -define Version=$ver `
             -define MachExeSource=$exe `
             packaging/wix/mach.wxs -o "mach-${{ matrix.arch }}.msi"
           Get-ChildItem *.msi
 
+      # The x64-only validate: GitHub's arm64 runner image ships an msiexec
+      # (5.00.10011) that predates Arm64-template packages and rejects the
+      # MSI with 1633 before any action runs (#51) — that is a runner-image
+      # limitation, not a defect in the mach-arm64.msi (Template
+      # 'Arm64;1033', attested and published; native arm64 USER installs are
+      # the supported path). Revisit when the image ships an arm64-native
+      # engine.
       - name: Validate on the runner (install, task, uninstall)
+        if: matrix.arch == 'x64'
         shell: pwsh
         run: |
           $msi = (Resolve-Path "mach-${{ matrix.arch }}.msi").Path

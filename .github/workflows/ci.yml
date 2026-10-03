@@ -93,9 +93,8 @@ jobs:
         shell: pwsh
         run: |
           dotnet tool install --global wix --version 5.0.2
-          wix extension add -g WixToolset.Util.wixext/5.0.2
-          'stub' | Out-File -Encoding ascii mach-smoke.exe
-          wix build -ext WixToolset.Util.wixext/5.0.2 -arch x64 `
+                    'stub' | Out-File -Encoding ascii mach-smoke.exe
+          wix build -arch x64 `
             -define Version=0.0.0-smoke `
             -define MachExeSource=mach-smoke.exe `
             packaging/wix/mach.wxs -o mach-smoke.msi
