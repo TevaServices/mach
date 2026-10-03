@@ -424,7 +424,8 @@ func TestPermanentReEnrollmentClearsTemporaryOverHTTP(t *testing.T) {
 		enrollTemporaryBody(key, pub1, "bcross-here", true)); code != http.StatusOK {
 		t.Fatalf("temporary enrollment: %d (%s)", code, body)
 	}
-	// `mach install` on a host that ran plain `mach`: same name, permanent.
+	// A permanent enrollment on a host that ran plain `mach` (how the packaged
+	// service registers since #40): same name, permanent.
 	pub2, _ := newKeyHex(t)
 	if code, body := bearerJSON(t, s.Routes(), "POST", "/v1/register/apikey", "",
 		enrollTemporaryBody(key, pub2, "bcross-here", false)); code != http.StatusOK {

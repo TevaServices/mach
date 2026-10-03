@@ -10,7 +10,8 @@ package agent
 //
 // The other half of the property, tested by construction here and by the caller
 // in cmd/mach, is that the temporary path never touches the *installed* agent's
-// state: it cannot read, re-key or delete an enrollment an `mach install` made.
+// state: it cannot read, re-key or delete an enrollment the packaged service
+// (the distribution packages own service registration since #40) runs on.
 
 import (
 	"bytes"
@@ -147,7 +148,8 @@ func TestPersistentRegistrationStillWrites(t *testing.T) {
 }
 
 // A temporary session must not disturb an installed agent: it neither reads nor
-// writes that state, so an `mach install` survives someone typing `mach`.
+// writes that state, so the installed agent's packaged service survives
+// someone typing `mach` on the same host.
 func TestTemporarySessionLeavesAnInstalledEnrollmentAlone(t *testing.T) {
 	dir := t.TempDir()
 	srv, _ := fakePlane(t)
