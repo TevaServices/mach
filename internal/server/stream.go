@@ -90,6 +90,13 @@ type streamRelay struct {
 	// stopOnce guards Done, which two goroutines may now want to close: the
 	// handler's own teardown and an operator's block.
 	stopOnce sync.Once
+	// auditDone closes once the running command's real exit record has been
+	// written to the audit trail. The teardown's fate-unknown fallback waits
+	// for it (bounded) instead of racing the audit pump for takeCommand(): the
+	// pump winning that race used to leave the row to say the command's fate
+	// was unknown while the real exit status sat in a frame that WAS relayed.
+	auditDone chan struct{}
+	stopAudit sync.Once
 
 	// Audit bookkeeping for the command running in this session. Guarded
 	// because the console pump (which captures output) and the console read
@@ -108,12 +115,17 @@ func newStreamRelay(machine, key string, console *protocol.WSConn) *streamRelay 
 		console:   console,
 		toConsole: make(chan protocol.Envelope, 64),
 		Done:      make(chan struct{}),
+		auditDone: make(chan struct{}),
 	}
 }
 
 // stop ends this session's delivery loop. Idempotent, because the handler's own
 // teardown and an operator's kill can both reach it.
 func (r *streamRelay) stop() { r.stopOnce.Do(func() { close(r.Done) }) }
+
+// markAudited records that the running command's exit record reached the audit
+// trail exactly once; idempotent, like stop.
+func (r *streamRelay) markAudited() { r.stopAudit.Do(func() { close(r.auditDone) }) }
 
 // kill ends the session from outside its handler: the console is told why, and
 // then the socket is closed.
@@ -314,6 +326,16 @@ func (r *streamRelay) takeCommand() (command, source, stdout, stderr string, ok 
 	return command, source, stdout, stderr, ok
 }
 
+// streamPumpDrain bounds how long the relay's audit pump keeps draining after
+// the session ended, so an end frame racing the console's death is still
+// audited with its real exit status rather than fate-unknown.
+const streamPumpDrain = 2 * time.Second
+
+// streamAuditGrace bounds how long the session's teardown waits for the audit
+// pump to write the command's real exit record before falling back to the
+// fate-unknown row. Same event, the other side of the handoff.
+const streamAuditGrace = 2 * time.Second
+
 // handleConsoleStreamWS is the console's streaming endpoint (machine in the
 // query string, same bearer auth as exec).
 func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
@@ -393,12 +415,22 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 		// The command's fate on the machine is unknown; it is not cancelled by
 		// the console going away, so the row says as much rather than
 		// pretending it succeeded.
-		if command, source, stdout, stderr, ok := relay.takeCommand(); ok {
-			if stderr != "" {
-				stderr += "\n"
+		// The wait is the pump/teardown handoff: an end frame racing this
+		// teardown is relayed (and audited) by the pump above, and the two used
+		// to race for takeCommand() — the loser's row silently missing, so a
+		// command was buried under a fate-unknown row it did not earn. Bounded,
+		// so a dead agent still gets its row promptly.
+		select {
+		case <-relay.auditDone:
+			// the real row is already in the trail
+		case <-time.After(streamAuditGrace):
+			if command, source, stdout, stderr, ok := relay.takeCommand(); ok {
+				if stderr != "" {
+					stderr += "\n"
+				}
+				stderr += "[mach: stream closed before the command reported an exit status]"
+				s.auditRow(machine, command, source, sqlNullInt(-1), stdout, stderr)
 			}
-			stderr += "[mach: stream closed before the command reported an exit status]"
-			s.auditRow(machine, command, source, sqlNullInt(-1), stdout, stderr)
 		}
 	}()
 
@@ -433,37 +465,64 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 	})
 
 	// Agent → console, plus the audit capture that has to see the frames go by.
+	//
+	// The audit row is written for every stream_end that is RELAYED, not only
+	// for one whose console write succeeded: a console that died mid-write
+	// still ran the command, and the exit status is a fact about the machine.
+	// After relay.done closes the loop keeps reading anything the agent pump
+	// already queued — a stream_end sitting in the channel when the console was
+	// killed used to be dropped here, leaving the fate-unknown row below to
+	// speak for a command whose real exit status had in fact arrived.
 	go func() {
+		serve := func(env protocol.Envelope) {
+			if env.Type == "stream_out" {
+				var out protocol.StreamOut
+				if json.Unmarshal(env.Payload, &out) == nil {
+					if b, derr := base64.StdEncoding.DecodeString(out.B64); derr == nil {
+						relay.capture(out.Stream, b)
+					}
+				}
+			}
+			if env.Type != "stream_end" {
+				_ = consoleConn.WriteEnvelope(env)
+				return
+			}
+			var end protocol.StreamEnd
+			_ = json.Unmarshal(env.Payload, &end)
+			_ = consoleConn.WriteEnvelope(env) // best effort: the audit below does not depend on it
+			if command, source, stdout, stderr, ok := relay.takeCommand(); ok {
+				if end.Error != "" {
+					if stderr != "" {
+						stderr += "\n"
+					}
+					stderr += "[mach: " + end.Error + "]"
+				}
+				s.auditRow(machine, command, source, sqlNullInt(end.ExitCode), stdout, stderr)
+				// The row is IN. The session's teardown (and its own
+				// fate-unknown fallback) can stop waiting for this command.
+				relay.markAudited()
+			}
+		}
 		for {
 			select {
 			case env := <-relay.toConsole:
-				if env.Type == "stream_out" {
-					var out protocol.StreamOut
-					if json.Unmarshal(env.Payload, &out) == nil {
-						if b, derr := base64.StdEncoding.DecodeString(out.B64); derr == nil {
-							relay.capture(out.Stream, b)
-						}
-					}
-				}
-				if err := consoleConn.WriteEnvelope(env); err != nil {
-					return
-				}
-				if env.Type != "stream_end" {
-					continue
-				}
-				var end protocol.StreamEnd
-				_ = json.Unmarshal(env.Payload, &end)
-				if command, source, stdout, stderr, ok := relay.takeCommand(); ok {
-					if end.Error != "" {
-						if stderr != "" {
-							stderr += "\n"
-						}
-						stderr += "[mach: " + end.Error + "]"
-					}
-					s.auditRow(machine, command, source, sqlNullInt(end.ExitCode), stdout, stderr)
-				}
+				serve(env)
 			case <-relay.Done:
-				return
+				// stop(): the console is gone, or teardown began. Frames already
+				// queued (the agent's end record racing the kill) are still the
+				// agent's words — audit a stream_end if one is in there, bounded.
+				deadline := time.After(streamPumpDrain)
+				for {
+					select {
+					case env := <-relay.toConsole:
+						serve(env)
+						if env.Type == "stream_end" {
+							return
+						}
+					case <-deadline:
+						return
+					}
+				}
 			}
 		}
 	}()
