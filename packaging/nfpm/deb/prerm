@@ -1,0 +1,16 @@
+#!/bin/sh
+# deb prerm — stop the service before the binary goes away (upgrade or
+# removal). Do NOT mask or disable at remove time beyond what dpkg does:
+# `dpkg -r` keeps conffiles, and the postinst on upgrade re-enables.
+# A revoked/deleted machine's agent exits 0 on its own — that is the stop
+# mechanism; this is only the package lifecycle hook.
+
+set -e
+
+if [ "$1" = "remove" ] || [ "$1" = "upgrade" ]; then
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl stop machd.service || true
+    fi
+fi
+
+#DEBHELPER#

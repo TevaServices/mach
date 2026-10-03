@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  mach.wxs — the Windows MSI for the mach agent (#43).
+
+  Built by release.yml's msi job:
+    wix build -ext WixToolset.Util.wixext -arch x64|arm64 \
+      -define Version=<tag version> -define MachExeSource=<staged mach.exe>
+
+  What it does:
+    - per-machine install of mach.exe into Program Files\mach\
+    - registers the `machd` Task Scheduler job on install (refreshed on
+      upgrade): ONLOGON trigger, run level HIGHEST, /RI 1 restart interval
+      (see packaging/README.md's caveat on what /RI can honestly promise —
+      the restart-on-failure-only contract lives in the agent's exit codes)
+    - deletes the task on uninstall
+
+  Custom actions are WixQuietExec (WixToolset.Util.wixext), deferred with
+  Impersonate=no so the HIGHEST run-level task can be registered — the
+  documented v4/v5 pattern: a SetProperty stages the command into the
+  CustomActionData (property named exactly like the deferred action), and
+  the deferred WixQuietExec runs it (docs.firegiant.com/wix/tools/wixext/
+  quietexec — BinaryRef Wix4UtilCA_$(sys.BUILDARCHSHORT) covers x64/arm64).
+
+  /TR quoting: the task's action must be the quoted path plus its argument
+  ("C:\Program Files\mach\mach.exe" run). MSI Formatted strings escape a
+  literal quote with a backslash (\"), so the nested argument is staged in
+  its own property (MACH_RUN_CMD) and embedded with \&quot;...&quot; —
+  the backslash pairs survive formatting, yielding
+    /TR ""C:\Program Files\mach\mach.exe" run"
+  which schtasks stores as the quoted command line.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="mach agent"
+      Manufacturer="TevaServices"
+      Version="$(var.Version)"
+      UpgradeCode="97A3604A-39DA-4238-B138-1D054D701DBF"
+      Scope="perMachine"
+      Compressed="yes"
+      Language="1033">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="Main" Level="1">
+      <ComponentGroupRef Id="MachComponents" />
+    </Feature>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="mach">
+        <ComponentGroup Id="MachComponents">
+          <Component Id="MachExe" Guid="*">
+            <File Id="MachExeFile" Source="$(var.MachExeSource)" KeyPath="yes" />
+          </Component>
+        </ComponentGroup>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- The task's action line, quoted (Formatted string: the &quot; pairs
+         are literal). Referenced by the schtasks command below. -->
+    <Property Id="MACH_RUN_CMD" Value="&quot;[(INSTALLFOLDER)mach.exe]&quot; run" />
+
+    <SetProperty
+        Id="RegisterMachd"
+        Value="&quot;[SystemFolder]schtasks.exe&quot; /Create /F /TN machd /RL HIGHEST /SC ONLOGON /RI 1 /TR \&quot;[MACH_RUN_CMD]\&quot;"
+        Before="RegisterMachd"
+        Sequence="execute" />
+    <CustomAction Id="RegisterMachd"
+                  BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <SetProperty
+        Id="UnregisterMachd"
+        Value="&quot;[SystemFolder]schtasks.exe&quot; /Delete /F /TN machd"
+        Before="UnregisterMachd"
+        Sequence="execute" />
+    <CustomAction Id="UnregisterMachd"
+                  BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!-- Fresh install and upgrade both (re)register the task; uninstall
+           deletes it. A repair (REINSTALL) also refreshes it. -->
+      <Custom Action="RegisterMachd" After="InstallFiles" Condition="NOT REMOVE" />
+      <Custom Action="UnregisterMachd" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

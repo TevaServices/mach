@@ -1,0 +1,192 @@
+# .goreleaser.yaml — how mach ships outside GitHub Releases and GHCR.
+#
+# GoReleaser is the build+package engine for the CLIENT (cmd/mach): zipped
+# archives, the native Linux packages (deb/rpm/apk, three nfpms entries —
+# apk differs: alpine runs OpenRC, not systemd, so its package contents and
+# maintainer scripts genuinely differ), and the Homebrew tap formula. The
+# control plane (mach-server) does not appear here on purpose — it ships as
+# a container only; release.yml builds it separately as the attest/verify
+# tool for the client binaries' in-toto attestations.
+#
+# Division of labor: goreleaser builds, packages and pushes the tap; the
+# GitHub release itself stays in release.yml (attestation bundle assembly,
+# release body with the GHCR digests, upload of goreleaser's dist/). The
+# workflow runs goreleaser with --skip=publish so goreleaser creates no
+# release of its own.
+#
+# Version rules (AGENTS.md): one version string; an unset -X means no -X at
+# all. goreleaser always has .Version from the tag on this path, so the
+# empty stamp cannot happen here.
+#
+# Supervision contract (AGENTS.md invariant 22, carried from the unit the
+# removed `mach install` used to generate): the agent exits 0 to mean STOP —
+# restart on failure only, never on a clean exit; a clean exit is a retire
+# or an update handoff. machd.service keeps Restart=on-failure; the OpenRC
+# script runs unsupervised (no supervise-daemon) for the same reason; the
+# brew service block pins keep_alive successful_exit: false — launchd's
+# exact equivalent. cmd/mach/packaging_test.go asserts all three.
+version: 2
+
+project_name: mach
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: mach
+    main: ./cmd/mach
+    binary: mach
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X github.com/TevaServices/mach/internal/version.Version={{.Version}}
+    # Per-target post hook: attest the exact bytes just built, and refuse a
+    # modified-tree or unstamped build (verify-attestation's WARNING -> exit
+    # 1 -> the release fails). MACH_SERVER_KEY points at the release signing
+    # key FILE, which release.yml writes from the MACH_RELEASE_SIGNING_KEY
+    # secret before goreleaser runs.
+    hooks:
+      post:
+        - cmd: packaging/goreleaser/attest-hook.sh "{{ .Path }}" "{{ .Version }}"
+          output: false
+
+archives:
+  - ids: [mach]
+    formats: [zip]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+# --- Linux native packages (#41) ------------------------------------------
+# One nfpms entry per format: the maintainer scripts differ per format
+# (dpkg vs rpm scriptlets vs apk scripts) and so do the file lists (no
+# systemd unit on alpine). All install the same things otherwise: the
+# mach binary in /usr/bin, the state dir /var/lib/mach (0700, owned by the
+# service account the scripts create), enable — never start — the service
+# (an unenrolled machd must not crash-loop; enrollment is a person at the
+# machine scanning the QR, see README).
+nfpms:
+  # --- deb: systemd family ---
+  - id: packages-deb
+    formats: [deb]
+    package_name: mach
+    file_name_template: "{{ .ConventionalFileName }}"
+    vendor: TevaServices
+    homepage: https://github.com/TevaServices/mach
+    maintainer: TevaServices <hermes@tevaservices.invalid>
+    description: |-
+      mach agent — outbound-only remote access daemon. Enrolls to a
+      mach-server control plane. After installing: enroll with
+      `sudo -u mach mach register ...` (QR), then `sudo systemctl start machd`.
+    license: Apache-2.0
+    bindir: /usr/bin
+    ids: [mach]
+    mtime: "{{ .CommitDate }}"
+    contents:
+      - src: packaging/systemd/machd.service
+        dst: /usr/lib/systemd/system/machd.service
+        type: config|noreplace
+        file_info:
+          owner: root
+          group: root
+          mode: 0644
+      - dst: /var/lib/mach
+        type: dir
+        file_info:
+          owner: mach
+          group: mach
+          mode: 0700
+    scripts:
+      postinstall: packaging/nfpm/deb/postinst
+      preremove: packaging/nfpm/deb/prerm
+      postremove: packaging/nfpm/deb/postrm
+
+  # --- rpm: systemd family ---
+  - id: packages-rpm
+    formats: [rpm]
+    package_name: mach
+    file_name_template: "{{ .ConventionalFileName }}"
+    vendor: TevaServices
+    homepage: https://github.com/TevaServices/mach
+    maintainer: TevaServices <hermes@tevaservices.invalid>
+    description: |-
+      mach agent — outbound-only remote access daemon. Enrolls to a
+      mach-server control plane. After installing: enroll with
+      `sudo -u mach mach register ...` (QR), then `sudo systemctl start machd`.
+    license: Apache-2.0
+    bindir: /usr/bin
+    ids: [mach]
+    mtime: "{{ .CommitDate }}"
+    contents:
+      - src: packaging/systemd/machd.service
+        dst: /usr/lib/systemd/system/machd.service
+        type: config|noreplace
+        file_info:
+          owner: root
+          group: root
+          mode: 0644
+      - dst: /var/lib/mach
+        type: dir
+        file_info:
+          owner: mach
+          group: mach
+          mode: 0700
+    scripts:
+      preinstall: packaging/nfpm/rpm/pre.sh
+      postinstall: packaging/nfpm/rpm/post.sh
+      preremove: packaging/nfpm/rpm/preun.sh
+      postremove: packaging/nfpm/rpm/postun.sh
+    rpm:
+      group: Unspecified
+      summary: mach agent (outbound-only daemon)
+
+  # --- apk: OpenRC family (alpine has no systemd) ---
+  - id: packages-apk
+    formats: [apk]
+    package_name: mach
+    file_name_template: "{{ .ConventionalFileName }}"
+    vendor: TevaServices
+    homepage: https://github.com/TevaServices/mach
+    maintainer: TevaServices <hermes@tevaservices.invalid>
+    description: |-
+      mach agent — outbound-only remote access daemon. Enrolls to a
+      mach-server control plane. After installing: enroll with
+      `sudo -u mach mach register ...` (QR), then
+      `sudo rc-service machd start` (OpenRC on alpine, not systemd).
+    license: Apache-2.0
+    bindir: /usr/bin
+    ids: [mach]
+    mtime: "{{ .CommitDate }}"
+    contents:
+      - src: packaging/openrc/machd
+        dst: /etc/init.d/machd
+        file_info:
+          owner: root
+          group: root
+          mode: 0755
+      - dst: /var/lib/mach
+        type: dir
+        file_info:
+          owner: mach
+          group: mach
+          mode: 0700
+    scripts:
+      preinstall: packaging/nfpm/apk/pre-install.sh
+      postinstall: packaging/nfpm/apk/post-install.sh
+      preremove: packaging/nfpm/apk/pre-deinstall.sh
+
+
+# --- Homebrew tap (#42) ----------------------------------------------------
+# NOT goreleaser's brews: it is deprecated upstream (v2.10, casks are the
+# replacement) and `goreleaser check` fails on any deprecated property, which
+# would turn config validation into a permanent, unfixable red. The formula
+# lives as a template at packaging/homebrew/mach.rb.tmpl and is generated +
+# pushed to TevaServices/homebrew-mach by a release job (scripts/brew-bump.sh)
+# — the URLs and sha256s come from the goreleaser artifacts this same run
+# produced, so the tap is never hand-edited. The service block in the
+# template is the Homebrew service DSL (keep_alive successful_exit: false —
+# the launchd semantic matching Restart=on-failure, invariant 22).

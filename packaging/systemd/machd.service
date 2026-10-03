@@ -1,0 +1,36 @@
+# machd.service — shipped by the distribution packages (deb/rpm).
+#
+# This file replaces the unit that `mach install` used to generate at
+# runtime (removed in #44): the package installs it verbatim and the
+# package manager owns the lifecycle (postinst enables it; prerm stops it).
+#
+# The supervision semantics below are a correctness property, carried over
+# unchanged from the generated unit: Restart=on-failure, never always —
+# exit 0 means stop. The agent exits 0 when the control plane retires it
+# (revoked or deleted) and when a pushed update has detached its own
+# replacement; a supervisor that restarts a clean exit turns a deliberate
+# retirement into a restart loop and races the update path. The suite
+# asserts this file's semantics (see AGENTS.md "Testing").
+#
+# Paths are the package conventions (#41): the binary is /usr/bin/mach and
+# the state dir is /var/lib/mach, owned by the dedicated unprivileged
+# account the unit runs as — never root. Enrollment for the service is
+# done as that account (see README): `sudo -u mach mach register ...`,
+# after which `sudo systemctl start machd` runs the agent.
+
+[Unit]
+Description=mach agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mach
+Group=mach
+Environment=MACH_STATE_DIR=/var/lib/mach
+ExecStart="/usr/bin/mach" run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

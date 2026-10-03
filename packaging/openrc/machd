@@ -1,0 +1,30 @@
+#!/sbin/openrc-run
+# mach agent service (OpenRC) — shipped by the apk package.
+#
+# Alpine has no systemd, so the apk ships this instead of machd.service;
+# the deb/rpm packages ship packaging/systemd/machd.service.
+#
+# Supervision note (a correctness property, see AGENTS.md invariant 22):
+# the agent exits 0 to mean STOP — a retired (revoked/deleted) machine must
+# not be restarted into a loop, and a clean exit also hands off to a pushed
+# update's detached replacement. supervise-daemon restarts unconditionally,
+# which would violate that contract, so this service runs the agent without
+# a supervisor: a crashed agent stays down and is restarted by hand
+# (`rc-service machd start`) or by an operator watchdog. Correctness before
+# convenience here is deliberate — the deb/rpm units keep Restart=on-failure,
+# which is restart on failure, never on success.
+
+description="mach agent (outbound-only daemon)"
+command="/usr/bin/mach"
+command_args="run"
+command_background="yes"
+pidfile="/run/machd.pid"
+output_log="/var/log/machd.log"
+error_log="/var/log/machd.log"
+start_stop_daemon_args="--user mach:mach --env MACH_STATE_DIR=/var/lib/mach"
+
+depend() {
+	need net
+	use dns
+	after firewall
+}

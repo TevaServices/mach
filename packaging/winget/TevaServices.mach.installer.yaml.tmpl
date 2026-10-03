@@ -1,0 +1,36 @@
+# The winget installer manifest. Rendered by scripts/winget-gen.sh:
+# __VER__, __MSI_URL_X64__, __SHA_X64__, __MSI_URL_ARM64__, __SHA_ARM64__,
+# __PRODUCTCODE_X64__, __PRODUCTCODE_ARM64__.
+# InstallerSha256 is computed by release.yml's msi job over the ARTIFACT IT
+# UPLOADS; the ProductCode is read from the SHIPPED MSI (WiX mints a fresh
+# ProductCode per build — the manifest points at the code the actual
+# artifact registers, and winget checks the installed ProductCode against
+# it). Upgrade detection works across versions through the fixed
+# UpgradeCode in packaging/wix/mach.wxs regardless.
+PackageIdentifier: TevaServices.mach
+PackageVersion: __VER__
+PackageLocale: en-US
+Installers:
+  - Architecture: x64
+    InstallerType: wix
+    InstallerUrl: __MSI_URL_X64__
+    InstallerSha256: __SHA_X64__
+    InstallerSwitches:
+      Silent: /quiet /norestart
+      SilentWithProgress: /passive /norestart
+      Upgrade: /quiet /norestart
+    UpgradeBehavior: install
+    ProductCode: "{__PRODUCTCODE_X64__}"
+  - Architecture: arm64
+    InstallerType: wix
+    InstallerUrl: __MSI_URL_ARM64__
+    InstallerSha256: __SHA_ARM64__
+    InstallerSwitches:
+      Silent: /quiet /norestart
+      SilentWithProgress: /passive /norestart
+      Upgrade: /quiet /norestart
+    UpgradeBehavior: install
+    ProductCode: "{__PRODUCTCODE_ARM64__}"
+ManifestType: installer
+ManifestVersion: 1.9.0
+Scope: machine
