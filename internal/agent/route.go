@@ -111,12 +111,6 @@ func Route(args []string) {
 			os.Exit(1)
 		}
 
-	case "install", "service":
-		if err := Install(stateDir); err != nil {
-			fmt.Fprintln(os.Stderr, "mach: "+err.Error())
-			os.Exit(1)
-		}
-
 	case "version":
 		fmt.Printf("mach %s (%s/%s)\n", version.Version, runtime.GOOS, runtime.GOARCH)
 
@@ -138,8 +132,7 @@ func usageAgent() {
   mach register [--server URL] [--org ORG]          enroll via QR (type challenge code on phone)
   mach register --api-key K --name ORG-machine      enroll headlessly (enroll-scoped key)
   mach run                                          run the agent daemon (outbound-only connection)
-  mach install                                      register the agent as an OS service
-                                                    (linux: systemd / macOS: launchd / windows: Task Scheduler)
+                                                    (service registration lives in the distribution packages)
   mach version
 
 Machine names are org-prefixed: <org>-<machine> (unique; conflicts error out).

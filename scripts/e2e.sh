@@ -1209,7 +1209,7 @@ OUT=$(curl -sS "$UI_BASE/v1/machines" -H "Authorization: Bearer $UI_ADMIN" 2>&1)
 [[ "$OUT" != *"$UI_MACHINE"* ]]; check "the machine is gone from the fleet" $?
 # The agent is told to retire rather than left dialing a name nobody knows, and
 # it must actually STOP: Run() returns nil, so the process exits 0. That is the
-# half a supervisor depends on — the installed unit restarts on failure, not on
+# half a supervisor depends on — the packaged unit restarts on failure, not on
 # any exit, which is what makes a clean exit mean "stop" instead of a loop.
 sleep 2
 OUT=$(grep -c 'deleted by the operator' "$WORKDIR/agent-ui.log"); [[ "$OUT" -ge 1 ]]

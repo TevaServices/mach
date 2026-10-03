@@ -7,8 +7,8 @@ package agent
 // written to the state directory, so the session ends when the process does:
 // Ctrl-C is a real shutdown, and running `mach` again means enrolling again.
 //
-// That is the whole difference from `mach run`, which uses the files an
-// `mach install` left behind and reconnects across reboots. The point of keeping
+// That is the whole difference from `mach run`, which uses the files a
+// packaging-registered service runs on, connecting across reboots. The point of keeping
 // them separate is that a machine someone has installed can never be disturbed by
 // somebody typing `mach` at a console: the temporary path cannot read, write or
 // delete the persistent state, so it cannot disconnect or re-key an installed
@@ -178,7 +178,6 @@ func (c *sessionCtl) retiredEnrollment() bool {
 func RunEphemeral(server, org string) error {
 	fmt.Println("mach: TEMPORARY session — nothing is written to disk.")
 	fmt.Println("      Ctrl-C ends it and retires this enrollment; running `mach` again enrolls afresh.")
-	fmt.Println("      For a connection that survives reboots:  mach install")
 
 	id, err := NewIdentity()
 	if err != nil {

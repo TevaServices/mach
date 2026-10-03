@@ -153,8 +153,8 @@ func TestPermanentEnrollmentClearsTheTemporaryFlag(t *testing.T) {
 		t.Fatal("not temporary to begin with")
 	}
 
-	// The same machine, enrolled permanently this time — `mach install` on a host
-	// that ran plain `mach`.
+	// The same machine, enrolled permanently this time — the packaged service's
+	// registration on a host that ran plain `mach` (#40).
 	ok, err := st.ReenrollMachine("bcross-here", "k2", "h", "linux", "amd64", "v", "", false)
 	if err != nil || !ok {
 		t.Fatalf("permanent re-enrollment: ok=%v err=%v", ok, err)

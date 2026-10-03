@@ -38,17 +38,12 @@ and the config in memory and writes nothing, so Ctrl-C ends it and running
 on the control plane and it retires that enrollment when it ends — and because it
 is marked temporary, running `mach` again reuses the same name without you having
 to revoke or delete anything first (which matters when a session is killed rather
-than stopped). It cannot disturb a machine you have already installed — on one of
-those it says so and exits rather than starting a second identity. To make a
-connection permanent (auto-start at boot, reconnect after network loss), run
-once:
-
-```
-mach install
-```
-
-That registers the OS service: systemd (linux), launchd (macOS), or Task
-Scheduler (Windows).
+than stopped). It cannot disturb a machine you have already enrolled persistently — on one of
+those it says so and exits rather than starting a second identity. For a
+connection that survives reboots (auto-start at boot, restart after network
+loss), install mach from the OS distribution packages: they register the
+service (systemd on linux, launchd on macOS, Task Scheduler on Windows) and
+the binary no longer self-installs.
 
 **On your admin machine** (or the LLM troubleshooter's box): run
 
@@ -86,8 +81,10 @@ lives in the separate `mach-server` binary, which is what runs in the container.
 - **Shells (per-OS default with fallbacks):** linux `bash → sh`; macOS
   `bash → zsh → sh`; Windows `PowerShell → pwsh → cmd`. Shell-mode commands
   get exactly one parse by the chosen shell; argv (`--`) mode parses zero.
-- **Service install:** systemd (linux), launchd (macOS, KeepAlive + RunAtLoad),
-  Task Scheduler (Windows, ONLOGON + restart).
+- **Service registration comes from the distribution packages**, not from the
+  binary. The `mach install`/`mach service` commands are gone; the packages
+  own the units/plists/tasks (their supervision stays "restart on failure":
+  exit 0 means stop).
 - **State dir:** `$MACH_STATE_DIR`, else `/var/lib/mach` (root on linux),
   `~/.mach` (user), `%APPDATA%\mach`-equivalent user dir on Windows.
 - **Binaries:** static, CGO-free; linux/macOS/Windows × amd64/arm64.

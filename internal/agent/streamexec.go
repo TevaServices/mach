@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
@@ -75,8 +76,36 @@ func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{
 	applyConfinement(c)
 	c.Env = filteredEnv()
 	stdinPipe, _ := c.StdinPipe()
-	stdoutPipe, _ := c.StdoutPipe()
-	stderrPipe, _ := c.StderrPipe()
+	// Output pipes are ours, not os/exec's: StdoutPipe/StderrPipe hand the read
+	// end back with the promise that Wait closes it, which is exactly the loss
+	// this session used to suffer. The command can exit between the last stdin
+	// byte and the pump's next Read; Wait then closed the read end out from
+	// under the pump, Read failed, and the bytes the command had already put in
+	// the pipe buffer were dropped — silently, because the pump's write errors
+	// are deliberate (an unbounded stream may outlive its reader) while its
+	// read errors were treated as EOF. An owned pipe pair closes the write end
+	// only after Wait returns, so every pump sees EOF only after the buffer is
+	// drained, whatever the scheduling.
+	stdoutR, stdoutW, perr := os.Pipe()
+	stderrR, stderrW, perr2 := os.Pipe()
+	if perr != nil || perr2 != nil {
+		if perr == nil {
+			stdoutR.Close()
+			stdoutW.Close()
+		}
+		if perr2 == nil {
+			stderrR.Close()
+			stderrW.Close()
+		}
+		end(protocol.StreamEnd{ExitCode: 126, Error: "output pipes: " + firstErr(perr, perr2).Error()})
+		return
+	}
+	defer stdoutW.Close()
+	defer stderrW.Close()
+	defer stdoutR.Close()
+	defer stderrR.Close()
+	c.Stdout = stdoutW
+	c.Stderr = stderrW
 	if err := c.Start(); err != nil {
 		end(protocol.StreamEnd{ExitCode: 126, Error: err.Error()})
 		return
@@ -127,28 +156,34 @@ func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{
 		}
 		done <- struct{}{}
 	}
-	go pump(stdoutPipe, "stdout")
-	go pump(stderrPipe, "stderr")
+	go pump(stdoutR, "stdout")
+	go pump(stderrR, "stderr")
 
 	runErr := c.Wait()
 
-	// Drain remaining pump output briefly (pipes close after Wait on most
-	// platforms; give the pumps a grace period to flush).
+	// The command is gone; close OUR write ends so each pump's next Read is
+	// EOF once the pipe buffer is drained. All read ends stay open here — the
+	// pipes are ours, and Wait has nothing left to close out from under the
+	// pumps.
 	//
 	// The grace is per pump, not one budget shared between them: the console
 	// stops reading at the terminal record, so whatever is still in flight when
 	// that record is written is output nobody will ever see, and a shared timer
 	// lets one pump's slow flush consume the time the other pump needed. A pump
-	// that is still not at EOF after the process is gone means something else
-	// holds the pipe open (a grandchild that inherited it), which is why the
-	// wait is bounded at all — and why the record says the output may be cut
-	// short instead of presenting a truncated stream as the whole of it.
+	// that is still not at EOF after the write ends are closed means something
+	// else holds a write end open (a grandchild that inherited it), which is why
+	// the wait is bounded at all — closed read ends unblock those pumps, and the
+	// record says the output may be cut short instead of presenting a truncated
+	// stream as the whole of it.
+	stdoutW.Close()
+	stderrW.Close()
 	cut := false
-	for i := 0; i < 2; i++ {
+	for _, r := range []*os.File{stdoutR, stderrR} {
 		select {
 		case <-done:
 		case <-time.After(streamDrainGrace):
 			cut = true
+			r.Close() // unblock the parked pump; its exit drains to `done`
 		}
 	}
 
@@ -178,6 +213,14 @@ func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{
 	errText = withDrainNote(errText, cut)
 	_ = stdinPipe
 	end(protocol.StreamEnd{ExitCode: exitCode, Error: errText})
+}
+
+// firstErr is the non-nil of two errors, for a message naming which pipe failed.
+func firstErr(a, b error) error {
+	if a != nil {
+		return a
+	}
+	return b
 }
 
 // streamDrainGrace bounds how long the terminal record waits for the output pumps

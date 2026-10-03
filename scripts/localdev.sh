@@ -7,10 +7,11 @@
 # touch a real deployment's database, and it cannot touch your own ~/.mach,
 # because both sides are given a state dir inside the playground.
 #
-# Nothing here installs anything. `mach install` would register launchd/systemd
-# so the agent survives a reboot; this runs the agent as a plain background
-# process instead, which is the right shape for something you will start and
-# stop while working on the code.
+# Nothing here installs anything. A packaged install would register
+# launchd/systemd so the agent survives a reboot; this runs the agent as a plain
+# background process instead, which is the right shape for something you will
+# start and stop while working on the code (the binary itself no longer
+# self-installs, #40 — service registration lives in the OS packages).
 #
 #   scripts/localdev.sh up         build, start the control plane, enroll this host, start the agent
 #   scripts/localdev.sh server     build and start the control plane alone — nothing enrolled
