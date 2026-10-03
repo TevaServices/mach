@@ -59,6 +59,49 @@ jobs:
       - uses: jdx/mise-action@v4
       - run: mise run test
 
+  # The MSI authoring has no linux compile path (wix.exe is windows-only and
+  # the release pipeline only exercises it on a tag) — that is how a v3-ism
+  # survived until the FIRST tag through the new pipeline (v0.8.0 run,
+  # WIX0005, #49). This smoke build compiles the authoring the way the
+  # release does, at the same pinned WiX, resolve-only: the exe the
+  # Component's File points at is stubbed, because only the authoring is on
+  # trial, not the payload.
+  wix-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # On PRs, run only when the authoring (or this job) changed: a docs PR
+      # should not pay a Windows runner for a WiX compile. On main pushes it
+      # always runs — main touching packaging/wix without a smoke build is
+      # exactly the drift this guards against.
+      - name: Did the MSI authoring change?
+        id: wxs
+        shell: bash
+        run: |
+          set -u
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            n=$(git diff --name-only "$base"...HEAD -- packaging/wix/mach.wxs | wc -l)
+          else
+            n=1
+          fi
+          echo "changed=$n" >> "$GITHUB_OUTPUT"
+      - name: Compile the MSI authoring (WiX 5.0.2, resolve-only)
+        if: steps.wxs.outputs.changed != '0'
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+          'stub' | Out-File -Encoding ascii mach-smoke.exe
+          wix build -ext WixToolset.Util.wixext/5.0.2 -arch x64 `
+            -define Version=0.0.0-smoke `
+            -define MachExeSource=mach-smoke.exe `
+            packaging/wix/mach.wxs -o mach-smoke.msi
+          if ($LASTEXITCODE -ne 0) { Write-Error 'wix build failed'; exit 1 }
+          Get-ChildItem mach-smoke.msi
+
   e2e:
     runs-on: ubuntu-latest
     steps:
