@@ -88,7 +88,7 @@ nfpms:
     mtime: "{{ .CommitDate }}"
     contents:
       - src: packaging/systemd/machd.service
-        dst: /lib/systemd/system/machd.service
+        dst: /usr/lib/systemd/system/machd.service
         type: config|noreplace
         file_info:
           owner: root
@@ -123,7 +123,7 @@ nfpms:
     mtime: "{{ .CommitDate }}"
     contents:
       - src: packaging/systemd/machd.service
-        dst: /lib/systemd/system/machd.service
+        dst: /usr/lib/systemd/system/machd.service
         type: config|noreplace
         file_info:
           owner: root

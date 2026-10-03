@@ -3,7 +3,9 @@
 Layout:
 
 - `systemd/machd.service` — the unit the deb/rpm packages install
-  (`/lib/systemd/system/machd.service`). `Restart=on-failure`, `User=mach`,
+  (`/usr/lib/systemd/system/machd.service`, the merged-usr path modern
+  Debian/Ubuntu packages ship; a `/lib` symlink alias resolves it on
+  older releases). `Restart=on-failure`, `User=mach`,
   `Environment=MACH_STATE_DIR=/var/lib/mach` — the supervision contract the
   binary used to generate under `mach install` (#44 removed it; AGENTS.md
   invariant 22 — exit 0 means stop).
