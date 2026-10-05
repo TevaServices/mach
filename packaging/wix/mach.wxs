@@ -3,7 +3,7 @@
   mach.wxs — the Windows MSI for the mach agent (#43).
 
   Built by release.yml's msi job:
-    wix build -ext WixToolset.Util.wixext -arch x64|arm64 \
+    wix build -arch x64|arm64 \
       -define Version=<tag version> -define MachExeSource=<staged mach.exe>
 
   What it does:
@@ -14,18 +14,10 @@
       the restart-on-failure-only contract lives in the agent's exit codes)
     - deletes the task on uninstall
 
-  Custom actions are WixQuietExec (WixToolset.Util.wixext), deferred with
-  Impersonate=no so the HIGHEST run-level task can be registered — the
-  documented v4/v5 pattern: a SetProperty stages the command into the
-  CustomActionData (property named exactly like the deferred action), and
-  the deferred WixQuietExec runs it (docs.firegiant.com/wix/tools/wixext/
-  quietexec — BinaryRef Wix4UtilCA_$(sys.BUILDARCHSHORT) covers x64/arm64).
-
   /TR quoting: the task's action must be the quoted path plus its argument
   ("C:\Program Files\mach\mach.exe" run). MSI Formatted strings escape a
-  literal quote with a backslash (\"), so the nested argument is staged in
-  its own property (MACH_RUN_CMD) and embedded with \&quot;...&quot; —
-  the backslash pairs survive formatting, yielding
+  literal quote with a backslash (\"), and the deferred type-34 command line
+  is resolved at script-write time (properties included), yielding
     /TR ""C:\Program Files\mach\mach.exe" run"
   which schtasks stores as the quoted command line.
 -->
@@ -63,34 +55,31 @@
       </Component>
     </ComponentGroup>
 
-    <!-- The task's action line, quoted (Formatted string: the &quot; pairs
-         are literal). Referenced by the schtasks command below. -->
-    <Property Id="MACH_RUN_CMD" Value="&quot;[(INSTALLFOLDER)mach.exe]&quot; run" />
-
-    <SetProperty
+    <!-- Registration is native Windows Installer, no Util extension CAs
+     (type 34: synchronous exe, deferred, system context). Rationale (#51):
+     the Util pair died at CA-dll spawn (2717, no dll trace) on x64 and the
+     Util CA cannot exist in the Arm64 package GitHub's runner can install
+     (1633 rejects the package before any CA runs); type-34 resolves its
+     command at script-write time, needs no CustomActionData and no dll.
+     The /TR argument nests quotes directly (type-34 ExeCommand is not a
+     Formatted string, so no backslash-quote escaping — the &quot; pair is
+     the XML escape only): /TR receives
+       "C:\Program Files\mach\mach.exe" run
+     as ONE argument with the quoted path inside. -->
+    <CustomAction
         Id="RegisterMachd"
-        Value="&quot;[SystemFolder]schtasks.exe&quot; /Create /F /TN machd /RL HIGHEST /SC ONLOGON /RI 1 /TR \&quot;[MACH_RUN_CMD]\&quot;"
-        Before="RegisterMachd"
-        Sequence="execute" />
-    <CustomAction Id="RegisterMachd"
-                  BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
-                  DllEntry="WixQuietExec"
-                  Execute="deferred"
-                  Impersonate="no"
-                  Return="check" />
-
-    <SetProperty
+        Execute="deferred"
+        Impersonate="no"
+        Return="check"
+        Directory="System64Folder"
+        ExeCommand="schtasks.exe /Create /F /TN machd /RL HIGHEST /SC ONLOGON /RI 1 /TR &quot;[(INSTALLFOLDER)mach.exe] run&quot;" />
+    <CustomAction
         Id="UnregisterMachd"
-        Value="&quot;[SystemFolder]schtasks.exe&quot; /Delete /F /TN machd"
-        Before="UnregisterMachd"
-        Sequence="execute" />
-    <CustomAction Id="UnregisterMachd"
-                  BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
-                  DllEntry="WixQuietExec"
-                  Execute="deferred"
-                  Impersonate="no"
-                  Return="ignore" />
-
+        Execute="deferred"
+        Impersonate="no"
+        Return="check"
+        Directory="System64Folder"
+        ExeCommand="schtasks.exe /Delete /F /TN machd" />
     <InstallExecuteSequence>
       <!-- Fresh install and upgrade both (re)register the task; uninstall
            deletes it. A repair (REINSTALL) also refreshes it. -->
