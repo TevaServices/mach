@@ -33,8 +33,14 @@ func TestCommandOutputKeepsItsBytesAndItsTruncationMarker(t *testing.T) {
 	} else {
 		sh = []string{"/bin/sh", "-c", `printf '\000\200\377'`}
 	}
+	// Timeout generous on windows: powershell.exe cold-starts slowly on CI
+	// runners (the 5s default raced its startup and killed the command).
+	timeout := 5
+	if runtime.GOOS == "windows" {
+		timeout = 60
+	}
 	payload, _ := json.Marshal(protocol.ExecCommand{
-		Argv: sh, Timeout: 5,
+		Argv: sh, Timeout: timeout,
 	})
 	go handleExec(conn, protocol.Envelope{Type: "exec", ReqID: "bytes-1", Payload: payload},
 		make(chan struct{}, 1), nil)

@@ -161,7 +161,11 @@ jobs:
           if (Test-Path "$env:ProgramFiles\mach\mach-smoke.exe") {
             Write-Error 'mach-smoke.exe survived uninstall'; exit 1
           }
-          "smoke install + service + uninstall OK"
+          # exit 0 explicitly, not implicitly: the runner takes the trailing
+          # $LASTEXITCODE as the step's status, and the step's LAST native call
+          # is the query that EXPECTED to fail (sc.exe query after uninstall
+          # exits 1060).
+          "smoke install + service + uninstall OK"; exit 0
 
       - name: Upload the smoke logs
         if: failure()
