@@ -5,6 +5,7 @@ package agent
 import (
 	"bytes"
 	"encoding/json"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -21,10 +22,25 @@ func TestCommandOutputKeepsItsBytesAndItsTruncationMarker(t *testing.T) {
 	globalPolicy.install("")
 	conn, peer := streamPipe(t)
 
-	// A shell that can emit a byte no JSON string can hold.
+	// A shell that can emit a byte no JSON string can hold. Windows has no
+	// /bin/sh: argv mode exec's the list directly, so a PowerShell one-liner
+	// writes the same three bytes raw to its stdout stream.
 	raw := []byte{0x00, 0x80, 0xff}
+	var sh []string
+	if runtime.GOOS == "windows" {
+		sh = []string{"powershell", "-NoProfile", "-Command",
+			"$o = [Console]::OpenStandardOutput(); $o.Write([byte[]](0,128,255), 0, 3)"}
+	} else {
+		sh = []string{"/bin/sh", "-c", `printf '\000\200\377'`}
+	}
+	// Timeout generous on windows: powershell.exe cold-starts slowly on CI
+	// runners (the 5s default raced its startup and killed the command).
+	timeout := 5
+	if runtime.GOOS == "windows" {
+		timeout = 60
+	}
 	payload, _ := json.Marshal(protocol.ExecCommand{
-		Argv: []string{"/bin/sh", "-c", `printf '\000\200\377'`}, Timeout: 5,
+		Argv: sh, Timeout: timeout,
 	})
 	go handleExec(conn, protocol.Envelope{Type: "exec", ReqID: "bytes-1", Payload: payload},
 		make(chan struct{}, 1), nil)

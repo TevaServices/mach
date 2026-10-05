@@ -12,7 +12,7 @@ import (
 
 // loadOrCreateServerKey ensures the control plane has a stable identity
 // keypair (agents pin its public key at enrollment and verify it on
-// updates/connections via TLS + this key for signed update manifests).
+// every connection via TLS + this key; it also signs attestation envelopes).
 // Key material lives at keyPath (persistent volume), 0600. Persisting is
 // mandatory: a key that lives only in memory rotates on every restart and
 // silently breaks every enrolled agent's pin, so write failures abort boot.

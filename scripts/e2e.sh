@@ -2,8 +2,8 @@
 # e2e.sh — end-to-end test of mach: control plane, enrollment (QR + API key),
 # scoped keys (exec, readonly), exec (shell + argv), streaming output, the
 # output-is-data guarantee, agent-local and server-wide command policy, audit,
-# revocation, signed update push with in-toto attestation, the
-# challenge-code lockout, and the OIDC web UI (block / revoke / delete, org
+# revocation, release attestations (in-toto), the challenge-code lockout, and
+# the OIDC web UI (block / revoke / delete, org
 # management) driven against a loopback identity provider.
 # Run via `mise run e2e` or directly.
 set -uo pipefail
@@ -652,12 +652,6 @@ CODE=0
 OUT=$(MACH_DB="$DB" "$WORKDIR/mach-server" revoke-machine "$ORG-typo-no-such" 2>&1) || CODE=$?
 [[ "$CODE" -ne 0 ]]; check "revoke-machine refuses an unknown name" $?
 [[ "$OUT" == *"unknown machine"* ]]; check "and says which name it did not find" $?
-# --attestation with no value used to skip the attestation gate entirely, which
-# is the one control that makes "nothing unattested ships" true.
-CODE=0
-OUT=$(MACH_DB="$DB" "$WORKDIR/mach-server" push-update "$MACHINE" "$WORKDIR/mach" 9.9.9 --attestation 2>&1) || CODE=$?
-[[ "$CODE" -ne 0 ]]; check "push-update refuses --attestation with no value" $?
-[[ "$OUT" == *"needs a file path"* ]]; check "and says why rather than shipping unattested" $?
 
 step "readonly key: sees the whole fleet, runs nothing"
 curl -fsS "$BASE/v1/machines" -H "Authorization: Bearer $RO_KEY" >"$WORKDIR/ro.json"
@@ -897,7 +891,7 @@ OUT=$(MACH_SERVER="$BASE" MACH_ORG="$ORG" MACH_STATE_DIR="$TMP_STATE" "$WORKDIR/
 OUT=$(MACH_STATE_DIR="$WORKDIR/agent1" "$WORKDIR/mach" 2>&1)
 [[ "$OUT" != *"WARNING"* ]]; check "an enrolled host is refused without any confirmation prompt" $?
 
-step "release attestation (in-toto) and attested update push"
+step "release attestation (in-toto); agent updates moved to the distribution points"
 # Built with -buildvcs=false so the artifact carries no VCS state: the e2e
 # runs against a working tree that may well be dirty, and a dirty-tree build is
 # deliberately refused by the push gate below. Determinism matters more here
@@ -921,19 +915,18 @@ MACHINE3="$ORG-test-03"
 MACH_STATE_DIR="$WORKDIR/agent5" "$WORKDIR/mach" run >>"$WORKDIR/agent5.log" 2>&1 &
 AGENT_PID=$!
 sleep 2
-# An attestation that does not describe the binary being pushed must stop the
-# push outright — nothing queued, nothing delivered.
-MACH_DB="$DB" "$WORKDIR/mach-server" push-update "$MACHINE3" "$WORKDIR/mach" 0.2.1 \
-  --attestation "$ATT" >/dev/null 2>&1
-[[ $? -ne 0 ]]; check "push refused a binary its attestation does not describe" $?
-# With the attested binary, the update is queued, delivered and applied.
-MACH_DB="$DB" "$WORKDIR/mach-server" push-update "$MACHINE3" "$WORKDIR/mach-release" 0.2.1 \
-  --attestation "$ATT" >/dev/null
-check "attested update queued" $?
-sleep 5
-# Behavioral assertion: the agent survives the swap and keeps serving.
-machc exec "$MACHINE3" "echo updated-ok" >/dev/null; check "post-update exec works" $?
-machc list | grep -q "$MACHINE3"; check "updated machine still enrolled+known" $?
+# The push channel itself is gone: agent binaries are updated through the
+# distribution points (apt/rpm/apk repositories, winget/Homebrew), each of
+# whose supervisors restarts the agent on failure only. The command is not a
+# stub and not a renamed thing — it is UNKNOWN, so nothing queues, nothing
+# ships, and a pipeline that still calls it fails loudly here.
+# The enrolled machine keeps serving regardless.
+CODE=0
+OUT=$(MACH_DB="$DB" "$WORKDIR/mach-server" push-update "$MACHINE3" "$WORKDIR/mach-release" 0.2.1 --attestation "$ATT" 2>&1) || CODE=$?
+[[ "$CODE" -ne 0 ]]; check "push-update is refused outright (updates moved to the distribution points)" $?
+[[ "$OUT" == *"unknown"* || "$OUT" == *"usage"* ]]; check "and it is unknown rather than a stub that might queue" $?
+machc exec "$MACHINE3" "echo updated-ok" >/dev/null; check "agent exec works" $?
+machc list | grep -q "$MACHINE3"; check "machine still enrolled+known" $?
 
 step "web UI: absent when OIDC is not configured"
 # The primary control plane has no MACH_OIDC_* set, so its UI must not exist at

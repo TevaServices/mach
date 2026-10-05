@@ -22,7 +22,8 @@
 //	mach register [...]       → enrollment only
 //
 // Nothing else is required: enrollment config, console config, and keys all
-// live in one state dir (~/.mach, /var/lib/mach for root, %APPDATA%\mach).
+// live in one state dir (~/.mach under the user profile; /var/lib/mach for
+// root; a packaged Windows service reads its own profile's).
 package main
 
 import (
@@ -48,7 +49,7 @@ func main() {
 		case "list", "exec", "console", "audit", "trust":
 			consoleMain(args)
 			return
-		case "register", "run", "version", "help":
+		case "register", "run", "service", "version", "help":
 			agentMain(args)
 			return
 		default:

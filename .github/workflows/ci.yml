@@ -59,13 +59,32 @@ jobs:
       - uses: jdx/mise-action@v4
       - run: mise run test
 
+  # Windows parity for the unit tests: the agent has Windows-only service
+  # code (the MSI's machd entry point), and several suites carried POSIX-only
+  # assertions (file modes, umask, /bin/sh) that were made to run there — this
+  # job keeps the Windows build and its tests honest on every PR. The e2e
+  # suite stays a Linux job (bash harness + unix confinement); the MSI smoke
+  # below covers the Windows package end to end.
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+
   # The MSI authoring has no linux compile path (wix.exe is windows-only and
   # the release pipeline only exercises it on a tag) — that is how a v3-ism
   # survived until the FIRST tag through the new pipeline (v0.8.0 run,
-  # WIX0005, #49). This smoke build compiles the authoring the way the
-  # release does, at the same pinned WiX, resolve-only: the exe the
-  # Component's File points at is stubbed, because only the authoring is on
-  # trial, not the payload.
+  # WIX0005, #49), and how an unterminated condition quote reached THREE
+  # releases that all died at the first real install (#54). So this smoke is
+  # more than a compile: it builds the REAL agent (the service must speak the
+  # SCM protocol or the start fails 1920 — a stub cannot), installs the MSI
+  # on the runner, checks the machd service (installed, running = the
+  # idling-until-enrollment service, auto-start, restart-on-failure
+  # configured, binary path right), and uninstalls it — the exact class of
+  # failure every burned tag hit, now caught on the PR.
   wix-smoke:
     runs-on: windows-latest
     steps:
@@ -88,18 +107,72 @@ jobs:
             n=1
           fi
           echo "changed=$n" >> "$GITHUB_OUTPUT"
-      - name: Compile the MSI authoring (WiX 5.0.2, resolve-only)
+
+      - uses: actions/setup-go@v6
+        if: steps.wxs.outputs.changed != '0'
+        with:
+          go-version-file: go.mod
+
+      - name: Build the agent binary the MSI embeds
+        if: steps.wxs.outputs.changed != '0'
+        shell: pwsh
+        run: go build -trimpath -o mach-smoke.exe ./cmd/mach
+
+      - name: Install, service, uninstall (WiX 5.0.2)
         if: steps.wxs.outputs.changed != '0'
         shell: pwsh
         run: |
           dotnet tool install --global wix --version 5.0.2
-                    'stub' | Out-File -Encoding ascii mach-smoke.exe
           wix build -arch x64 `
             -define Version=0.0.0-smoke `
             -define MachExeSource=mach-smoke.exe `
             packaging/wix/mach.wxs -o mach-smoke.msi
           if ($LASTEXITCODE -ne 0) { Write-Error 'wix build failed'; exit 1 }
-          Get-ChildItem mach-smoke.msi
+
+          $iLog = Join-Path (Get-Location) 'msi-log-smoke-install.txt'
+          $uLog = Join-Path (Get-Location) 'msi-log-smoke-uninstall.txt'
+          function DumpLogTail($path) {
+            if (Test-Path $path) { Get-Content $path -Tail 200 }
+          }
+
+          $p = Start-Process msiexec -ArgumentList "/i","`"$PWD\mach-smoke.msi`"","/quiet","/norestart","/l*v","`"$iLog`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            DumpLogTail $iLog; Write-Error "smoke install failed: exit $($p.ExitCode)"; exit 1
+          }
+          $q = sc.exe query machd
+          if ($LASTEXITCODE -ne 0 -or -not ($q | Select-String -Pattern '4  RUNNING')) {
+            DumpLogTail $iLog; Write-Error "machd not installed+running: $($q | Out-String)"; exit 1
+          }
+          $qc = sc.exe qc machd
+          if (-not ($qc | Select-String -SimpleMatch 'mach-smoke.exe" service') -or
+              -not ($qc | Select-String -SimpleMatch 'AUTO_START')) {
+            DumpLogTail $iLog; Write-Error "machd config wrong: $($qc | Out-String)"; exit 1
+          }
+          if (-not ((sc.exe qfailure machd) | Select-String -SimpleMatch 'RESTART')) {
+            DumpLogTail $iLog; Write-Error "machd has no restart-on-failure action"; exit 1
+          }
+
+          $p2 = Start-Process msiexec -ArgumentList "/x","`"$PWD\mach-smoke.msi`"","/quiet","/norestart","/l*v","`"$uLog`"" -Wait -PassThru
+          if ($p2.ExitCode -ne 0) {
+            DumpLogTail $uLog; Write-Error "smoke uninstall failed: exit $($p2.ExitCode)"; exit 1
+          }
+          $null = sc.exe query machd
+          if ($LASTEXITCODE -eq 0) { DumpLogTail $uLog; Write-Error 'machd service survived uninstall'; exit 1 }
+          if (Test-Path "$env:ProgramFiles\mach\mach-smoke.exe") {
+            Write-Error 'mach-smoke.exe survived uninstall'; exit 1
+          }
+          # exit 0 explicitly, not implicitly: the runner takes the trailing
+          # $LASTEXITCODE as the step's status, and the step's LAST native call
+          # is the query that EXPECTED to fail (sc.exe query after uninstall
+          # exits 1060).
+          "smoke install + service + uninstall OK"; exit 0
+
+      - name: Upload the smoke logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: msi-smoke-logs
+          path: msi-log-smoke-*.txt
 
   e2e:
     runs-on: ubuntu-latest

@@ -257,7 +257,7 @@ func TestInspectRejectsNonGoBinary(t *testing.T) {
 }
 
 // The attestation file round-trips through disk, which is how it is actually
-// handed to push-update and to auditors.
+// handed to auditors and checked at publish.
 func TestSaveAndLoadRoundTrip(t *testing.T) {
 	bin := testBinary(t)
 	pub, priv := keyPair(t)

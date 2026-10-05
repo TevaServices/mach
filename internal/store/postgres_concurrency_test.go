@@ -168,44 +168,6 @@ func TestPostgresTakeoverNeverDisplacesAnActiveMachine(t *testing.T) {
 	}
 }
 
-// The update pop is one statement (DELETE ... RETURNING) precisely so that
-// concurrent callers cannot both be handed the same signed manifest — delivering
-// one update twice would make the agent apply it twice. Two callers exist now
-// (the connect path and unblock), which is what makes this reachable.
-func TestPostgresUpdatePopDeliversOnceUnderConcurrency(t *testing.T) {
-	st := postgresStore(t)
-	if err := st.CreateMachine("pg-up", "pk", "h", "linux", "amd64", "v", "", false); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	if err := st.QueueUpdate("pg-up", "2.0", "sha", "", "ZGF0YQ==", "sig"); err != nil {
-		t.Fatalf("queue: %v", err)
-	}
-	var wg sync.WaitGroup
-	delivered := make([]bool, 8)
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			_, _, _, _, _, ok, err := st.PopPendingUpdate("pg-up")
-			if err != nil {
-				t.Errorf("pop: %v", err)
-				return
-			}
-			delivered[i] = ok
-		}(i)
-	}
-	wg.Wait()
-	n := 0
-	for _, d := range delivered {
-		if d {
-			n++
-		}
-	}
-	if n != 1 {
-		t.Errorf("the update was delivered %d times, want exactly once", n)
-	}
-}
-
 // Concurrent audit inserts all land. The audit trail is the record the rest of
 // the design leans on, and Postgres is where they can actually interleave.
 func TestPostgresConcurrentAuditInserts(t *testing.T) {

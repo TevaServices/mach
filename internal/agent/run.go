@@ -7,16 +7,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	mrand "math/rand"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -84,6 +81,15 @@ func (c *cappedBuffer) Bytes() []byte {
 // service (no User= in the unit) would otherwise drop to an unprivileged
 // user that cannot read its own config and crash-loop forever.
 func Run(stateDir string) error {
+	return runDaemon(stateDir, nil)
+}
+
+// runDaemon is Run with the shutdown control exposed: a nil ctl is the console
+// case (`mach run`, stopped only by a terminal frame), a live one belongs to a
+// supervisor's stop request — the Windows service's control handler (see
+// service_windows.go) — whose stop() ends the loop without retiring the
+// enrollment, because a permanent machine must stay enrolled.
+func runDaemon(stateDir string, ctl *sessionCtl) error {
 	cfg, err := LoadConfig(stateDir)
 	if err != nil {
 		return err
@@ -106,7 +112,7 @@ func Run(stateDir string) error {
 		return err
 	}
 	DropPrivileges()
-	return serveLoop(cfg, id, e2eKey, nil)
+	return serveLoop(cfg, id, e2eKey, ctl)
 }
 
 // serveLoop is the reconnect loop, shared by the installed agent and the
@@ -352,10 +358,6 @@ func dialAndServe(cfg *Config, id *Identity, e2eKey *E2EKeyPair, ctl *sessionCtl
 			if err := handlePolicyFrame(conn, env); err != nil {
 				log.Printf("agent: installing fleet policy failed: %v", err)
 			}
-		case "update":
-			if err := handleUpdate(cfg, env); err != nil {
-				log.Printf("agent: update failed: %v", err)
-			}
 		case "pong":
 			// keepalive ack; the pong handler already refreshed deadlines
 		default:
@@ -482,99 +484,15 @@ func describePayloadCommand(payload []byte) string {
 	return describeCommandText(cmd.Command, cmd.Argv)
 }
 
-// handleUpdate verifies and applies a pushed update, then execs the new
-// binary over this process. The manifest is signed by the pinned server
-// key (sig over version|sha256), so a hijacked TLS layer or a rogue
-// control plane cannot push arbitrary binaries to an enrolled agent.
-func handleUpdate(cfg *Config, env protocol.Envelope) error {
-	var upd protocol.UpdateCommand
-	if err := json.Unmarshal(env.Payload, &upd); err != nil {
-		return err
-	}
-	if cfg.ServerKey == "" {
-		return errors.New("no pinned server key in config — refusing update")
-	}
-	pub, ok := parsePubKey(cfg.ServerKey)
-	if !ok {
-		// A wrong-length key would make ed25519.Verify panic; refuse instead.
-		return errors.New("corrupt server_key in config (not a 32-byte hex key) — refusing update")
-	}
-	if !ed25519.Verify(pub, []byte(upd.Version+"|"+upd.Sha256), mustSig(upd.SigB64)) {
-		return errors.New("update signature verification failed — refusing")
-	}
-	var data []byte
-	switch {
-	case upd.DataB64 != "":
-		d, err := base64.StdEncoding.DecodeString(upd.DataB64)
-		if err != nil {
-			return err
-		}
-		data = d
-	case upd.URL != "":
-		// Only ever fetched over https (or plain http when the pinned
-		// control plane itself is http — dev deployments).
-		if !strings.HasPrefix(upd.URL, "https://") {
-			if !strings.HasPrefix(cfg.Server, "http://") || !strings.HasPrefix(upd.URL, "http://") {
-				return errors.New("update URL must be https")
-			}
-		}
-		d, err := fetchUpdate(upd.URL)
-		if err != nil {
-			return err
-		}
-		data = d
-	default:
-		return errors.New("update has neither url nor data")
-	}
-	if len(data) == 0 || len(data) > 256<<20 {
-		return errors.New("update payload missing or too large")
-	}
-	sum := sha256.Sum256(data)
-	if !strings.EqualFold(hex.EncodeToString(sum[:]), upd.Sha256) {
-		return errors.New("update checksum mismatch — refusing")
-	}
-
-	self, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	// Atomic swap: write new binary next to self, rename over. Windows
-	// cannot rename over a running executable image, so move self aside
-	// first (the .old copy is replaced on the next update).
-	tmp := self + ".new"
-	if err := os.WriteFile(tmp, data, 0o755); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, self); err != nil {
-		old := self + ".old"
-		_ = os.Remove(old)
-		if err2 := os.Rename(self, old); err2 != nil {
-			return fmt.Errorf("replacing binary %s: %v (initial rename: %v)", self, err2, err)
-		}
-		if err3 := os.Rename(tmp, self); err3 != nil {
-			return err3
-		}
-	}
-	log.Printf("agent: updated to %s — restarting", upd.Version)
-	// Re-exec self, detached: the new process outlives this one and
-	// reconnects (old connection dies). On unix we detach via Setsid.
-	cmd := exec.Command(self, "run")
-	if runtime.GOOS != "windows" {
-		cmd.SysProcAttr = detachSysProcAttr()
-	}
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	// This process must NOT re-enter the reconnect loop: two live agents
-	// with one identity would fight over the broker connection forever.
-	// errShutdown stops Run() and lets the new process take over.
-	return errShutdown
-}
-
-func mustSig(b64 string) []byte {
-	sig, _ := base64.StdEncoding.DecodeString(b64)
-	return sig
-}
+// handleUpdate was removed: the control plane no longer pushes agent
+// binaries. Updates are the distribution points' job (apt/rpm/apk for the
+// Linux packages, winget/MSI for Windows, brew for macOS) — a supervisor
+// (systemd unit, OpenRC script, Windows service) restarts the upgraded
+// binary the same way it supervises the old one, on "failure" only, so
+// exit 0 still means stop. Removing the push also removes what it could
+// do: a signed manifest was wire-integrity only, and a hostile control
+// plane or database could push any correctly signed binary anyway, while
+// a captured manifest replayed forever (the anti-rollback gap).
 
 // parsePubKey hex-decodes an ed25519 public key, rejecting wrong-length
 // input (ed25519.Verify panics on anything that is not 32 bytes).
@@ -628,18 +546,4 @@ func replyExec(conn *protocol.WSConn, reqID string, res protocol.ExecResult) {
 	if err := conn.WriteEnvelope(protocol.Envelope{Type: "exec_result", ReqID: reqID, Payload: payload}); err != nil {
 		log.Printf("agent: failed to send exec_result: %v", err)
 	}
-}
-
-// fetchUpdate downloads an update payload, size-bounded.
-func fetchUpdate(url string) ([]byte, error) {
-	client := &http.Client{Timeout: 2 * time.Minute}
-	resp, err := client.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("update fetch: %d", resp.StatusCode)
-	}
-	return io.ReadAll(io.LimitReader(resp.Body, 256<<20))
 }

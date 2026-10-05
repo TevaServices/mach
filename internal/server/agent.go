@@ -385,16 +385,6 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	// configuration.
 	s.pushFleetPolicy(ac)
 
-	// Deliver any queued, signed update before the command loop — unless the
-	// machine is blocked, in which case the update stays queued and is delivered
-	// when the block is lifted. The row is not merely left alone: PopPendingUpdate
-	// *deletes* it, so a blocked machine must not be popped at all.
-	if machine.Blocked {
-		s.logf("agent %q is blocked: queued update held until it is unblocked", machine.Name)
-	} else {
-		s.pushQueuedUpdate(conn, machine.Name)
-	}
-
 	// Keepalive, server side. The agent pings every 30s and gorilla answers
 	// silently — but those pings are control frames this read loop never sees,
 	// so the read deadline the pump sets below was refreshed only by data
@@ -477,30 +467,9 @@ func (s *Server) handleSelfRetire(name string) {
 	s.logf("machine %q retired itself (temporary session ended)", name)
 }
 
-// pushQueuedUpdate delivers a machine's queued, signed update over a live
-// connection and clears it, re-queueing on a write failure so it is not lost.
-//
-// Called at agent connect, and again when an operator unblocks a machine that is
-// already online — which is why the pop underneath it is a single statement
-// rather than a read followed by a delete.
-//
-// Writing to a connection owned by the agent pump is safe from another
-// goroutine: protocol.WSConn serialises writes.
-func (s *Server) pushQueuedUpdate(conn *protocol.WSConn, machineName string) {
-	version, sha256Hex, url, dataB64, sigB64, ok, err := s.st.PopPendingUpdate(machineName)
-	if err != nil || !ok {
-		return
-	}
-	manifest, _ := json.Marshal(protocol.UpdateCommand{
-		URL: url, DataB64: dataB64, Sha256: sha256Hex, Version: version, SigB64: sigB64,
-	})
-	if err := conn.WriteEnvelope(protocol.Envelope{Type: "update", Payload: manifest}); err != nil {
-		// Re-queue on failure so it isn't lost.
-		_ = s.st.QueueUpdate(machineName, version, sha256Hex, url, dataB64, sigB64)
-		return
-	}
-	s.logf("update pushed to %q (v%q)", machineName, version)
-}
+// pushQueuedUpdate was removed with the update push channel: agent binaries
+// are updated through the distribution points (apt/rpm/apk, winget/MSI, brew),
+// not through the control plane.
 
 // verifyAgentHello checks the ed25519 signature over (name|nonce). The
 // nonce is unique per connection, so captured hellos can't be replayed.

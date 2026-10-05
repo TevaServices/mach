@@ -8,18 +8,22 @@
 
   What it does:
     - per-machine install of mach.exe into Program Files\mach\
-    - registers the `machd` Task Scheduler job on install (refreshed on
-      upgrade): ONLOGON trigger, run level HIGHEST, /RI 1 restart interval
-      (see packaging/README.md's caveat on what /RI can honestly promise —
-      the restart-on-failure-only contract lives in the agent's exit codes)
-    - deletes the task on uninstall
-
-  /TR quoting: the task's action must be the quoted path plus its argument
-  ("C:\Program Files\mach\mach.exe" run). MSI Formatted strings escape a
-  literal quote with a backslash (\"), and the deferred type-34 command line
-  is resolved at script-write time (properties included), yielding
-    /TR ""C:\Program Files\mach\mach.exe" run"
-  which schtasks stores as the quoted command line.
+    - registers the `machd` Windows service: LocalSystem, own process,
+      automatic start at boot; the SCM's failure actions restart it on a
+      failing exit (exit code 1) up to three times, re-arming after a stable
+      day — the parity of the systemd unit's Restart=on-failure. `mach service`
+      is the binary's SCM entry point; a clean exit (revoked or deleted — exit
+      0, AGENTS.md invariant 22) stays stopped. Restart-on-failure-only is why
+      a deliberate retirement retires.
+    - stops and removes the service on uninstall; on upgrade the old product's
+      uninstall (MajorUpgrade's afterInstallValidate ordering: the old product
+      finishes — service included — before any of this install's script) has
+      already removed the service before this one re-registers and starts it
+  Bare `mach` on an installed host is a TEMPORARY session and refuses rather
+  than starting a second identity; enrollment into the service's state dir is
+  documented in the package README (the service runs as LocalSystem, so the
+  state dir is that account's profile — the same shape /var/lib/mach + the
+  `mach` service account have on Linux).
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package
@@ -31,7 +35,11 @@
       Compressed="yes"
       Language="1033">
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <!-- Upgrade ordering (afterInstallValidate: the old product — whose
+         uninstall removes the machd service — finishes before any of this
+         install's script, so the service this install re-registers is never
+         the old one). -->
+    <MajorUpgrade Schedule="afterInstallValidate" DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <Feature Id="Main" Level="1">
@@ -44,47 +52,61 @@
 
     <!-- v4/v5 schema: a Directory takes no ComponentGroup child (WIX0005,
          hit by the v0.8.0 run — #49); and Package takes no Fragment child
-         either (WIX0005 again, caught by the new wix-smoke job on this very
-         PR — the guard already paying for itself). The legal v4/v5 shape:
+         either (WIX0005 again, caught by the wix-smoke job on this very PR
+         — the guard already paying for itself). The legal v4/v5 shape:
          ComponentGroup as a DIRECT child of Package, its Component pointed
-         at INSTALLFOLDER via the Directory attribute; the Feature's
-         ComponentGroupRef needs nothing else. -->
+         at INSTALLFOLDER via the Directory attribute. -->
     <ComponentGroup Id="MachComponents">
       <Component Directory="INSTALLFOLDER" Id="MachExe" Guid="*">
         <File Id="MachExeFile" Source="$(var.MachExeSource)" KeyPath="yes" />
+        <!-- Service registration is native Windows Installer (the
+             ServiceInstall/ServiceControl tables), not a custom action:
+             msiexec installs, stops, upgrades and removes the SCM entry
+             itself. The earlier authoring drove the task scheduler through
+             deferred exe CAs — v0.9.0/v0.10.0/v0.11.0 all died there
+             (#51/#54): an unterminated condition quote, a /TR nested-quote
+             idiom that msiexec's command-line re-tokenization mangles, and
+             a repetition-interval flag the scheduling tool refuses outright
+             for ONLOGON triggers. A service has none of those hazards: no
+             command line to quote, no flags to reject, and LocalSystem is
+             the account the agent's state dir already resolves to. -->
+        <ServiceInstall
+            Id="MachdService"
+            Name="machd"
+            DisplayName="mach agent"
+            Description="Outbound-only mach agent: holds the machine's enrollment and the live control-plane connection. Enrollment: mach register on this host (see the package README)."
+            ErrorControl="normal"
+            Start="auto"
+            Type="ownProcess"
+            Arguments="service" />
+        <ServiceControl
+            Id="MachdServiceControl"
+            Name="machd"
+            Stop="both"
+            Remove="uninstall"
+            Start="install"
+            Wait="yes" />
       </Component>
     </ComponentGroup>
 
-    <!-- Registration is native Windows Installer, no Util extension CAs
-     (type 34: synchronous exe, deferred, system context). Rationale (#51):
-     the Util pair died at CA-dll spawn (2717, no dll trace) on x64 and the
-     Util CA cannot exist in the Arm64 package GitHub's runner can install
-     (1633 rejects the package before any CA runs); type-34 resolves its
-     command at script-write time, needs no CustomActionData and no dll.
-     The /TR argument nests quotes directly (type-34 ExeCommand is not a
-     Formatted string, so no backslash-quote escaping — the &quot; pair is
-     the XML escape only): /TR receives
-       "C:\Program Files\mach\mach.exe" run
-     as ONE argument with the quoted path inside. -->
+    <!-- SCM failure actions: restart on a failing exit (exit 1) after 5s,
+         up to three times, count re-armed after a stable day — the closest
+         the SCM comes to the unit file's Restart=on-failure. The service must
+         already exist, so this runs after InstallServices. Every token is a
+         single word: nothing here can trip the command-line quoting that
+         killed the task-scheduler authoring (#54). -->
     <CustomAction
-        Id="RegisterMachd"
+        Id="MachdFailureActions"
         Execute="deferred"
         Impersonate="no"
         Return="check"
         Directory="System64Folder"
-        ExeCommand="schtasks.exe /Create /F /TN machd /RL HIGHEST /SC ONLOGON /RI 1 /TR &quot;[(INSTALLFOLDER)mach.exe] run&quot;" />
-    <CustomAction
-        Id="UnregisterMachd"
-        Execute="deferred"
-        Impersonate="no"
-        Return="check"
-        Directory="System64Folder"
-        ExeCommand="schtasks.exe /Delete /F /TN machd" />
+        ExeCommand="sc.exe failure machd reset= 86400 actions= restart/5000/restart/5000/restart/5000" />
     <InstallExecuteSequence>
-      <!-- Fresh install and upgrade both (re)register the task; uninstall
-           deletes it. A repair (REINSTALL) also refreshes it. -->
-      <Custom Action="RegisterMachd" After="InstallFiles" Condition="NOT REMOVE" />
-      <Custom Action="UnregisterMachd" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL" />
+      <!-- Failure actions are configured once the service exists (install
+           and repair and upgrade; never on uninstall, where the service is
+           being removed). -->
+      <Custom Action="MachdFailureActions" After="InstallServices" Condition="NOT REMOVE" />
     </InstallExecuteSequence>
   </Package>
 </Wix>

@@ -19,11 +19,13 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -196,7 +198,22 @@ func TestTemporarySessionTracesTheCommandsItRuns(t *testing.T) {
 	globalPolicy.install("")
 	conn, peer := streamPipe(t)
 
-	payload, _ := json.Marshal(protocol.ExecCommand{Command: "echo traced\necho forged", Timeout: 5})
+	// dash/sh interprets \n in an echo argument, so the command carries a
+	// literal newline the shell turns into a second line. PowerShell (the
+	// Windows shell) has no backslash escapes in an echo argument — use its
+	// statement separator, which yields the same two lines and the same one
+	// quoted trace line. The timeout is generous on purpose: powershell.exe
+	// cold-starts slowly on CI runners, and the point is the trace, not the
+	// timer.
+	cmd := "echo traced\necho forged"
+	if runtime.GOOS == "windows" {
+		cmd = "echo traced; echo forged"
+	}
+	timeout := 5
+	if runtime.GOOS == "windows" {
+		timeout = 60
+	}
+	payload, _ := json.Marshal(protocol.ExecCommand{Command: cmd, Timeout: timeout})
 	got := captureStdout(t, func() {
 		handleExec(conn, protocol.Envelope{Type: "exec", ReqID: "trace-1", Payload: payload},
 			make(chan struct{}, 1), newSessionCtl())
@@ -216,7 +233,7 @@ func TestTemporarySessionTracesTheCommandsItRuns(t *testing.T) {
 		t.Errorf("stdout = %q, want both echoed lines", res.Stdout)
 	}
 
-	if !strings.Contains(got, `mach: exec: "echo traced\necho forged"`) {
+	if !strings.Contains(got, fmt.Sprintf("mach: exec: %q", cmd)) {
 		t.Errorf("trace = %q, want the command quoted on one line", got)
 	}
 	if !strings.Contains(got, "mach: exec: exit 0") {
@@ -229,7 +246,8 @@ func TestTemporarySessionTracesTheCommandsItRuns(t *testing.T) {
 }
 
 // Only a temporary session traces: the permanent agent passes a nil *sessionCtl,
-// and a session that is already shutting down has said its farewell already.
+// a session that is already shutting down has said its farewell already, and the
+// service's non-tracing ctl (service_windows.go) has nowhere to print to.
 func TestAnnounceIsSilentWithoutALiveTemporarySession(t *testing.T) {
 	got := captureStdout(t, func() {
 		var noSession *sessionCtl // the installed agent's case
@@ -238,9 +256,28 @@ func TestAnnounceIsSilentWithoutALiveTemporarySession(t *testing.T) {
 		stopped := newSessionCtl()
 		stopped.shutDown()
 		stopped.announce("exec: %q", "echo hi")
+
+		quiet := &sessionCtl{done: make(chan struct{})} // the service's ctl
+		quiet.announce("exec: %q", "echo hi")
 	})
 	if got != "" {
 		t.Errorf("something with no console to trace to printed %q", got)
+	}
+}
+
+// The service's stop (sessionCtl.stop, service_windows.go) is the permanent
+// agent's shutdown: it ends the session like an interrupt does, WITHOUT the
+// retire frame (a stopped service is not a retired enrollment), and it must be
+// idempotent — the SCM can deliver a stop and a shutdown to the same handler.
+func TestSessionCtlStopEndsSessionWithoutRetiring(t *testing.T) {
+	c := &sessionCtl{done: make(chan struct{})} // the service's non-tracing ctl
+	c.stop()
+	if !c.stopped() {
+		t.Fatal("stop did not signal shutdown")
+	}
+	c.stop() // a second stop must not re-close the channel (would panic)
+	if c.retiredEnrollment() {
+		t.Fatal("a service stop retired the enrollment")
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -655,7 +656,8 @@ func TestFirstUsePinsTheKeyAndSaysSo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pin file: %v", err)
 	}
-	if st.Mode().Perm() != 0o600 {
+	// POSIX-only: Windows has no permission bits for this rule to bind.
+	if runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 		t.Errorf("pin file mode = %v, want 0600", st.Mode().Perm())
 	}
 	var f2 struct {
@@ -936,6 +938,10 @@ func TestLoadConfigDistinguishesUnreadableFromAbsent(t *testing.T) {
 	path := filepath.Join(dir, "console.json")
 	if err := os.WriteFile(path, []byte(`{"server":"https://x","api_key":"mach_k"}`), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
+	}
+	if runtime.GOOS == "windows" {
+		t.Log("windows: os.Chmod cannot make a file unreadable to its owner; the unreadable/absent distinction is POSIX")
+		return
 	}
 	if err := os.Chmod(path, 0o000); err != nil {
 		t.Fatalf("chmod: %v", err)

@@ -3,6 +3,7 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -223,15 +224,20 @@ func TestE2EKeyIsNeverSilentlyReplaced(t *testing.T) {
 	}
 
 	// A loose mode is tightened on load, like the identity key's.
+	// POSIX-only: Windows has no permission bits to loosen (os.Chmod on
+	// Windows sets the read-only attribute), so the tightening assertion
+	// is skipped there rather than made always-pass.
 	keyPath := filepath.Join(dir, "e2e.key")
-	if err := os.Chmod(keyPath, 0o644); err != nil {
-		t.Fatalf("chmod: %v", err)
-	}
-	if _, err := LoadOrCreateE2EKey(dir); err != nil {
-		t.Fatalf("reload after a loose mode: %v", err)
-	}
-	if st, err := os.Stat(keyPath); err != nil || st.Mode().Perm() != 0o600 {
-		t.Fatalf("e2e.key mode = %v (%v), want 600", st.Mode().Perm(), err)
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(keyPath, 0o644); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		if _, err := LoadOrCreateE2EKey(dir); err != nil {
+			t.Fatalf("reload after a loose mode: %v", err)
+		}
+		if st, err := os.Stat(keyPath); err != nil || st.Mode().Perm() != 0o600 {
+			t.Fatalf("e2e.key mode = %v (%v), want 600", st.Mode().Perm(), err)
+		}
 	}
 
 	// A corrupt file is refused, not replaced, and left for the operator.

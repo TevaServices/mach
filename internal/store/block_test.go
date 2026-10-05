@@ -9,7 +9,6 @@ import (
 	"database/sql"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 )
 
@@ -126,130 +125,13 @@ func TestVerifySchemaRejectsDatabaseWithoutBlocked(t *testing.T) {
 	}
 }
 
-// The pop had a SELECT-then-DELETE gap that was only safe while it had one
-// caller. Delivering a held update on unblock is a second caller, so two
-// concurrent pops would hand out the same signed manifest twice.
-//
-// This half pins the observable contract: once popped, the update is gone and a
-// later pop reports "nothing queued" rather than replaying it. It does NOT pin
-// the race — that is what TestPopPendingUpdateIsSingleDeliveryUnderRace is for,
-// and the sequential case passes against the old two-statement implementation.
-func TestPopPendingUpdateIsSingleDelivery(t *testing.T) {
-	st := testStore(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	if err := st.QueueUpdate("bcross-a", "1.2.3", "sha", "url", "data", "sig"); err != nil {
-		t.Fatalf("queue: %v", err)
-	}
-	v, sha, url, data, sig, ok, err := st.PopPendingUpdate("bcross-a")
-	if err != nil || !ok {
-		t.Fatalf("first pop: ok=%v err=%v", ok, err)
-	}
-	if v != "1.2.3" || sha != "sha" || url != "url" || data != "data" || sig != "sig" {
-		t.Fatalf("pop returned the wrong manifest: %q %q %q %q %q", v, sha, url, data, sig)
-	}
-	// The second pop is the whole point: the row is gone, so this must report
-	// "nothing queued" rather than replaying the same manifest.
-	if _, _, _, _, _, ok, err := st.PopPendingUpdate("bcross-a"); err != nil || ok {
-		t.Fatalf("second pop delivered the update again: ok=%v err=%v", ok, err)
-	}
-}
-
-// The race the single-statement pop exists to close: several callers popping the
-// same machine at once must produce exactly ONE delivery.
-//
-// This is reachable even on SQLite, whose pool is capped at one connection:
-// queryRow and exec acquire and release the connection separately, so two
-// callers can interleave *between* the SELECT and the DELETE of the old
-// implementation. Postgres (25 connections) makes the same window wider.
-//
-// Verified by reverting PopPendingUpdate to its two-statement form: this test
-// fails there and passes with the single DELETE ... RETURNING.
-func TestPopPendingUpdateIsSingleDeliveryUnderRace(t *testing.T) {
-	st := testStore(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	const (
-		callers    = 8
-		iterations = 60
-	)
-	double := 0
-	for i := 0; i < iterations; i++ {
-		if err := st.QueueUpdate("bcross-a", "1.2.3", "sha", "url", "data", "sig"); err != nil {
-			t.Fatalf("queue: %v", err)
-		}
-		start := make(chan struct{})
-		var (
-			wg    sync.WaitGroup
-			mu    sync.Mutex
-			got   int
-			fails []error
-		)
-		for c := 0; c < callers; c++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				<-start // line them all up, then release together
-				_, _, _, _, _, ok, err := st.PopPendingUpdate("bcross-a")
-				mu.Lock()
-				defer mu.Unlock()
-				if err != nil {
-					fails = append(fails, err)
-				}
-				if ok {
-					got++
-				}
-			}()
-		}
-		close(start)
-		wg.Wait()
-		if len(fails) > 0 {
-			t.Fatalf("pop errored: %v", fails[0])
-		}
-		if got != 1 {
-			double++
-		}
-	}
-	if double > 0 {
-		t.Fatalf("%d of %d rounds delivered the queued update to more (or fewer) than one caller; "+
-			"the pop is not a single statement", double, iterations)
-	}
-}
-
-func TestHasPendingUpdateDoesNotConsume(t *testing.T) {
-	st := testStore(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	if has, err := st.HasPendingUpdate("bcross-a"); err != nil || has {
-		t.Fatalf("empty queue reports pending: has=%v err=%v", has, err)
-	}
-	if err := st.QueueUpdate("bcross-a", "1.2.3", "sha", "url", "data", "sig"); err != nil {
-		t.Fatalf("queue: %v", err)
-	}
-	// Read twice, then pop: observing the queue must not drain it.
-	for i := 0; i < 2; i++ {
-		if has, err := st.HasPendingUpdate("bcross-a"); err != nil || !has {
-			t.Fatalf("probe %d reports no queued update: has=%v err=%v", i, has, err)
-		}
-	}
-	if _, _, _, _, _, ok, err := st.PopPendingUpdate("bcross-a"); err != nil || !ok {
-		t.Fatalf("pop after probes: ok=%v err=%v", ok, err)
-	}
-}
-
 // Delete is the recovery path revocation cannot express, and the web UI depends
-// on exactly these semantics: the row goes, the queued update goes, the audit
-// trail stays, and both the name and the agent key become reusable.
+// on exactly these semantics: the row goes, the audit trail stays, and both the
+// name and the agent key become reusable.
 func TestDeleteMachineFreesNameAndKeyKeepsAudit(t *testing.T) {
 	st := testStore(t)
 	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false); err != nil {
 		t.Fatalf("create: %v", err)
-	}
-	if err := st.QueueUpdate("bcross-a", "1.2.3", "sha", "url", "data", "sig"); err != nil {
-		t.Fatalf("queue: %v", err)
 	}
 	if err := st.AuditInsert("2026-01-01T00:00:00Z", "bcross-a", "echo hi", "console:x",
 		sql.NullInt64{Int64: 0, Valid: true}, "hi", ""); err != nil {
@@ -264,9 +146,6 @@ func TestDeleteMachineFreesNameAndKeyKeepsAudit(t *testing.T) {
 	}
 	if m, err := st.MachineByPubKey("pub-a"); err != nil || m != nil {
 		t.Fatalf("agent key survived delete: %v %+v", err, m)
-	}
-	if has, err := st.HasPendingUpdate("bcross-a"); err != nil || has {
-		t.Fatalf("queued update survived delete: has=%v err=%v", has, err)
 	}
 	// Audit is a record about the fleet, not a property of the machine row.
 	entries, err := st.AuditList("bcross-a", 50)

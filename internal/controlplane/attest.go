@@ -16,8 +16,8 @@ import (
 // was built from, so that later anyone — an operator, an auditor, another tool
 // — can check where a shipped artifact came from. The signature is made with
 // the control plane's own identity key, the same key agents pin at enrollment,
-// so an attestation vouches for the binary in the same terms the update path
-// already does.
+// so an attestation vouches for the binary under the same key the deployments
+// already pin.
 //
 // The attestation is written next to the binary as <binary>.intoto.jsonl.
 func Attest(binPath, version, outPath string) error {

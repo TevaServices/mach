@@ -14,7 +14,8 @@
 # revision into each binary, `mach-server attest` reads it back out, and that
 # is what lets a shipped agent binary be traced to a commit. Build from a
 # clean checkout — a dirty tree is recorded as vcs.modified, and
-# `push-update --attestation` refuses to ship such a build.
+# `mach-server verify-attestation` refuses such a build's attestation at
+# publish time.
 #
 # --platform=$BUILDPLATFORM pins this stage to the machine running the build,
 # with TARGETOS/TARGETARCH naming the image being built. In a multi-platform
@@ -73,13 +74,10 @@ CMD ["serve"]
 # Attestations are made after the image is running, not during the build:
 # they are signed with the control plane's identity key, which is generated on
 # first `serve` and lives in /data. Signing with a key that only exists at
-# runtime is what ties an attestation to the control plane that will actually
-# push the update.
+# runtime is what ties an attestation to the control plane whose release
+# carries the binary.
 #
 #   docker compose exec mach-server mach-server attest /opt/mach-agents/mach-linux-amd64 0.2.0
 #   docker compose cp mach-server:/opt/mach-agents/mach-linux-amd64.intoto.jsonl .
 #   docker compose exec mach-server mach-server verify-attestation \
 #       /opt/mach-agents/mach-linux-amd64.intoto.jsonl /opt/mach-agents/mach-linux-amd64
-#   docker compose exec mach-server mach-server push-update \
-#       <machine> /opt/mach-agents/mach-linux-amd64 0.2.0 \
-#       --attestation /opt/mach-agents/mach-linux-amd64.intoto.jsonl

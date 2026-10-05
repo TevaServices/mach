@@ -22,7 +22,8 @@
 #     re-verifies every envelope against the artifact set before uploading.
 #   - mach-x64.msi / mach-arm64.msi — Windows installers built from the SAME
 #     goreleaser-attested windows binaries (downloaded, not rebuilt),
-#     registering the `machd` Task Scheduler job. The MSIs themselves are not
+#     installing the machd Windows service (ServiceInstall/ServiceControl —
+#     no custom-action command lines to quote). The MSIs themselves are not
 #     attested this round; the winget manifest pins InstallerSha256 (see
 #     packaging/winget/README.md).
 #   - the signing key's public half (hex ed25519) in the release notes
@@ -51,8 +52,8 @@
 # goreleaser post hook enforces it per binary.
 #
 # VCS stamping matters here: Go embeds the revision and dirty flag in each
-# binary, `mach-server attest` reads it back, and push-update --attestation
-# refuses a modified-tree build. Actions/checkout leaves a clean tree, and
+# binary, `mach-server attest` reads it back, and the post hook fails a
+# modified-tree build. Actions/checkout leaves a clean tree, and
 # .git must reach the Docker build (the Dockerfile explains why there is no
 # .dockerignore excluding it); the goreleaser post hook re-checks per binary.
 #
@@ -198,7 +199,9 @@ jobs:
       # context so Go stamps the VCS revision into the binaries it compiles
       # (see the Dockerfile header; there is deliberately no .dockerignore
       # excluding it). Note: the agent binaries baked into the image are not
-      # attested — push-update --attestation covers runtime pushes only.
+      # attested — there is no runtime push path anymore (agents update
+      # through their distribution points), so the gap is "the image's baked
+      # binaries carry no attestation file", not a pushed one (#4).
       - id: push
         uses: docker/build-push-action@v7
         with:
@@ -252,7 +255,8 @@ jobs:
           password: ${{ github.token }}
 
       # The agent container is built from Dockerfile.agent (see its header for
-      # why pushed updates are refused inside it). Same MACH_VERSION stamp as
+      # why the container updates by pulling the next image). Same
+      # MACH_VERSION stamp as
       # the server image, so `mach version` in either container and the GHCR
       # tags all report the same release.
       - id: push
@@ -278,9 +282,10 @@ jobs:
 
   # Windows installers (#43): the MSI wraps the goreleaser-BUILT windows
   # binary (staged above — the same bytes its attestation names; NOT a
-  # rebuild), registers the machd Task Scheduler job, and is validated right
-  # here: silent install, the task exists and points at the installed
-  # binary, silent uninstall removes it.
+  # rebuild), installs the machd Windows service, and is validated right
+  # here: silent install, the service exists (running, auto-start,
+  # restart-on-failure configured) and points at the installed binary,
+  # silent uninstall removes service and binary both.
   msi:
     name: windows MSI (${{ matrix.arch }})
     runs-on: windows-latest
@@ -340,30 +345,79 @@ jobs:
       # 'Arm64;1033', attested and published; native arm64 USER installs are
       # the supported path). Revisit when the image ships an arm64-native
       # engine.
-      - name: Validate on the runner (install, task, uninstall)
+      #
+      # Both legs log (/l*v) and read the CHILD's exit code (-PassThru:
+      # Start-Process -Wait never populates $LASTEXITCODE — v0.9.0's 1603 went
+      # silently past this step while the schtasks query after it took the
+      # blame, #51/#54). Each leg aborts on its own failure, so the evidence
+      # is from the leg that failed.
+      - name: Validate on the runner (install, service, uninstall)
         if: matrix.arch == 'x64'
         shell: pwsh
         run: |
           $msi = (Resolve-Path "mach-${{ matrix.arch }}.msi").Path
-          $log = (Join-Path (Get-Location) "msi-log-${{ matrix.arch }}.txt")
-          Start-Process msiexec -ArgumentList "/i","`"$msi`"","/quiet","/norestart","/l*v","`"$log`"" -Wait
-          if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { Write-Error "msiexec install failed"; exit 1 }
-          schtasks /Query /TN machd /FO LIST
-          if ($LASTEXITCODE -ne 0) { Write-Error "machd task not registered after install"; exit 1 }
-          if (-not (Test-Path "$env:ProgramFiles\mach\mach.exe")) {
-            Write-Error "mach.exe not at the expected install path"; exit 1
-          }
-          Start-Process msiexec -ArgumentList "/x","`"$msi`"","/quiet","/norestart" -Wait
-          schtasks /Query /TN machd 2>$null
-          if ($LASTEXITCODE -eq 0) { Write-Error "machd task survived uninstall"; exit 1 }
-          "install + task + uninstall OK"
+          $iLog = (Join-Path (Get-Location) "msi-log-install-${{ matrix.arch }}.txt")
+          $uLog = (Join-Path (Get-Location) "msi-log-uninstall-${{ matrix.arch }}.txt")
 
-      - name: Dump the install log tail (diagnose CA failures)
+          function DumpLogTail($path) {
+            if (Test-Path $path) { Get-Content $path -Tail 200 }
+          }
+
+          $p = Start-Process msiexec -ArgumentList "/i","`"$msi`"","/quiet","/norestart","/l*v","`"$iLog`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            DumpLogTail $iLog
+            Write-Error "msiexec install failed: exit $($p.ExitCode)"; exit 1
+          }
+          # The machd service must EXIST, be RUNNING (the agent idles while
+          # unenrolled — service_windows.go serviceRun — so a start that stays
+          # up is the proof the SCM handshake works), point at the installed
+          # binary with the SCM entry-point argument, auto-start at boot, and
+          # carry the restart-on-failure actions (`sc failure`, RestartSec=5
+          # parity with the systemd unit — restart, never on exit 0).
+          $q = sc.exe query machd
+          if ($LASTEXITCODE -ne 0) { DumpLogTail $iLog; Write-Error "machd service not installed"; exit 1 }
+          $q | Select-String -Pattern 'RUNNING'
+          if (-not ($q | Select-String -Pattern '4  RUNNING')) {
+            DumpLogTail $iLog; Write-Error "machd not RUNNING after install: $($q | Out-String)"; exit 1
+          }
+          $qc = sc.exe qc machd
+          if (-not ($qc | Select-String -SimpleMatch 'mach.exe" service')) {
+            DumpLogTail $iLog; Write-Error "machd binary path wrong: $($qc | Out-String)"; exit 1
+          }
+          if (-not ($qc | Select-String -SimpleMatch 'AUTO_START')) {
+            DumpLogTail $iLog; Write-Error "machd not AUTO_START: $($qc | Out-String)"; exit 1
+          }
+          $qf = sc.exe qfailure machd
+          if (-not ($qf | Select-String -SimpleMatch 'RESTART')) {
+            DumpLogTail $iLog; Write-Error "machd has no restart-on-failure action: $($qf | Out-String)"; exit 1
+          }
+          if (-not (Test-Path "$env:ProgramFiles\mach\mach.exe")) {
+            DumpLogTail $iLog; Write-Error "mach.exe not at the expected install path"; exit 1
+          }
+
+          $p2 = Start-Process msiexec -ArgumentList "/x","`"$msi`"","/quiet","/norestart","/l*v","`"$uLog`"" -Wait -PassThru
+          if ($p2.ExitCode -ne 0) {
+            DumpLogTail $uLog
+            Write-Error "msiexec uninstall failed: exit $($p2.ExitCode)"; exit 1
+          }
+          $null = sc.exe query machd
+          if ($LASTEXITCODE -eq 0) { DumpLogTail $uLog; Write-Error "machd service survived uninstall"; exit 1 }
+          if (Test-Path "$env:ProgramFiles\mach\mach.exe") {
+            Write-Error "mach.exe survived uninstall"; exit 1
+          }
+          # exit 0 explicitly, not implicitly: the runner takes the trailing
+          # $LASTEXITCODE as the step's status, and the step's LAST native call
+          # is the query that EXPECTED to fail (sc.exe query after uninstall
+          # exits 1060).
+          "install + service + uninstall OK"; exit 0
+
+      - name: Dump the install logs (diagnose CA/service failures)
         if: failure()
         shell: pwsh
         run: |
-          if (Test-Path "msi-log-${{ matrix.arch }}.txt") {
-            Get-Content "msi-log-${{ matrix.arch }}.txt" -Tail 240
+          foreach ($f in Get-ChildItem "msi-log-*.txt") {
+            "===== $($f.Name) (tail) ====="
+            Get-Content $f.FullName -Tail 240
           }
 
       - uses: actions/upload-artifact@v7
@@ -467,7 +521,7 @@ jobs:
           {
             printf '**Container images** (linux/amd64 + linux/arm64):\n'
             printf -- '- `ghcr.io/%s:%s` (also `:latest`) — the control plane; image digest `%s`\n' "$SERVER_IMAGE" "$SERVER_VERSION" "$SERVER_DIGEST"
-            printf -- '- `ghcr.io/%s:%s` (also `:latest`) — the outbound-only agent, for machines that run as containers; image digest `%s`. Enrolls headlessly from `MACH_SERVER` / `MACH_API_KEY` / `MACH_NAME` and state lives entirely in the `/data` volume; pushed updates are refused inside it (see Dockerfile.agent) — update by pulling the next image.\n' "$AGENT_IMAGE" "$SERVER_VERSION" "$AGENT_DIGEST"
+            printf -- '- `ghcr.io/%s:%s` (also `:latest`) — the outbound-only agent, for machines that run as containers; image digest `%s`. Enrolls headlessly from `MACH_SERVER` / `MACH_API_KEY` / `MACH_NAME` and state lives entirely in the `/data` volume; updated only by pulling the next image (Dockerfile.agent).\n' "$AGENT_IMAGE" "$SERVER_VERSION" "$AGENT_DIGEST"
             printf '\n'
             printf '**Client:** the mach binary (agent + console) — per-platform zips below, or through a package manager: Linux packages (.deb/.rpm/.apk here and in the dist.mach.teva.services package repos — see README "Installing the client"), Homebrew `brew install tevaservices/mach/mach`, Windows MSIs (also `winget install TevaServices.mach`).\n'
             printf '\n'
