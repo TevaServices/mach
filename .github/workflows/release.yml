@@ -683,6 +683,10 @@ jobs:
     runs-on: macos-latest
     needs: brew-bump
     steps:
+      # The repo is needed for go.mod (the scratch control plane the smoke
+      # enrolls against is built from it) — the pre-service-smoke job never
+      # checked out, and this one does now.
+      - uses: actions/checkout@v7
       - name: Check the tap exists
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

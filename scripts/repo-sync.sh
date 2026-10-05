@@ -91,6 +91,16 @@ cd - >/dev/null
 # createrepo_c indexes whatever is in rpm/ and dnf resolves per-arch.
 for f in $(by_ext rpm); do cp "$f" "$YUM/."; done
 createrepo_c "$YUM"
+# createrepo finalizes by silently renaming its .repodata staging into
+# repodata/ — and on one runner (identical tool version, script, input; the
+# v0.12.3 run) the rename did not happen at all, leaving EVERYTHING under the
+# hidden .repodata/ with exit 0. A consumer reads repodata/repomd.xml, not
+# .repodata/, so force the layout when the tool left it behind; where it
+# finalized, this is a no-op. The workflow's validate step catches whatever
+# remains either way.
+if [ ! -d "$YUM/repodata" ] && [ -d "$YUM/.repodata" ]; then
+    mv "$YUM/.repodata" "$YUM/repodata"
+fi
 
 # --- Alpine: unsigned APKINDEX (consumers add --allow-untrusted for now) ----
 # apk index needs apk-tools, which the RUNNER lacks — that is the whole reason
