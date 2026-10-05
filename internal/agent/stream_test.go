@@ -46,12 +46,19 @@ func streamPipe(t *testing.T) (*protocol.WSConn, *websocket.Conn) {
 }
 
 // readEnvelope reads one frame, failing the test rather than hanging.
+//
+// The deadline sits above the longest timeout these tests hand an exec (60s on
+// windows: powershell cold-starts slowly on CI runners), so a slow command
+// still delivers its result frame instead of tripping a read timeout that
+// looks exactly like a lost reply. If the deadline does fire, the result frame
+// was never written — the command hung past its own timeout, or the agent
+// died without answering — and the failure says that, not just "i/o timeout".
 func readEnvelope(t *testing.T, peer *websocket.Conn) protocol.Envelope {
 	t.Helper()
-	_ = peer.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_ = peer.SetReadDeadline(time.Now().Add(70 * time.Second))
 	var env protocol.Envelope
 	if err := peer.ReadJSON(&env); err != nil {
-		t.Fatalf("read frame: %v", err)
+		t.Fatalf("read frame (no reply within the 70s deadline — the command never produced a result frame): %v", err)
 	}
 	return env
 }

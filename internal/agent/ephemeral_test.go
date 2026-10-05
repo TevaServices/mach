@@ -230,14 +230,37 @@ func TestTemporarySessionTracesTheCommandsItRuns(t *testing.T) {
 		t.Fatalf("exec_result payload: %v", err)
 	}
 	if !strings.Contains(res.Stdout, "traced") || !strings.Contains(res.Stdout, "forged") {
-		t.Errorf("stdout = %q, want both echoed lines", res.Stdout)
+		hint := ""
+		if strings.Contains(got, "mach: exec: exit -1") {
+			// The -1 branch is reachable only after the process started and
+			// was killed by its own deadline, so "no output at all" on this
+			// run is a lost result, not a failed spawn (that is exit 127).
+			hint = "\n(trace reported exit -1: the command hit its own timeout with no output — if the exit was 0, this is a lost output buffer)"
+		}
+		t.Errorf("stdout = %q, want both echoed lines%s", res.Stdout, hint)
 	}
 
 	if !strings.Contains(got, fmt.Sprintf("mach: exec: %q", cmd)) {
 		t.Errorf("trace = %q, want the command quoted on one line", got)
 	}
-	if !strings.Contains(got, "mach: exec: exit 0") {
-		t.Errorf("trace = %q, want the exit status reported", got)
+	if exit := "mach: exec: exit 0"; !strings.Contains(got, exit) {
+		status := "unknown"
+		for _, s := range []string{"exit 0", "exit -1", "exit 126", "exit 127", "exit 130"} {
+			if strings.Contains(got, s) {
+				status = strings.TrimPrefix(s, "exit ")
+				break
+			}
+		}
+		extra := ""
+		if status == "-1" {
+			// Reached only with the process started: the exec ran for its
+			// whole timeout with no output, then was killed. On windows that
+			// has meant a stalled powershell startup inside the runner (one
+			// observed occurrence, #58) — a slow spawn, one shot above 60s,
+			// would look the same.
+			extra = "\n(want exit 0; -1 means the command was killed by its 60s timeout — on windows this has been a stalled powershell startup inside the runner, #58)"
+		}
+		t.Errorf("trace = %q, want the exit status reported (saw exit status: %s)%s", got, status, extra)
 	}
 	// Exactly two lines: the command's own newline was escaped, not printed.
 	if n := strings.Count(got, "\n"); n != 2 {
