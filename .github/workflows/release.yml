@@ -469,6 +469,14 @@ jobs:
             -ldflags "-s -w -X github.com/TevaServices/mach/internal/version.Version=$VER" \
             -o .attest-tool ./cmd/mach-server
 
+          # The attest tool loads the signing key itself (verify-attestation
+          # checks the envelope's signature against the control-plane key, the
+          # same one the goreleaser hook used). Without MACH_SERVER_KEY it
+          # falls back to the container's default DB path and finds nothing:
+          # v0.12.1 failed at exactly that. Absolute path, not relative: the
+          # tool resolves it verbatim.
+          export MACH_SERVER_KEY="$PWD/signing.key"
+
           # Verify EVERY envelope against the staged binary it names (its own
           # dist-relative path), fold into the bundle at ../bundle.jsonl —
           # outside dist, so the cleanup below cannot eat it. An envelope
