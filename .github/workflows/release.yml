@@ -482,7 +482,12 @@ jobs:
               echo "::error::$rel attests a binary that is not among the staged artifacts: $bin"
               exit 1
             fi
-            if ! out=$(.attest-tool verify-attestation "$env_file" "$bin"); then
+            # ./.attest-tool, not .attest-tool: the shell never looks in the
+            # current directory for a bare name, and this is the first run the
+            # publish job has ever had (every earlier tag died at the MSI job,
+            # which is why this bug survived until the MSI validated green —
+            # #55/v0.12.0).
+            if ! out=$(./.attest-tool verify-attestation "$env_file" "$bin"); then
               echo "::error::attestation verify failed for $rel"
               exit 1
             fi
