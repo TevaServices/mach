@@ -549,8 +549,15 @@ jobs:
         with:
           body_path: release-body.md
           generate_release_notes: true
+          # dist/mach-* AND dist/mach_*: goreleaser's zips and the debs/apks
+          # name with an UNDERSCORE after the project (mach_0.12.2_amd64.deb,
+          # mach_0.12.2_darwin_arm64.zip) while nfpm's rpm names and every
+          # manually staged file use a hyphen — a single glob silently shipped
+          # a release without the zips, debs or apks (v0.12.2, first publish
+          # that ever ran; #57). checksums.txt separately.
           files: |
             dist/mach-*
+            dist/mach_*
             dist/checksums.txt
 
   # Linux repo sync (#45): regenerate the apt/rpm/apk metadata from this
