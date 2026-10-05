@@ -4,11 +4,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,11 +13,10 @@ import (
 	"time"
 
 	"github.com/TevaServices/mach/internal/release"
-	"github.com/TevaServices/mach/internal/store"
 )
 
 // setup points the control plane's paths at a temp dir and installs a fresh
-// identity key, which is what signs both attestations and update manifests.
+// identity key, which is what signs attestation envelopes.
 func setup(t *testing.T) (priv ed25519.PrivateKey, bin string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -42,48 +38,6 @@ func setup(t *testing.T) (priv ed25519.PrivateKey, bin string) {
 		t.Skipf("test binary carries no build information: %v", err)
 	}
 	return priv, self
-}
-
-func queued(t *testing.T, machine string) (sha string, ok bool) {
-	t.Helper()
-	st, err := store.Open(dbPath())
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	defer st.Close()
-	_, sha, _, _, sig, ok, err := st.PopPendingUpdate(machine)
-	if err != nil {
-		t.Fatalf("pending update: %v", err)
-	}
-	if !ok {
-		return "", false
-	}
-	// The signature must verify over the manifest exactly as the agent checks
-	// it (see internal/agent handleUpdate) — otherwise a queued update would
-	// be refused on arrival and the test would be asserting nothing.
-	pub := privOf(t).Public().(ed25519.PublicKey)
-	if !ed25519.Verify(pub, []byte("1.2.3|"+sha), mustB64(t, sig)) {
-		t.Fatal("queued update is not signed by the control plane key")
-	}
-	return sha, true
-}
-
-func privOf(t *testing.T) ed25519.PrivateKey {
-	t.Helper()
-	priv, err := loadServerPriv()
-	if err != nil {
-		t.Fatalf("loadServerPriv: %v", err)
-	}
-	return priv
-}
-
-func mustB64(t *testing.T, s string) []byte {
-	t.Helper()
-	b, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		t.Fatalf("base64: %v", err)
-	}
-	return b
 }
 
 // The two commands are a round trip: what attest writes, verify-attestation
@@ -124,104 +78,6 @@ func TestAttestNeedsAVersionAndABuild(t *testing.T) {
 	}
 }
 
-// The gate that matters: with --attestation, a binary the attestation does not
-// describe must not be queued for any machine at all.
-func TestPushUpdateRefusesMismatchedAttestation(t *testing.T) {
-	_, bin := setup(t)
-	att := bin + ".intoto.jsonl"
-	if err := Attest(bin, "1.2.3", att); err != nil {
-		t.Fatalf("attest: %v", err)
-	}
-
-	// Swap the binary for different bytes, keeping the attestation.
-	swapped := filepath.Join(t.TempDir(), "agent")
-	orig, err := os.ReadFile(bin)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if err := os.WriteFile(swapped, append(orig, 0x00), 0o755); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	if err := PushUpdate("mach-a", swapped, "1.2.3", att); err == nil {
-		t.Fatal("push-update queued a binary its attestation does not describe")
-	}
-	if _, ok := queued(t, "mach-a"); ok {
-		t.Fatal("an update was queued despite the attestation check failing")
-	}
-
-	// A version that disagrees with the attestation is also refused: the
-	// version is what the agent records as running after it applies the
-	// update, so it has to be the one that was attested.
-	if err := PushUpdate("mach-a", bin, "9.9.9", att); err == nil {
-		t.Fatal("push-update accepted a version the attestation does not claim")
-	}
-	if _, ok := queued(t, "mach-a"); ok {
-		t.Fatal("an update was queued despite the version mismatch")
-	}
-}
-
-// With a matching attestation the update is queued, signed, and carries the
-// digest of the attested bytes — the property the agent verifies on arrival.
-func TestPushUpdateQueuesAttestedBinary(t *testing.T) {
-	_, bin := setup(t)
-	att := bin + ".intoto.jsonl"
-	if err := Attest(bin, "1.2.3", att); err != nil {
-		t.Fatalf("attest: %v", err)
-	}
-	// A copy at another path, as a real release would be shipped.
-	shipped := filepath.Join(t.TempDir(), "mach-agent")
-	data, err := os.ReadFile(bin)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if err := os.WriteFile(shipped, data, 0o755); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-
-	seedMachine(t, "mach-b")
-	if err := PushUpdate("mach-b", shipped, "1.2.3", att); err != nil {
-		t.Fatalf("push-update: %v", err)
-	}
-	sum := sha256.Sum256(data)
-	sha, ok := queued(t, "mach-b")
-	if !ok {
-		t.Fatal("no update was queued")
-	}
-	if !strings.EqualFold(sha, hex.EncodeToString(sum[:])) {
-		t.Fatalf("queued sha256 = %s, want %s", sha, hex.EncodeToString(sum[:]))
-	}
-}
-
-// An empty file is never a legitimate agent binary, and queueing one would
-// hand the agent a zero-length "update" to apply.
-func TestPushUpdateRejectsEmptyBinary(t *testing.T) {
-	setup(t)
-	empty := filepath.Join(t.TempDir(), "empty")
-	if err := os.WriteFile(empty, nil, 0o755); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	if err := PushUpdate("mach-c", empty, "1.2.3", ""); err == nil {
-		t.Fatal("push-update queued an empty binary")
-	}
-}
-
-// push-update without an attestation keeps working, for the case where an
-// operator is rolling out a locally built binary and has nothing to attest.
-func TestPushUpdateWithoutAttestationStillWorks(t *testing.T) {
-	_, bin := setup(t)
-	seedMachine(t, "mach-d")
-	if err := PushUpdate("mach-d", bin, "1.2.3", ""); err != nil {
-		t.Fatalf("push-update: %v", err)
-	}
-	if _, ok := queued(t, "mach-d"); !ok {
-		t.Fatal("no update was queued")
-	}
-	// And an unreadable attestation path is an error, not a silent skip.
-	if err := PushUpdate("mach-d", bin, "1.2.3", filepath.Join(t.TempDir(), "missing.jsonl")); err == nil {
-		t.Fatal("push-update ignored a missing attestation file")
-	}
-}
-
 // A statement signed by a key other than this control plane's is rejected even
 // though it is structurally valid — the pin is the whole point.
 func TestVerifyRejectsForeignSignature(t *testing.T) {
@@ -247,40 +103,9 @@ func TestVerifyRejectsForeignSignature(t *testing.T) {
 	}
 }
 
-// push-update must seedMachine the target it is told to update. Queueing for a
-// name no machine has ever held is how a typo looks like a completed rollout:
-// pending_updates has no foreign key, so the row would sit there forever while
-// the command printed "delivered on next connect".
-func seedMachine(t *testing.T, name string) {
-	t.Helper()
-	st, err := store.Open(dbPath())
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	defer st.Close()
-	if err := st.CreateMachine(name, "pub-"+name, "h", "linux", "amd64", "v", "", false); err != nil {
-		t.Fatalf("seed %s: %v", name, err)
-	}
-}
-
-// An unknown machine is refused rather than queued, and nothing is written.
-func TestPushUpdateRejectsUnknownMachine(t *testing.T) {
-	_, bin := setup(t)
-	err := PushUpdate("mach-typo", bin, "1.2.3", "")
-	if err == nil {
-		t.Fatal("push-update queued an update for a machine that does not exist")
-	}
-	if !strings.Contains(err.Error(), "unknown machine") {
-		t.Fatalf("error = %q, want it to name the unknown machine", err)
-	}
-	if _, ok := queued(t, "mach-typo"); ok {
-		t.Fatal("an update was queued for an unknown machine")
-	}
-}
-
 // The identity key's path is derived from the database path, which only means
 // something as a FILE. With a Postgres DSN, appending ".key" produced a path that
-// is not a path — scheme, host and password included — so push-update, attest and
+// is not a path — scheme, host and password included — so attest and
 // verify-attestation could not find the key at all, and the error printed the DSN
 // (password and all) into whatever collected it. There is nowhere near a DSN to
 // put a key, so the command asks rather than invents one.
@@ -324,9 +149,8 @@ func TestServerKeyPathWithAPostgresDSN(t *testing.T) {
 // working copy reaching a fleet, and only the key holder can produce such an
 // envelope, which is exactly why it should be a hard error rather than a
 // conditional one.
-func TestPushUpdateRefusesAnUnreadablePredicate(t *testing.T) {
+func TestVerifyRefusesAnUnreadablePredicate(t *testing.T) {
 	priv, bin := setup(t)
-	seedMachine(t, "mach-pred")
 
 	st, err := release.Attest(release.Options{
 		SubjectName: filepath.Base(bin), Binary: bin, Version: "1.2.3", Started: time.Now(),
@@ -346,47 +170,12 @@ func TestPushUpdateRefusesAnUnreadablePredicate(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	perr := PushUpdate("mach-pred", bin, "1.2.3", att)
-	if perr == nil {
-		t.Fatal("push-update queued a binary whose attestation predicate could not be read")
+	verr := VerifyAttestation(att, bin)
+	if verr == nil {
+		t.Fatal("verify-attestation accepted an attestation whose predicate could not be read")
 	}
-	if !strings.Contains(perr.Error(), "predicate") {
-		t.Fatalf("the refusal does not name the predicate: %v", perr)
-	}
-	if _, ok := queued(t, "mach-pred"); ok {
-		t.Fatal("an update was queued despite the unreadable predicate")
-	}
-}
-
-// Queuing without an attestation still works — a locally built binary has
-// nothing to attest with — but it says so. Silence here is how a by-hand push
-// quietly becomes the thing the release pipeline promises it cannot be: the
-// flag is omitted, nothing notices, and an unattested binary is on its way to a
-// fleet.
-func TestPushUpdateWithoutAttestationSaysSo(t *testing.T) {
-	_, bin := setup(t)
-	seedMachine(t, "mach-warn")
-
-	origErr := os.Stderr
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("pipe: %v", err)
-	}
-	os.Stderr = w
-	perr := PushUpdate("mach-warn", bin, "1.2.3", "")
-	os.Stderr = origErr
-	w.Close()
-	out, _ := io.ReadAll(r)
-	r.Close()
-
-	if perr != nil {
-		t.Fatalf("push-update: %v", perr)
-	}
-	if _, ok := queued(t, "mach-warn"); !ok {
-		t.Fatal("no update was queued")
-	}
-	if !strings.Contains(string(out), "WARNING") || !strings.Contains(string(out), "attestation") {
-		t.Fatalf("an unattested push said nothing about it: %q", out)
+	if !strings.Contains(verr.Error(), "predicate") {
+		t.Fatalf("the refusal does not name the predicate: %v", verr)
 	}
 }
 

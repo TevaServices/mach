@@ -4,10 +4,7 @@
 package controlplane
 
 import (
-	"context"
 	"crypto/ed25519"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -18,7 +15,6 @@ import (
 	"time"
 
 	"github.com/TevaServices/mach/internal/broker"
-	"github.com/TevaServices/mach/internal/release"
 	"github.com/TevaServices/mach/internal/server"
 	"github.com/TevaServices/mach/internal/store"
 )
@@ -51,7 +47,7 @@ func Org() string {
 // failed with "open postgres://user:s3cret@host:5432/mach.key: no such file or
 // directory": the DSN, password included, printed into whatever collected the
 // error, and a Postgres deployment with no explicit MACH_SERVER_KEY could not
-// use push-update, attest or verify-attestation at all. There is nowhere near a
+// use attest or verify-attestation at all. There is nowhere near a
 // DSN to put a key, so the answer is to ask rather than to guess.
 func serverKeyPath() string {
 	if v := os.Getenv("MACH_SERVER_KEY"); v != "" {
@@ -423,17 +419,18 @@ func DeleteMachine(name string, purgeAudit bool) error {
 	return nil
 }
 
-// updateManifest mirrors the wire struct without importing protocol here.
-type updateManifest struct {
-	Version string
-	Sha256  string
-	URL     string
-	DataB64 string
-}
-
+// PushUpdate was removed: the control plane no longer signs and queues
+// agent-binary updates. Agents are updated through their distribution points
+// (apt/rpm/apk packages and their package repositories for Linux, winget/MSI
+// for Windows, Homebrew for macOS), each of whose supervisors restarts the
+// agent on failure only — the "exit 0 means stop" contract, unchanged. What
+// the removal takes with it: the signed-manifest control (wire integrity,
+// subsumed by TLS + the pinned server key) and the anti-rollback residue it
+// never had. attest/verify-attestation survive as the release pipeline's
+// provenance record for shipped artifacts.
 // loadServerPriv returns the control plane's identity private key (for
-// signing update manifests). Reads the persisted key file; errors surface
-// through PushUpdate as a normal CLI error, not a panic.
+// signing attestation envelopes). Reads the persisted key file; errors surface
+// as a normal CLI error, not a panic.
 func loadServerPriv() (ed25519.PrivateKey, error) {
 	path, perr := requireServerKeyPath()
 	if perr != nil {
@@ -448,100 +445,4 @@ func loadServerPriv() (ed25519.PrivateKey, error) {
 		return nil, fmt.Errorf("corrupt control plane key at %s", path)
 	}
 	return ed25519.PrivateKey(b), nil
-}
-
-// PushUpdate signs the manifest for a local agent binary and queues it for
-// delivery on the machine's next live connection.
-//
-// When attestation is non-empty, the binary must be proved to be the one that
-// attestation describes — same signature key, same sha256 — before it is
-// queued. This is a release-pipeline gate rather than an agent-side control:
-// the agent cannot check an attestation, because it does not receive one. What
-// the agent already enforces (the pinned-key manifest signature over the
-// sha256) is what protects the wire; the attestation is what makes the
-// pipeline refuse to ship bytes no build recorded.
-func PushUpdate(machine, binPath, version, attestation string) error {
-	priv, err := loadServerPriv()
-	if err != nil {
-		return err
-	}
-	bin, err := os.ReadFile(binPath)
-	if err != nil {
-		return fmt.Errorf("reading agent binary: %w", err)
-	}
-	if len(bin) == 0 {
-		return fmt.Errorf("agent binary %s is empty", binPath)
-	}
-	sum := sha256.Sum256(bin)
-	sha := hex.EncodeToString(sum[:])
-
-	if attestation != "" {
-		env, err := release.LoadAttestation(attestation)
-		if err != nil {
-			return err
-		}
-		st, err := release.Open(context.Background(), env, priv.Public().(ed25519.PublicKey))
-		if err != nil {
-			return fmt.Errorf("attestation rejected: %w", err)
-		}
-		if err := st.VerifyArtifact("", binPath); err != nil {
-			return fmt.Errorf("attestation does not describe this binary: %w", err)
-		}
-		// A predicate that will not decode is refused, not skipped. It used to
-		// fall through both checks below — `err == nil &&` — so a statement
-		// whose signature and digest verified but whose predicate was
-		// unreadable sailed past the version match and, worse, past the
-		// modified-tree refusal, which is exactly the check that stops a build
-		// from someone's working copy being shipped to a fleet. A check that
-		// cannot be made is refused for the same reason an unreadable policy
-		// file is fatal: silence and success look identical from outside.
-		pred, err := st.PredicateOf()
-		if err != nil {
-			return fmt.Errorf("attestation predicate could not be read (%w) — the version and modified-tree "+
-				"checks cannot be made, and this refuses rather than shipping an unchecked build", err)
-		}
-		if pred.Version != version {
-			return fmt.Errorf("attestation is for version %q but this push declares %q", pred.Version, version)
-		}
-		if pred.Byproducts.VCSModified {
-			return fmt.Errorf("attestation records a build from a modified tree — refusing to ship it; rebuild from a clean tree and re-attest")
-		}
-		fmt.Printf("attestation verified: %s describes %s (version %s)\n", attestation, binPath, version)
-	} else {
-		// Queuing an unattested binary is a real choice an operator may make by
-		// hand — a locally built binary has nothing to attest with, which is why
-		// this stays legal — but it is not the documented posture ("push-update
-		// --attestation used so nothing unattested ships"), and the release
-		// pipeline always passes the flag. Saying so is what keeps a by-hand push
-		// from quietly becoming the thing the pipeline promises it cannot be.
-		fmt.Fprintf(os.Stderr, "mach-server: WARNING: no attestation for %s — queueing it without checking which "+
-			"build produced it; pass --attestation FILE to have it checked\n", binPath)
-	}
-
-	manifest := updateManifest{
-		Version: version,
-		Sha256:  sha,
-		DataB64: base64.StdEncoding.EncodeToString(bin),
-	}
-	sig := ed25519.Sign(priv, []byte(manifest.Version+"|"+manifest.Sha256))
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	// An unknown machine is refused rather than queued: pending_updates has no
-	// foreign key, so the row would sit there forever while the command printed
-	// that it would be delivered on next connect. A typo would look like a
-	// completed rollout.
-	if m, err := st.MachineByName(machine); err != nil {
-		return err
-	} else if m == nil {
-		return fmt.Errorf("unknown machine %q — nothing was queued", machine)
-	}
-	if err := st.QueueUpdate(machine, manifest.Version, manifest.Sha256, manifest.URL, manifest.DataB64, base64.StdEncoding.EncodeToString(sig)); err != nil {
-		return err
-	}
-	fmt.Printf("update v%s queued for %q (%d bytes, delivered on next connect; agent verifies signature + sha256 before applying)\n",
-		version, machine, len(bin))
-	return nil
 }

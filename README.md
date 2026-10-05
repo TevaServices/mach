@@ -42,8 +42,8 @@ than stopped). It cannot disturb a machine you have already enrolled persistentl
 those it says so and exits rather than starting a second identity. For a
 connection that survives reboots (auto-start at boot, restart after network
 loss), install mach from the OS distribution packages: they register the
-service (systemd on linux, launchd on macOS, Task Scheduler on Windows) and
-the binary no longer self-installs.
+service (systemd on linux, launchd on macOS, a real Windows service on
+Windows) and the binary no longer self-installs.
 
 **On your admin machine** (or the LLM troubleshooter's box): run
 
@@ -73,7 +73,7 @@ with a `mach: ` prefix, so a script never has to guess which is which.
 
 Advanced flags still exist for automation (`mach register --api-key K --name N`,
 `mach run`), but nothing *requires* them. Everything on the
-control plane — API keys, revocation, update pushes, release attestations —
+control plane — API keys, revocation, release attestations —
 lives in the separate `mach-server` binary, which is what runs in the container.
 
 ## Cross-platform behavior
@@ -82,20 +82,32 @@ lives in the separate `mach-server` binary, which is what runs in the container.
   `bash → zsh → sh`; Windows `PowerShell → pwsh → cmd`. Shell-mode commands
   get exactly one parse by the chosen shell; argv (`--`) mode parses zero.
 - **Service registration comes from the distribution packages**, not from the
-  binary. The `mach install`/`mach service` commands are gone; the packages
-  own the units/plists/tasks (their supervision stays "restart on failure":
-  exit 0 means stop).
+  binary. The `mach install` command is gone; the packages own the units,
+  plists, and the Windows service (`mach service` is the SCM entry point the
+  MSI registers — a real service, not a scheduled task), and their supervision
+  stays "restart on failure": exit 0 means stop.
 - **State dir:** `$MACH_STATE_DIR`, else `/var/lib/mach` (root on linux),
-  `~/.mach` (user), `%APPDATA%\mach`-equivalent user dir on Windows.
+  `~/.mach` under the user profile on every other platform — on Windows
+  literally `%USERPROFILE%\.mach`, and for the MSI's LocalSystem service the
+  service account's own profile (the enrollment docs name the path).
+- **Updates are the distribution points' job.** The control plane does not
+  push agent binaries (that whole channel — and the signed-manifest,
+  anti-rollback and attestation-gating machinery it carried — was removed):
+  upgrade through your package repo (`apt upgrade mach`, `dnf`, `apk`,
+  `winget upgrade TevaServices.mach`) or re-install the MSI, and the OS
+  supervisor restarts the agent. Attestations remain the release's provenance
+  record for the published binaries.
 - **Binaries:** static, CGO-free; linux/macOS/Windows × amd64/arm64.
 
 ## Installing the client (distribution packages)
 
 The binary no longer self-installs — the OS package managers own service
 registration. All packages create a dedicated unprivileged `mach` account
-and a state dir it owns (`/var/lib/mach` on Linux; Homebrew-prefix-relative
-`var/mach` on brew; `%APPDATA%\mach` on Windows), and **enable but do not
-start** the service: enrollment is a person at the machine.
+and a state dir it owns (`/var/lib/mach` on Linux, owned by the `mach`
+account; Homebrew-prefix-relative `var/mach` on brew; the service account's
+profile dir on Windows), and **enable but do not start** the service where
+the supervisor starts unenrolled agents into a restart loop: enrollment is a
+person at the machine.
 
 | Platform | Install | Then |
 |---|---|---|
@@ -103,7 +115,7 @@ start** the service: enrollment is a person at the machine.
 | Fedora/RHEL (dnf) | same | same |
 | Alpine (apk) | same | same (OpenRC instead of systemd) |
 | macOS / Linuxbrew | `brew install tevaservices/mach/mach` | `brew services start mach` |
-| Windows | `winget install TevaServices.mach` (MSI registers the `machd` Task Scheduler job) | runs at logon |
+| Windows | `winget install TevaServices.mach` (MSI installs the `machd` Windows service) | the service runs immediately, waiting; enroll next |
 
 Enrollment is unchanged and works the same on every platform: run `mach` on
 the machine (QR enrollment, temporary session), or headlessly with a key
@@ -116,10 +128,21 @@ sudo systemctl start machd        # Fedora/RHEL/Debian/Ubuntu
 sudo rc-service machd start      # Alpine (OpenRC)
 ```
 
-(`mach run` runs the daemon by hand anywhere. The systemd unit keeps
-`Restart=on-failure` — exit 0 always means stop: a revoked machine's agent
-retires itself and stays retired, and a pushed update hands off with a clean
-exit.)
+On Windows the MSI's service runs as LocalSystem and its state dir is that
+account's profile (enrollment needs the same dir — an elevated PowerShell):
+
+```powershell
+$state = "$env:windir\System32\config\systemprofile\.mach"
+$env:MACH_STATE_DIR = $state
+mach register --server https://… --api-key KEY --name web-01 --state-dir $state
+# nothing else: the service is already running and polling; it picks the
+# enrollment up within 30 seconds
+```
+
+(`mach run` runs the daemon by hand anywhere. The supervisors keep
+restart-on-failure — exit 0 always means stop: a revoked machine's agent
+retires itself and stays retired, and the Windows service idles unenrolled
+instead of failing its own install.)
 
 **Linux package repositories** are synced from GitHub Releases to
 **dist.mach.teva.services** (GitHub Pages, deployed by the release
@@ -205,8 +228,9 @@ Put Caddy/nginx in front for TLS (agents speak wss://).
   source key, exit code, output snippets) in the control plane's database —
   including streamed commands, and including the ones the policy refused.
 - Released agent binaries can carry a signed **in-toto attestation** recording
-  the toolchain, build flags, module graph and source revision; `push-update
-  --attestation` refuses to ship a binary its attestation does not describe.
+  the toolchain, build flags, module graph and source revision; it is checked
+  against the binary before a release publishes it, and refuses a
+  modified-tree build.
 - Control plane binds to loopback by default; expose only via your TLS proxy.
 
 ### Features (post-limitations, v0.3)
@@ -279,9 +303,9 @@ Put Caddy/nginx in front for TLS (agents speak wss://).
 - SQLite is the default and is single-writer; fine for a household fleet, not
   a datacenter. `MACH_DB=postgres://…` swaps in Postgres (same schema,
   translated at the driver layer) when you outgrow it.
-- Release attestations cover binaries pushed at runtime through
-  `push-update --attestation`; the copies baked into the container image are
-  not attested by that path yet.
+- Release attestations cover the binaries published to a release; the copies
+  baked into the container image are not attested (there is no runtime push
+  path anymore — that limit is about provenance records, not updates).
 - **The web UI's only gate is your identity provider.** Block is fleet-wide and
   delete is irreversible, so any identity the issuer verifies can do both —
   and with an issuer that permits self-registration, that is the internet. Set
@@ -417,10 +441,9 @@ with `MACH_SERVER`, `MACH_API_KEY` (an enroll-scoped key) and `MACH_NAME`
 restate the machine's own command policy as `MACH_POLICY`. The key is read
 once, at enrollment, and can be revoked afterwards; a container that has
 already enrolled just needs the volume to keep its enrollment across
-restarts. Pushed updates are refused inside the container (the agent updates
-by rewriting its own executable, which the image's permissions do not allow) —
-pull the next image instead, and the fleet table's `differs` badge is what
-flags any container left behind.
+restarts. Updates come from pulling the next image (there is no pushed-update
+path), and the fleet table's `differs` badge is what flags any container left
+behind.
 
 The tag is also the version: `v0.3.0` publishes binaries and an image that
 report `0.3.0` (the leading `v` is stripped). So `mach version` inside a
@@ -434,7 +457,7 @@ release fails rather than shipping unattested binaries — the same rule the
 control plane applies to an unreadable policy file. The key is a
 provenance/audit control: agents never see the attestation, and a live
 control plane still re-attests with its own identity key per the Dockerfile
-footer, so `push-update --attestation` works there as documented.
+footer, so the release's attestation bundle covers what the image bakes in.
 
 CI (`.github/workflows/ci.yml`) runs lint, unit tests and e2e on main and on
 every PR, using the same `mise` tasks the repo documents.

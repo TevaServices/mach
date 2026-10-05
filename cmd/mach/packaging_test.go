@@ -269,3 +269,38 @@ func TestAttestHookRefusesWarnings(t *testing.T) {
 		"exit 1",
 	)
 }
+
+// The Windows MSI registers a real Windows service (machd), not a scheduled
+// task: the schtasks authoring died in every release that validated its
+// first real install (#51/#54 — an unterminated condition quote, a nested
+// /TR idiom msiexec re-tokenizes, and /RI refused outright for ONLOGON
+// triggers). These pins hold the service authoring's supervision semantics:
+// auto-start at boot, restart-on-failure-only (exit 0 means stop, invariant
+// 22), service removed on uninstall, and the SCM entry-point argument.
+func TestWixRegistersTheMachdService(t *testing.T) {
+	s := readPackaging(t, "packaging/wix/mach.wxs")
+	mustContain(t, s, "mach.wxs",
+		`Name="machd"`,
+		`Arguments="service"`,
+		`Start="auto"`,
+		`Remove="uninstall"`,
+	)
+	// Restart on FAILURE only: restart actions present, and no unconditional
+	// or interval-based rescheduling that would respawn a clean exit.
+	mustContain(t, s, "mach.wxs",
+		"sc.exe failure machd reset=",
+		"actions= restart/5000",
+		`Condition="NOT REMOVE"`,
+		"Return=\"check\"",
+	)
+	mustNotContain(t, s, "mach.wxs", "/RI ")
+}
+
+// And no schtasks authoring may return: the service replaced it. A CA that
+// shells out to schtasks again is exactly the class the three burned tags
+// paid for.
+func TestWixHasNoSchtasksAuthoring(t *testing.T) {
+	s := readPackaging(t, "packaging/wix/mach.wxs")
+	mustNotContain(t, s, "mach.wxs", "schtasks")
+	mustNotContain(t, s, "mach.wxs", "Task Scheduler")
+}

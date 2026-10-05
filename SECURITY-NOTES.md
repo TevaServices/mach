@@ -16,7 +16,9 @@ operator browser ┘ (TLS, OIDC — the web UI, optional)
   point of command authority**: it brokers exec, holds the audit log, and
   can read command content on the streaming path (sealed one-shot execs are
   opaque to it — see below). Treat its host as high-value; access to its
-  DB = control of every machine, and the ability to push a signed update.
+  DB = control of every machine. The control plane does not push agent
+  binaries — updates belong to the distribution points (apt/rpm/apk,
+  winget/MSI, brew) — so its DB grants command authority, not code.
 - The **operator browser** is a fourth client, and it is the least constrained
   one: OIDC establishes *who* someone is, not *whether they should be here*, and
   any identity the issuer verifies may block, revoke, delete and add orgs. It is
@@ -133,7 +135,8 @@ from the broker; nothing protects content from the machine's own operator.
 | Control | Where |
 |---|---|
 | Per-connection challenge-bound agent hello (replay-proof) | server/agent.go, agent/run.go |
-| Control-plane identity key persisted & pinned by agents; signed update manifests (sig over version\|sha256) | server/serverkey.go, agent/run.go handleUpdate |
+| Control-plane identity key persisted & pinned by agents (the hello's replay-proof and the attestation signatures are what verify against it) | server/serverkey.go |
+| **No agent-binary push channel**: the control plane never ships agent binaries; updates go through the distribution points (apt/rpm/apk, winget/MSI, brew) whose supervisors restart the agent on failure only | (removal: protocol UpdateCommand, agent handleUpdate, server pushQueuedUpdate, store pending_updates) |
 | Pairing tokens: 256-bit, single-use, ~10 min TTL | store.CreatePairing |
 | Challenge codes: 12 chars, agent-console-only, typed blind on phone; 5 wrong attempts expire the pairing. **Never placed in the QR, the URL or the pair page** — the QR carries the org and a suggested machine name, and the code stays on the agent's console. It gates **every** action on the page, approve and deny alike, so a photographed QR cannot approve, cannot deny, and cannot learn a name | store.NewChallengeCode, server/pairpages.go pairPageHandler/requirePairingCode, agent/register.go pairPrefill |
 | Pair-start rate limit (5 per IP / 10 min) and auth-failure rate limit (20 / 10 min), which every bearer surface now uses — including `/v1/register/apikey` and `/v1/agent/ws` (failed dials only, so a fleet behind one address spends nothing by connecting) | server.go, consoleapi.go, agent.go |
@@ -156,7 +159,7 @@ from the broker; nothing protects content from the machine's own operator.
 | **Command output is bytes**: carried base64 alongside the JSON text form whenever that form would be lossy (a JSON string must be valid UTF-8, so Go's encoder replaced every invalid byte with U+FFFD), so binary output survives `mach exec` intact instead of coming back mangled and longer | protocol.ExecResult SetOutput/Output, agent/run.go, console/client.go |
 | Audit log with secret-value redaction — quoted values included, which is the shape people actually write (`PGPASSWORD='…'`) and the one that used to leave the secret in the row; every dispatched command recorded on both paths; refusals audited too; a stream that dies without an exit status recorded as `-1`; a killed session recorded as `130` rather than as fate-unknown; one command per stream session, so a pipelined second one is refused rather than allowed to overwrite the row's identity; optional purge on revoke; a scope refusal recorded rather than silently refused; an insert that fails logged loudly instead of discarded | store.RedactScrubs/AuditInsert/RemoveMachineAudit, server/stream.go, server/consoleapi.go |
 | **SQLite file, and its WAL sidecar, tightened to 0600 on every open** — the database holds the audit trail and the API-key hashes, and the driver creates it world-readable | store.tightenDatabaseFiles |
-| Signed in-toto attestations for released agent binaries, verified before an update can be queued | internal/release, controlplane/attest.go |
+| Signed in-toto attestations for released agent binaries, verified against the binary before a release publishes it | internal/release, controlplane/attest.go |
 | Revocation: self-retiring agents, names and keys stay reserved. **A revoked OR temporary machine can be taken over by re-enrolling it — and only one of those two**: the guard is the `WHERE revoked=1 OR temporary=1` in `store.reenroll`, so an actively enrolled **permanent** machine's name and key can never be taken by an enrollment | store.RevokeMachine/reenroll, server enrollmentRefusal, agent errRevoked |
 | **Temporary session** (plain `mach` on a target): enrolls and serves with the identity key, E2E key and config held **in memory only**, so Ctrl-C is a real shutdown and running it again re-enrolls. It cannot read, write or delete the persistent state, so an installed host's enrollment is untouchable from it — and bare `mach` there refuses rather than starting a second identity | agent/ephemeral.go, registerQRCore/registerAPIKeyCore, cmd/mach bootStrap |
 | **The temporary enrollment is recorded as such**, and the session **retires it on exit** via a `retire` frame on its own authenticated connection. Accepted **only** from a temporary machine, so a permanent agent cannot retire a machine the operator expects to stay; the frame carries no name, so an agent can retire itself and nothing else | protocol retire, server handleSelfRetire, store.machines.temporary |
@@ -173,7 +176,7 @@ from the broker; nothing protects content from the machine's own operator.
 | **Non-reserving delete**: removes the machine row and its key, tells a connected agent to retire (so it exits rather than reconnecting), and keeps the audit trail; ordering is delete-then-notify so a failed notice cannot leave a live authenticated socket for a row that is gone | server/machineadmin.go deleteMachine, store.DeleteMachine |
 | **Org management**: orgs stored in the database with `MACH_ORG`/`MACH_ORGS` as a non-removable pin; an org with machines cannot be removed; adding one is validated by the same label rule the naming invariant uses | server/orgadmin.go, orgs.go, store.ValidOrgLabel |
 | The API-key listing the membership view renders has no field for `salt`, `key_lookup` or `key_hash` — the absent fields, not a promise, are what stops a leak | store.ListAPIKeys, org_test.go |
-| **Agent supervision restarts on failure, not on any exit**, so exit 0 means stop: a retirement actually retires, and the update path's detached replacement is not raced by a resurrected old image | the distribution packages' unit/plist/task (this contract) |
+| **Agent supervision restarts on failure, not on any exit**, so exit 0 means stop: a retirement actually retires (`Restart=on-failure`, launchd `SuccessfulExit=false`, the Windows service's SCM failure actions) | the distribution packages' unit/plist/service (this contract) |
 | Hourly pairing cleanup (24h retention) | server.New goroutine |
 
 ## Command policy: where it is enforced, and what it can promise
@@ -349,27 +352,42 @@ console has stopped reading, because that frame pump serves every other command
 on the connection. Neither truncation nor a drop is recoverable, and both are
 visible rather than silent.
 
-## Updates and release attestations
+## Updates: gone from the control plane; attestations remain
 
-Agents apply an update only after verifying a manifest signed by the pinned
-control-plane key over `version|sha256`, and only if the payload's sha256
-matches. That is what protects the wire.
+The control plane does not push agent binaries, and agents do not apply
+updates. The update-push channel — signed manifests over `version|sha256`,
+the pending-updates queue, the agent's handleUpdate and its detached re-exec
+— was removed: agent binaries are updated through their **distribution
+points** (the apt/rpm/apk package repositories, winget/MSI on Windows,
+Homebrew), each of whose supervisors restarts the agent on failure only —
+the same exit-0-means-stop contract as before, minus the channel. What the
+removal takes with it, honestly:
 
-What it does not establish is where the binary came from. So each released
-agent binary gets an **in-toto attestation**: a Statement v1 naming the
-artifact by sha256, carrying a predicate that records the toolchain version,
-GOOS/GOARCH, CGO setting, build flags, the module graph (read out of the
-binary by Go's linker, with each module's `go.sum` hash) and the VCS revision
-with a dirty-tree flag. It is wrapped in a DSSE envelope signed by the same
-control-plane identity key, so any DSSE-aware tool can check it, and
-`mach-server push-update --attestation` refuses to queue a binary the
-attestation does not describe, or one built from a modified tree.
+- The manifest signature protected the wire only; it could not establish
+  where the binary came from, and a control plane (or a hostile DB) could
+  have pushed any correctly signed binary — the "single point of command
+  authority" is still exactly that, but it no longer extends to code.
+- The manifests had no anti-rollback (a replayed signed manifest re-installed
+  an older version); there is nothing to replay now.
+- Package managers bring their own verification instead (repo signatures
+  when the release key lands; winget's InstallerSha256 pin today).
 
-The attestation is a release-pipeline and audit control, not a runtime one:
-agents do not receive or check it. That is deliberate — verifying it onboard
-would duplicate what the pinned-key manifest signature already does, at the
-cost of shipping the statement over the wire. The two are complementary: the
-signature protects delivery, the attestation records provenance.
+Each released agent binary still gets an **in-toto attestation**: a Statement
+v1 naming the artifact by sha256, carrying a predicate that records the
+toolchain version, GOOS/GOARCH, CGO setting, build flags, the module graph
+(read out of the binary by Go's linker, with each module's `go.sum` hash) and
+the VCS revision with a dirty-tree flag. It is wrapped in a DSSE envelope
+signed by the same control-plane identity key, so any DSSE-aware tool can
+check it.
+
+That is a **release-pipeline and audit control, and nothing more**: agents
+do not receive or check the attestation, and nothing runtime does either —
+`verify-attestation` is what the publish job runs against every artifact
+before the release ships it, refusing an envelope that does not describe its
+binary or one built from a modified tree. It records provenance for the
+bytes a distribution point will carry; the guarantee "this installer ships
+the attested bytes" comes from the hash the artifact carries (checksums.txt,
+the winget manifest's InstallerSha256), verified by the consuming tool.
 
 ## Known gaps (pre-1.0 — do not treat as closed)
 
@@ -377,10 +395,11 @@ signature protects delivery, the attestation records provenance.
    above for exactly what it can and cannot promise, including its blindness to
    what is typed into a streaming session's stdin. Use OS-level confinement for
    real isolation.
-2. **Single control plane** = availability + integrity SPOF. Signed updates
-   prevent code injection, but a malicious DB can still push any correctly
-   signed binary, and an operator with DB access can read the audit log. There
-   is no multi-server or HA story yet (issue #5).
+2. **Single control plane** = availability + integrity SPOF. There is no
+   code-push channel left to corrupt (updates are the distribution points'),
+   but an operator with DB access can still read the audit log and command
+   anything an agent would run. There is no multi-server or HA story yet
+   (issue #5).
 3. **Streaming is plaintext, and there is no PTY.** `mach console` has stdin
    and Ctrl-C but no echo/line discipline, so full-screen TUI programs still
    need a real PTY (issue #3). `mach exec` can be sealed but cannot feed input.
@@ -417,15 +436,8 @@ signature protects delivery, the attestation records provenance.
    ruleset version it holds, so "which machines have the current rules" is
    answerable rather than assumed.
 8. **The copies of the agent binaries baked into the container image are not
-   attested** by `push-update --attestation`, which covers runtime pushes only
-   (issue #4).
-8b. **`push-update` without `--attestation` still queues the binary.** That is
-   deliberate — a locally built binary has nothing to attest with — but it means
-   the release-pipeline control rests on the pipeline passing the flag, and the
-   command now says so on stderr rather than letting an unattested push look
-   like a checked one. Nothing verifies provenance at the agent: the pinned-key
-   manifest signature over `version|sha256` is what protects the wire, and the
-   attestation is the pipeline's record of what was built.
+   attested** — the release bundle attests the published artifacts; nothing
+   runtime pushes binaries anymore (issue #4).
 9. **The web UI's only gate is the identity provider.** Block is fleet-wide and
    delete is irreversible, so anyone who can obtain an identity the configured
    issuer verifies can do both. With a public issuer that permits
@@ -531,23 +543,23 @@ signature protects delivery, the attestation records provenance.
     directly — and "one command is one execution" is enforced in the console,
     not on the wire. Bind the dispatch `ReqID` into the HKDF info or the AAD if
     that ever needs to change.
-20. **Updates have no anti-rollback.** A manifest signed earlier replays
-    forever: an agent that has already applied `1.4.0` will accept `1.2.0`
-    again if an attacker can present that manifest. Subsumed by the control
-    plane being the signer (gap #2) — a malicious database can already push any
-    correctly signed binary — but a monotonic version check on the agent would
-    narrow it, and does not exist.
+20. **(Closed by the push channel's removal.)** There is no pushed-update
+    path to replay or roll back — an operator wanting an older agent pins the
+    older package version in their repo, which their package manager refuses
+    via its own version rules.
 21. **No PKCE on the OIDC exchange.** The UI is a confidential client with a
     client secret, which is the case where PKCE is optional rather than
     required, and the login CSRF is covered by the state cookie. It is a
     one-line BCP upgrade away and is not done.
-22. **Windows runs no privilege drop, and the packaged task can request the
-    highest privileges available.** The binary no longer self-installs (#40); the
-    distribution package creates the scheduled task, and if it uses `/RL HIGHEST`
-    an agent installed by an administrator runs commands with that
-    administrator's full token. `MACH_USER` and the drop are Linux-only.
-    This is the same-uid gap (#18) taken to its conclusion, and it is a Windows
-    deployment's own decision what account the task runs as.
+22. **Windows runs no privilege drop, and the packaged service runs as
+    LocalSystem.** The binary no longer self-installs (#40); the MSI installs a
+    real Windows service (`mach service`) running as LocalSystem, so commands
+    run with the fullest token on the machine — LocalSystem, not an
+    administrator's. `MACH_USER` and the drop are Linux-only.
+    This is the same-uid gap (#18) taken to its conclusion, and the local
+    `MACH_POLICY` remains a guardrail about the agent, not about a command
+    that has already run; a deployment wanting less must confine the host
+    itself.
 23. **A daemonizing command escapes the tree kill.** The process-group kill
     reaches children and grandchildren that stayed in the group; a `setsid` or
     double-forking daemon leaves it and survives, by design of the mechanism
@@ -582,7 +594,6 @@ signature protects delivery, the attestation records provenance.
 28. **An unpinned agent trusts TLS alone.** An agent enrolled before server-key
     pinning has no `server_key`, so it cannot verify the control plane's
     identity and logs a warning at every connect instead of refusing. Updates
-    still refuse (a manifest must verify against a pin), so integrity holds;
     re-enrolling is what pins one. This is backward compatibility with a loud
     warning, not a silent downgrade, and it is worth knowing before someone
     reads the warning as harmless.
@@ -606,9 +617,9 @@ signature protects delivery, the attestation records provenance.
   enrollment happens; per-machine allowlists for consoles; `readonly` for
   dashboards and monitoring).
 - `bin/mach-server` bound to loopback only (compose default).
-- Agent binaries attested (`mach-server attest`) and the `.intoto.jsonl` kept
-  with the artifacts; `push-update --attestation` used so nothing unattested
-  ships.
+- Agent binaries attested (`mach-server attest`) and the `.intoto.jsonl`
+  kept with the artifacts; the release verify loop checks every envelope
+  against its binary, so nothing unattested or mis-described ships.
 - Regular `mach audit` reviews; revoke machines on decommission with
   `--purge-audit` if their output contained secrets (though inserts are
   already redacted).

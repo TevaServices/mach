@@ -174,8 +174,7 @@ func (s *Server) deleteMachine(name string) error {
 }
 
 // blockMachine sets or clears the soft block. Blocking also ends any live console
-// session for the machine; unblocking delivers an update that was held back while
-// it was blocked.
+// session for the machine.
 func (s *Server) blockMachine(name string, blocked bool) error {
 	ok, err := s.st.SetMachineBlocked(name, blocked)
 	if err != nil {
@@ -195,13 +194,6 @@ func (s *Server) blockMachine(name string, blocked bool) error {
 		// so a session approval behind it can never be spent while blocked —
 		// clearing it here keeps that true on the unblock path too.
 		s.clearSessionApprovals(name)
-		return nil
-	}
-	// An update held while the machine was blocked is delivered now rather than
-	// waiting for a reconnect that may not come. This is the second caller of
-	// PopPendingUpdate, which is why that pop is a single statement.
-	if ac := s.br.Get(name); ac != nil {
-		s.pushQueuedUpdate(ac.Conn, name)
 	}
 	return nil
 }

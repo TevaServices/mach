@@ -382,17 +382,10 @@ type SealedExecResult struct {
 	ExitCode  *int   `json:"exit_code,omitempty"`
 }
 
-// UpdateCommand pushes a new agent binary from the control plane. The
-// manifest (version + sha256) is signed by the control plane's identity
-// key — agents pin that key at enrollment, so only the genuine control
-// plane can push an update, even over a hijacked channel.
-type UpdateCommand struct {
-	URL     string `json:"url,omitempty"`      // optional direct download (https)
-	DataB64 string `json:"data_b64,omitempty"` // inline binary (small updates)
-	Sha256  string `json:"sha256"`             // integrity: hex digest of the payload
-	Version string `json:"version"`            // target version string
-	SigB64  string `json:"sig"`                // ed25519 sig by server key over "version|sha256"
-}
+// UpdateCommand was removed: the control plane never pushes agent binaries.
+// Updates go through the distribution points (apt/rpm/apk, winget/MSI, brew)
+// and each package's supervisor restarts the agent on failure only — the same
+// exit-0-means-stop contract as before, minus the push channel.
 
 // ---- QR pairing (unauthenticated browser/phone side) ----
 

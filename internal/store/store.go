@@ -647,8 +647,8 @@ func (s *Store) SetMachineBlocked(name string, blocked bool) (ok bool, err error
 // public key for re-enrollment.
 //
 // Revocation is the normal way to retire a machine: it keeps the row (and
-// therefore any queued update, plus the fact that the key existed) while
-// refusing the agent. Deleting is the recovery path for the case revocation
+// therefore the fact that the key existed) while refusing the agent. Deleting
+// is the recovery path for the case revocation
 // cannot express — a machine that must enroll again from scratch, using the
 // same name or even the same key material (a re-imaged box, a restored
 // backup), where "already enrolled" would otherwise be a dead end.
@@ -663,9 +663,6 @@ func (s *Store) DeleteMachine(name string) error {
 	}
 	tx := &storeTx{tx: sqltx, s: s}
 	defer sqltx.Rollback()
-	if _, err := tx.exec(`DELETE FROM pending_updates WHERE machine=?`, name); err != nil {
-		return err
-	}
 	if _, err := tx.exec(`DELETE FROM machines WHERE name=?`, name); err != nil {
 		return err
 	}
@@ -1264,54 +1261,11 @@ func (s *Store) RemoveMachineAudit(machine string) error {
 	return err
 }
 
-// ---- pushed updates ----
-
-// QueueUpdate stores a signed update manifest for a machine.
-func (s *Store) QueueUpdate(machine, version, sha256Hex, url, dataB64, sigB64 string) error {
-	_, err := s.exec(`INSERT INTO pending_updates (machine, version, sha256, url, data_b64, sig_b64, created_at)
-		VALUES (?,?,?,?,?,?,?) ON CONFLICT(machine) DO UPDATE SET
-		version=excluded.version, sha256=excluded.sha256, url=excluded.url,
-		data_b64=excluded.data_b64, sig_b64=excluded.sig_b64, created_at=excluded.created_at`,
-		machine, version, sha256Hex, url, dataB64, sigB64, now())
-	return err
-}
-
-// PopPendingUpdate returns and clears the queued update for a machine.
+// ---- pushed updates: gone ----
 //
-// One statement, deliberately: this used to be a SELECT followed by a separate
-// DELETE, which was safe only while it had a single caller (the connect path).
-// Delivering a held update on unblock is a second caller, and two concurrent
-// pops of the same row would each have handed out the same signed manifest and
-// then both reported success — the agent would apply one update twice. RETURNING
-// collapses the read-and-clear into the statement that owns the row.
-//
-// It must go through queryRow (not exec, which discards rows) so that "nothing
-// queued" stays the clean ErrNoRows -> ok=false, err=nil contract the callers
-// depend on.
-func (s *Store) PopPendingUpdate(machine string) (version, sha256Hex, url, dataB64, sigB64 string, ok bool, err error) {
-	row := s.queryRow(`DELETE FROM pending_updates WHERE machine=?
-		RETURNING version, sha256, url, data_b64, sig_b64`, machine)
-	err = row.Scan(&version, &sha256Hex, &url, &dataB64, &sigB64)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", "", "", "", "", false, nil
-	}
-	if err != nil {
-		return "", "", "", "", "", false, err
-	}
-	return version, sha256Hex, url, dataB64, sigB64, true, nil
-}
-
-// HasPendingUpdate reports whether an update is queued for a machine, without
-// consuming it. Read-only counterpart to PopPendingUpdate, for callers that need
-// to observe the queue rather than drain it.
-func (s *Store) HasPendingUpdate(machine string) (bool, error) {
-	var one int
-	err := s.queryRow(`SELECT 1 FROM pending_updates WHERE machine=?`, machine).Scan(&one)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
+// The pushed-update queue (pending_updates, QueueUpdate/PopPendingUpdate/
+// HasPendingUpdate) was removed: the control plane no longer pushes agent
+// binaries. Updates go through the distribution points — apt/rpm/apk for the
+// Linux packages, winget/MSI for Windows, brew for macOS — and every package's
+// supervisor restarts the agent on failure only, so exit 0 still means stop.
+// Migration 0003 drops the table from stores that carried it.

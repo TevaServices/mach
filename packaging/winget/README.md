@@ -43,10 +43,12 @@ manifests must be submitted from a fork with the real version folder.
 ## Why the MSI, and what it registers
 
 The MSI (packaging/wix/mach.wxs) installs `mach.exe` per-machine and
-registers the `machd` scheduled task: ONLOGON trigger, run level HIGHEST,
-restart interval 1 minute (see packaging/README.md's schtasks caveat for
-what /RI can and cannot promise), matching the Linux packages'
-enable-not-start contract: the agent will not be started by the installer
-when it has no enrollment; on first logon after enrollment it runs (`mach
-run` under the task); enrollment on Windows: run `mach` from a terminal
-after install.
+installs the `machd` **Windows service** (native ServiceInstall/ServiceControl
+— LocalSystem, own process, auto start at boot, SCM failure actions give it
+restart-on-failure: `sc failure machd` shows them; see packaging/README.md's
+Windows section). There is no scheduled task and no schtasks custom action.
+Enrollment on Windows (elevated PowerShell): point `MACH_STATE_DIR` at the
+service's state dir (the LocalSystem profile's `.mach` — the README names the
+path), run `mach register`; the installed service is RUNNING and polls, so it
+picks the enrollment up without a manual start. Updates: `winget upgrade` /
+the next MSI — the control plane does not push agent binaries.

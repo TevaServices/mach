@@ -123,32 +123,6 @@ func main() {
 			fmt.Fprintln(os.Stderr, "mach-server: "+err.Error())
 			os.Exit(1)
 		}
-	case "push-update":
-		// mach-server push-update <machine> <agent-binary-path> <version> [--attestation FILE]
-		if len(args) < 4 {
-			fmt.Fprintln(os.Stderr, "usage: mach-server push-update <machine> <agent-binary-path> <version> [--attestation FILE]")
-			os.Exit(2)
-		}
-		att := ""
-		if len(args) >= 5 && args[4] == "--attestation" {
-			// A missing value must not be a quiet "no attestation": that is
-			// exactly how an unattested binary ships. `--attestation "$ATT"`
-			// from a CI job with ATT unset is the same shape and the same
-			// outcome, and the gate it skips is the one that makes "nothing
-			// unattested ships" true.
-			if len(args) < 6 || strings.TrimSpace(args[5]) == "" {
-				fmt.Fprintln(os.Stderr, "mach-server: --attestation needs a file path (an empty value would skip the check rather than fail it)")
-				os.Exit(2)
-			}
-			att = args[5]
-		} else if len(args) > 4 {
-			fmt.Fprintln(os.Stderr, "usage: mach-server push-update <machine> <agent-binary-path> <version> [--attestation FILE]")
-			os.Exit(2)
-		}
-		if err := controlplane.PushUpdate(args[1], args[2], args[3], att); err != nil {
-			fmt.Fprintln(os.Stderr, "mach-server: "+err.Error())
-			os.Exit(1)
-		}
 	case "version":
 		fmt.Printf("mach-server %s (%s/%s)\n", version.Version, runtime.GOOS, runtime.GOARCH)
 	default:
@@ -185,18 +159,14 @@ func usage() {
                                                  graph and VCS revision, read from the binary
   mach-server verify-attestation <att> <bin>     check an attestation against this control
                                                  plane's key AND against the binary's sha256
-  mach-server push-update <machine> <bin> <ver> [--attestation FILE]
-                                                 queue a signed agent update for a machine;
-                                                 with --attestation the binary must be the one
-                                                 that attestation describes, or nothing is sent
   mach-server version
 
 Machine names are org-prefixed: <MACH_ORG>-<machine> (unique; conflicts error out).
 
-Releases: attest each agent binary at build time, keep the .intoto.jsonl files with
-the artifacts, and pass --attestation to push-update so no unattested binary can be
-shipped. The agent itself does not consume the attestation — what it enforces is the
-pinned-key manifest signature over the sha256; the attestation is what makes the
-release pipeline and any later auditor able to check where the bytes came from.
+Releases: attest each agent binary at build time and keep the .intoto.jsonl files
+with the artifacts. Agents are updated through their distribution points (the
+apt/rpm/apk repositories, winget/Homebrew) — the control plane does not push
+agent binaries, and the attestation is what makes the release pipeline and any
+later auditor able to check where the bytes came from.
 `)
 }

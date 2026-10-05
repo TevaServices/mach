@@ -2,7 +2,7 @@ package server
 
 // The control plane's identity key is the one key the whole fleet pins. Every
 // agent stores its public half at enrollment and verifies the hello and every
-// update manifest against it, so a boot that quietly produces a *different*
+// attestation envelope against it, so a boot that quietly produces a *different*
 // identity does not look like a broken key — it looks like every agent in the
 // fleet refusing to connect, with nothing on the control plane to explain it.
 //
@@ -12,6 +12,7 @@ package server
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -40,19 +41,24 @@ func TestServerKeyIsNeverSilentlyReplaced(t *testing.T) {
 	}
 
 	// A loose mode is tightened on load, the way the agent's own key is: a
-	// volume restored from a backup can arrive world-readable.
-	if err := os.Chmod(path, 0o644); err != nil {
-		t.Fatalf("chmod: %v", err)
-	}
-	s3 := &Server{}
-	if err := s3.loadOrCreateServerKey(path); err != nil {
-		t.Fatalf("reload after a loose mode: %v", err)
-	}
-	if got := fileMode(t, path); got != 0o600 {
-		t.Fatalf("identity key left at mode %o, want 600", got)
-	}
-	if s3.serverKeyHex != first {
-		t.Fatal("tightening the mode changed the identity")
+	// volume restored from a backup can arrive world-readable. POSIX-only:
+	// Windows carries no permission bits for this rule to bind (os.Chmod sets
+	// the read-only attribute, not an ACL), so the assertion is skipped there
+	// rather than made always-pass.
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		s3 := &Server{}
+		if err := s3.loadOrCreateServerKey(path); err != nil {
+			t.Fatalf("reload after a loose mode: %v", err)
+		}
+		if got := fileMode(t, path); got != 0o600 {
+			t.Fatalf("identity key left at mode %o, want 600", got)
+		}
+		if s3.serverKeyHex != first {
+			t.Fatal("tightening the mode changed the identity")
+		}
 	}
 
 	// A corrupt file is refused, not replaced, and the file is left alone:

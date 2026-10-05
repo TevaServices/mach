@@ -34,7 +34,16 @@ func Route(args []string) {
 		apiKey := fs.String("api-key", "", "enroll headlessly with an enroll-scoped API key (`-` reads it from stdin)")
 		name := fs.String("name", "", "machine name, org-prefixed: <org>-<machine>")
 		org := fs.String("org", envOr("MACH_ORG", ""), "org prefix (or MACH_ORG env; prompted if empty)")
+		// The state dir the SERVICE will also read: on a machine installed
+		// through the MSI (Windows service) or by the Linux packages, the
+		// enrollment has to land in the directory the service account reads —
+		// `sudo -u mach` on Linux, an explicit dir here. Defaults to
+		// StateDir() unless given.
+		stateDirP := fs.String("state-dir", stateDir, "state directory the agent (and its service) read and write")
 		_ = fs.Parse(args[1:])
+		if *stateDirP != "" {
+			stateDir = *stateDirP
+		}
 		if *serverURL == "" {
 			// Zero-parameter UX: ask once. (Env MACH_SERVER pre-fills/default.)
 			def := envOr("MACH_SERVER", "")
@@ -106,10 +115,17 @@ func Route(args []string) {
 		}
 
 	case "run":
-		if err := Run(stateDir); err != nil {
+		if err := Run(stateDirFlag(stateDir, args[1:])); err != nil {
 			fmt.Fprintln(os.Stderr, "mach: "+err.Error())
 			os.Exit(1)
 		}
+
+	case "service":
+		// Windows: the SCM starts `mach service`; the MSI is who registered it
+		// (ServiceInstall/ServiceControl in packaging/wix/mach.wxs — the same
+		// place the systemd unit and OpenRC script are for the other platforms).
+		// Every other OS refuses (service_other.go).
+		serviceMain(stateDirFlag(stateDir, args[1:]))
 
 	case "version":
 		fmt.Printf("mach %s (%s/%s)\n", version.Version, runtime.GOOS, runtime.GOARCH)
@@ -118,6 +134,17 @@ func Route(args []string) {
 		usageAgent()
 		os.Exit(2)
 	}
+}
+
+// stateDirFlag is the --state-dir flag parsing shared by run and service:
+// the state dir defaults to the environment/default resolution Route did
+// above, and the flag overrides it. (register takes the same flag through
+// its own FlagSet.)
+func stateDirFlag(def string, args []string) string {
+	fs := flag.NewFlagSet("state-dir", flag.ContinueOnError)
+	p := fs.String("state-dir", def, "state directory the agent (and its service) read and write")
+	_ = fs.Parse(args)
+	return *p
 }
 
 // IsEnrolled reports whether this machine has completed enrollment.
@@ -129,14 +156,22 @@ func IsEnrolled(stateDir string) bool {
 func usageAgent() {
 	fmt.Fprint(os.Stderr, `mach — agent commands (remote-connection binary)
 
-  mach register [--server URL] [--org ORG]          enroll via QR (type challenge code on phone)
+  mach register [--server URL] [--org ORG] [--state-dir DIR]
+                                                    enroll via QR (type challenge code on phone)
   mach register --api-key K --name ORG-machine      enroll headlessly (enroll-scoped key)
-  mach run                                          run the agent daemon (outbound-only connection)
-                                                    (service registration lives in the distribution packages)
+  mach run [--state-dir DIR]                        run the agent daemon (outbound-only connection)
+  mach service [--state-dir DIR]                    (Windows) the installed service's entry point —
+                                                    started by the SCM, not by hand (mach run = interactive)
   mach version
 
 Machine names are org-prefixed: <org>-<machine> (unique; conflicts error out).
 The control plane is a separate binary: mach-server (serve, add-api-key, revoke-machine).
 Environment: MACH_SERVER, MACH_ORG, MACH_STATE_DIR
+
+Enrollment lands in the state dir the service will also read: on a packaged
+Linux install that is the service account's dir (run register as the service
+account: sudo -u mach mach register), on a Windows MSI install pass
+--state-dir pointing at the service's state directory (the package's README
+documents the path).
 `)
 }

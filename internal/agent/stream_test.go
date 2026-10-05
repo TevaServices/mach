@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -121,7 +122,16 @@ func TestStreamRunsAllowedCommandAndReportsExit(t *testing.T) {
 	globalPolicy.install("")
 	conn, peer := streamPipe(t)
 
-	payload, _ := json.Marshal(protocol.StreamStart{Command: "echo streamed-hello; echo oops >&2; exit 7"})
+	// The command runs through the agent's resolved shell. PowerShell 5.1
+	// (the Windows default) has NO stream-redirect operator — ">&2" and even
+	// "1>&2" are parser errors ("reserved for future use") that fail the whole
+	// command with exit 1 and no output — so stderr goes through the API there,
+	// while sh/bash and cmd take the portable 1>&2.
+	cmd := "echo streamed-hello; echo oops 1>&2; exit 7"
+	if runtime.GOOS == "windows" {
+		cmd = "echo streamed-hello; [Console]::Error.WriteLine('oops'); exit 7"
+	}
+	payload, _ := json.Marshal(protocol.StreamStart{Command: cmd})
 	handleStream(conn, protocol.Envelope{Type: "exec_stream", ReqID: "sess-run", Payload: payload},
 		make(chan struct{}, 1), nil)
 

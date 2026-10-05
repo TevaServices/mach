@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -82,9 +83,15 @@ func (p *pinStore) Load() (pinFile, error) {
 	}
 	// Whoever can rewrite this file chooses the key this console seals to, so a
 	// loose mode is worth complaining about even though the contents are public.
-	if st, serr := os.Stat(p.path); serr == nil && st.Mode().Perm()&0o077 != 0 {
-		fmt.Fprintf(os.Stderr, "mach: warning: %s had permissions %v; tightening to 0600\n", p.path, st.Mode().Perm())
-		_ = os.Chmod(p.path, 0o600)
+	// POSIX-only: Windows files carry no permission bits (a chmod is the
+	// read-only attribute, and every normal file reports 0666), so checking
+	// there would warn on every readable file — the containment is the ACLs of
+	// the profile dir holding it, not mode bits.
+	if runtime.GOOS != "windows" {
+		if st, serr := os.Stat(p.path); serr == nil && st.Mode().Perm()&0o077 != 0 {
+			fmt.Fprintf(os.Stderr, "mach: warning: %s had permissions %v; tightening to 0600\n", p.path, st.Mode().Perm())
+			_ = os.Chmod(p.path, 0o600)
+		}
 	}
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return pinFile{Machines: map[string]pinnedKey{}}, fmt.Errorf("%s is not readable as JSON: %w "+

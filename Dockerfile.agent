@@ -109,9 +109,8 @@ ENV MACH_STATE_DIR=/data
 USER mach
 ENTRYPOINT ["/usr/local/bin/entrypoint"]
 
-# Pushed updates are refused here, on purpose, by filesystem permission: the
-# agent applies an update by rewriting its own executable, and in this image
-# that path is root-owned and the process runs as `mach`. A container's update
-# path is the registry's, not the control plane's — pull the next image and
-# restart the container. The machine then reports the image's version, and the
+# A container's update path is the registry's, not the control plane's: there
+# is no pushed-update channel anymore (agent binaries are updated through the
+# distribution points, and for containers "pull the next image" is the way).
+# Pull the next image and restart the container. The machine then reports the image's version, and the
 # fleet table's `differs` badge is what flags any container left behind.

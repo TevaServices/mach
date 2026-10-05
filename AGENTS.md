@@ -8,14 +8,16 @@ This is `mach`: remote CLI access to registered machines, outbound-only
   connection — as a **temporary session**, keeping every secret in memory, so
   Ctrl-C ends it and running it again enrolls from scratch (#23).
   A connection survives reboots only through the OS packages (removed, #40 —
-  the binary does not self-install; the packages register
-  systemd/launchd/Task Scheduler). On an admin box, bare `mach`
-  prints the fleet table. On a target that is already installed, bare `mach`
-  refuses rather than starting a second identity.
+  the binary does not self-install; the packages register systemd/launchd,
+  and on Windows a real SCM service — `mach service`). On an admin box, bare
+  `mach` prints the fleet table. On a target that is already installed, bare
+  `mach` refuses rather than starting a second identity.
 - `mach-server` (cmd/mach-server) — the control plane; the ONLY publicly
   reachable component. Ships as a Docker container. Also serves admin
   commands: `add-api-key`, `revoke-machine`, `delete-machine`, `e2e`,
-  `attest`, `verify-attestation`, `push-update`, `version`.
+  `attest`, `verify-attestation`, `version`. (Push-update was removed: agent
+  binaries are updated through the distribution points — apt/rpm/apk,
+  winget/MSI, brew — not by the control plane.)
 
 ## Ground rules
 
@@ -73,7 +75,8 @@ This is `mach`: remote CLI access to registered machines, outbound-only
    string, because it can only get there by proving it holds the machine's key.
    Failed dials are counted per source; successful ones are not.
 3. **Server key pinning**: agents store `server_key` at enrollment and
-   verify update manifests against it (sig over `version|sha256`).
+   verify attestation envelopes against it; there is no update-push channel
+   to protect anymore (updates go through the distribution points).
 4. **Challenge codes** are 12 chars (Crockford-ish alphabet, ~60 bits) and
    are printed ONLY on the agent console; the pair page never displays them
    and users type them blind. 5 wrong attempts expire the pairing.
@@ -212,9 +215,12 @@ This is `mach`: remote CLI access to registered machines, outbound-only
     the store, the lookups and the dispatch path are all case-sensitive, so
     folding case here would let a key scoped to `web` reach `Web`.
 13. **Release attestations**: `mach-server attest` signs an in-toto statement
-    with the identity key agents pin; `push-update --attestation` verifies the
-    subject digest before queueing and refuses a modified-tree build. Signature
-    verification always precedes parsing the payload.
+    with the identity key agents pin; `verify-attestation` checks it against
+    the key AND the binary's digest before anything ships to a release, and
+    refuses a modified-tree build. Signature verification always precedes
+    parsing the payload. (They are provenance/audit records: agents do not
+    receive or check them — there is no pushed-update path to protect;
+    distribution points carry updates and their own package signatures.)
 14. **E2E is a server-side setting, per org, and the client obeys it.** Stored
     in the database (`e2e`, `e2e:<org>`), overridden by `MACH_E2E` for every
     org. With it off, sealed exec is refused before dispatch (403, audited, with
@@ -270,12 +276,13 @@ This is `mach`: remote CLI access to registered machines, outbound-only
     cannot be removed at all. The naming invariant is unchanged
     (`<org>-<machine>` for a *configured* org), but an `enroll`-scoped key can
     now register under any of them.
-22. **The agent exits 0 to mean stop.** The installed service restarts on
-    failure (`Restart=on-failure`, launchd `SuccessfulExit=false`), so a clean
-    exit is how a retirement — revoked or deleted — actually takes effect. Never
-    change those to restart unconditionally: it turns a deliberate retirement into
-    a restart loop, and it races the update path, which starts its own detached
-    replacement and then exits 0.
+22. **The agent exits 0 to mean stop.** The installed services restart on
+    failure (`Restart=on-failure`, launchd `SuccessfulExit=false`, the Windows
+    service's SCM failure actions), so a clean exit is how a retirement —
+    revoked or deleted — actually takes effect. Never change those to restart
+    unconditionally: it turns a deliberate retirement into a restart loop.
+    An unenrolled Windows service waits for enrollment instead of exiting
+    (a restarted one would fail its own MSI's start) — see service_windows.go.
 23. **Plain `mach` on a target is a TEMPORARY session** (`agent/ephemeral.go`).
     It enrolls and holds the live connection with every secret in memory — no
     identity key, no E2E key, no config on disk — so Ctrl-C is a real shutdown
@@ -462,7 +469,7 @@ to run it, and for why the driver difference matters.
   same row), an operator grants it through the admin API, the approved command
   runs once (the mirror on the machine stands down for exactly that dispatch,
   never for the machine's own rules), and the spent grant stays in the record.
-  Green = 213 checks.
+  Green = 211 checks.
 - **The service-registration properties live in the shipped packaging
   artifacts** (`cmd/mach/packaging_test.go`), not in agent code: since the
   packages took over service registration (#44 removed `mach install`), the
@@ -471,8 +478,11 @@ to run it, and for why the driver difference matters.
   `Restart=on-failure` (invariant 22: exit 0 means stop), the OpenRC
   script's no-unconditional-respawn, the brew template's
   `keep_alive successful_exit: false`, enable-never-start in the deb/rpm/apk
-  maintainer scripts, and the attest hook's WARNING refusal. A packaging
-  change that silently changes supervision semantics turns these red.
+  maintainer scripts, the attest hook's WARNING refusal, and the mach.wxs
+  service pins (auto-start, restart-on-failure-only, service removed on
+  uninstall, and NO task-scheduler authoring left — the exact classes three
+  burned tags died on, #54). A packaging change that silently changes
+  supervision semantics turns these red.
   `mise run pack` runs goreleaser check + a snapshot build locally (no
   attest without a release key; the release pipeline enforces it).
 - Timing-sensitive e2e checks (streaming) use a real sleep and a real
@@ -488,8 +498,8 @@ to run it, and for why the driver difference matters.
   A machine that *itself* runs as a container can run `Dockerfile.agent`
   instead (`ghcr.io/<owner>/mach-agent` on releases): headless enrollment
   from `MACH_SERVER`/`MACH_API_KEY`/`MACH_NAME`, state in a `/data` volume,
-  and pushed updates refused by design — update it by pulling a new image,
-  not by the control plane's push path.
+  and updated only by pulling a new image (the control plane does not push
+  agent binaries — no push path exists; see SECURITY-NOTES "Updates").
 - Put Caddy/nginx in front for TLS (agents speak wss://) and set
   `MACH_TRUST_PROXY=1` on the server. Nothing else exposes ports; targets
   dial out only.

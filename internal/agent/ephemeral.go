@@ -45,10 +45,14 @@ type sessionCtl struct {
 	conn     *protocol.WSConn
 	shutdown bool
 	retired  bool
-	done     chan struct{}
+	// trace gates announce: a temporary session exists to be watched at a
+	// terminal (true); a supervised service's stdout goes nowhere, and a
+	// per-command line there is noise (false).
+	trace bool
+	done  chan struct{}
 }
 
-func newSessionCtl() *sessionCtl { return &sessionCtl{done: make(chan struct{})} }
+func newSessionCtl() *sessionCtl { return &sessionCtl{trace: true, done: make(chan struct{})} }
 
 // attach records the live connection so an interrupt can retire on it.
 func (c *sessionCtl) attach(conn *protocol.WSConn) {
@@ -138,6 +142,34 @@ func (c *sessionCtl) shutDown() {
 	conn.Close()
 }
 
+// stop ends the session WITHOUT retiring the enrollment: it is the permanent
+// agent's shutdown path (currently the Windows service's control handler —
+// "sc stop machd" or the SCM's shutdown). The machine stays enrolled and
+// rejoins at the next start; the state files are untouched. shutDown is the
+// temporary session's path — a Ctrl-C there IS a retirement — so the two exist
+// side by side rather than one calling the other.
+//
+// Same mechanics as shutDown (signal the loop, close the socket to unpark the
+// read) minus the retire frame, and the same idempotency.
+func (c *sessionCtl) stop() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.shutdown {
+		c.mu.Unlock()
+		return
+	}
+	c.shutdown = true
+	conn := c.conn
+	c.conn = nil
+	c.mu.Unlock()
+	close(c.done)
+	if conn != nil {
+		conn.Close()
+	}
+}
+
 // announce prints a one-line trace of a command this session is asked to run, so
 // the operator watching the console it was started from can see what is being
 // done to the machine. Without it a temporary session sat silent while commands
@@ -154,7 +186,7 @@ func (c *sessionCtl) shutDown() {
 // this machine's console — the same rule the disconnect log line follows. It is
 // a trace, never input: nothing reads it back.
 func (c *sessionCtl) announce(format string, args ...any) {
-	if c == nil || c.stopped() {
+	if c == nil || !c.trace || c.stopped() {
 		return
 	}
 	fmt.Fprintf(os.Stdout, "mach: "+format+"\n", args...)
