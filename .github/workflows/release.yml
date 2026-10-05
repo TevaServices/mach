@@ -619,8 +619,12 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/mach-local.list
           # rpm: repodata present and repomd sane — an index for the packages
           # actually exists (dnf/rpmdb resolve per-arch at install time).
+          # *primary* with a LEADING STAR: createrepo_c names its metadata by
+          # content hash ("<sha256>-primary.xml.gz"), so a bare primary*
+          # glob never matches — this exact bug failed the validate across
+          # four release runs while the metadata sat complete in the dir.
           test -f pages/rpm/repodata/repomd.xml
-          ls pages/rpm/repodata/primary* >/dev/null
+          ls pages/rpm/repodata/*primary* >/dev/null
           n=$(find pages/rpm -name '*.rpm' | wc -l)
           [ "$n" -ge 2 ]
           echo "rpm repodata present ($n rpms indexed)"
