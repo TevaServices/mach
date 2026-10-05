@@ -600,22 +600,34 @@ jobs:
           '
 
       # Validate what was just built (same repo layout a consumer resolves):
-      # apk from an alpine container (the trust model refuses an unsigned
-      # index outside a keys-dir context, so the container IS the apk
-      # validation); apt + dnf resolve the local tree with their own tooling.
+      # apk's index was just made by apk-tools itself (nothing in the workflow
+      # reads it better than apk does); apt + rpm are checked with what the
+      # runner has. The rpm line this replaced — `createrepo_c --check
+      # --repo-dir` — named flags that do not exist in createrepo_c (the
+      # directory is positional; there is no --check), and the v0.12.2 run
+      # failed on exactly that line: authoring that had never run.
       - name: Validate the generated repos
         run: |
           # apt: the runner's own apt consumes a file:// repo (sudo is
-          # passwordless on hosted runners).
+          # passwordless on hosted runners). The assertion is the Candidate:
+          # line — a real version installable from the repo, not "none".
           echo "deb [trusted=yes] file://$PWD/pages/apt stable main" \
             | sudo tee /etc/apt/sources.list.d/mach-local.list
           sudo apt-get update 2>&1 | grep -iE "mach|err" | head -5 || true
           apt-cache policy mach | head -6
+          apt-cache policy mach | grep -q 'Candidate: [0-9]'
           sudo rm -f /etc/apt/sources.list.d/mach-local.list
-          # rpm repodata parses (createrepo_c --repo-dir revalidates its own
-          # output; dnf/rpmdb resolve per-arch at install time on the target).
-          createrepo_c --check --repo-dir pages/rpm >/dev/null 2>&1 \
-            && echo "rpm repodata valid"
+          # rpm: repodata present and repomd sane — an index for the packages
+          # actually exists (dnf/rpmdb resolve per-arch at install time).
+          test -f pages/rpm/repodata/repomd.xml
+          ls pages/rpm/repodata/primary* >/dev/null
+          n=$(find pages/rpm -name '*.rpm' | wc -l)
+          [ "$n" -ge 2 ]
+          echo "rpm repodata present ($n rpms indexed)"
+          # apk: an APKINDEX per alpine arch, built by apk itself.
+          test -f pages/apk/x86_64/APKINDEX.tar.gz
+          test -f pages/apk/aarch64/APKINDEX.tar.gz
+          echo "apk indexes present"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
@@ -682,6 +694,11 @@ jobs:
             echo "SKIP=1" >> "$GITHUB_ENV"
           fi
 
+      - uses: actions/setup-go@v6
+        if: env.SKIP != '1'
+        with:
+          go-version-file: go.mod
+
       - name: Install + service lifecycle
         if: env.SKIP != '1'
         run: |
@@ -690,10 +707,31 @@ jobs:
           # formula's service DSL (brew services generates launchd here).
           brew install tevaservices/mach/mach
           mach version
+          # An unenrolled machd exits 1 ON PURPOSE (the supervision contract:
+          # restart on failure — and there is nothing an unenrolled agent can
+          # serve). The first version of this smoke started the service and
+          # grepped "started" 3 seconds later, which an unenrolled runner can
+          # never satisfy: the plist shows `error` within seconds of the start
+          # (v0.12.2, the first run this ever executed — #57). Enroll first,
+          # the way every real deployment does: a scratch control plane to
+          # enroll against, then the start is a meaningful assertion.
+          mkdir -p cp
+          CGO_ENABLED=0 go build -o ./cp/mach-server ./cmd/mach-server
+          SCP="MACH_DB=$PWD/cp/mach.db MACH_SERVER_KEY=$PWD/cp/mach.db.key MACH_ORG=brew MACH_LISTEN=127.0.0.1:18117 MACH_PUBLIC_URL=http://127.0.0.1:18117"
+          env $SCP ./cp/mach-server serve >cp/server.log 2>&1 &
+          sleep 2
+          ENROLL_KEY=$(env $SCP ./cp/mach-server add-api-key smoke enroll | grep -oE 'mach_[a-f0-9]+' | tail -1)
+          RO_KEY=$(env $SCP ./cp/mach-server add-api-key smoke-ro readonly | grep -oE 'mach_[a-f0-9]+' | tail -1)
+          MACH_STATE_DIR=/opt/homebrew/var/mach mach register \
+            --server http://127.0.0.1:18117 --api-key "$ENROLL_KEY" --name brew-smoke-box
           brew services start mach
           sleep 3
-          # brew services list is tabular and stable to parse (started/stopped
-          # in the status column) — brew services info is newer and varies.
+          # brew services list is tabular and stable to parse (started/error/
+          # none in the status column) — brew services info is newer and varies.
           brew services list | tee /dev/stderr | grep -E "^mach .*started"
+          # and it is serving: the machine is online at the control plane.
+          curl -fsS http://127.0.0.1:18117/v1/machines \
+            -H "Authorization: Bearer $RO_KEY" | grep -q '"online":true'
           brew services stop mach
+          sleep 2
           brew services list | tee /dev/stderr | grep -E "^mach .*(stopped|none)"
