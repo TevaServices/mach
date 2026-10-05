@@ -93,20 +93,22 @@ for f in $(by_ext rpm); do cp "$f" "$YUM/."; done
 createrepo_c "$YUM"
 
 # --- Alpine: unsigned APKINDEX (consumers add --allow-untrusted for now) ----
-# apk index needs apk-tools; repo-sync.yml installs it (static apk binary or
-# an alpine container). The index is a tar of APKINDEX descriptors (one per
-# package), conventionally gzipped; unsigned indexes work against repos
-# added with --allow-untrusted (and -U to skip signature verification).
+# apk index needs apk-tools, which the RUNNER lacks — that is the whole reason
+# this script has a MODE=no-apk: release.yml copies the .apk files here (this
+# block — in BOTH modes: without it no-apk mode would deploy an EMPTY apk
+# repo, the bug the v0.12.0 run would have shipped), and the INDEXING runs in
+# an alpine container (scripts/repo-apk.sh). The index is a tar of APKINDEX
+# descriptors (one per package), conventionally gzipped; unsigned indexes
+# work against repos added with --allow-untrusted. When a key exists:
+# abuild-sign the APKINDEX (public key ships to /etc/apk/keys on consumers).
 # Alpine arch convention: x86_64 / aarch64 (the apk name carries it, and the
 # APKINDEX records it) — one repo dir per alpine arch, never mixed.
-if [ "$MODE" != "no-apk" ]; then
-  arches=$(find "$IN" -name '*.apk' | sed -E 's/.*_(x86_64|aarch64)\.apk$/\1/' | sort -u)
-  if [ -z "$arches" ]; then echo "repo-sync: no alpine-arch apks found" >&2; exit 1; fi
-  for arch in $arches; do
-      mkdir -p "$APK/$arch"
-      find "$IN" -name "*_${arch}.apk" -exec cp {} "$APK/$arch/" \;
-  done
-fi
+arches=$(find "$IN" -name '*.apk' | sed -E 's/.*_(x86_64|aarch64)\.apk$/\1/' | sort -u)
+if [ -z "$arches" ]; then echo "repo-sync: no alpine-arch apks found" >&2; exit 1; fi
+for arch in $arches; do
+    mkdir -p "$APK/$arch"
+    find "$IN" -name "*_${arch}.apk" -exec cp {} "$APK/$arch/" \;
+done
 
 APT_FILES=$(find "$APT" -type f | wc -l)
 YUM_FILES=$(find "$YUM" -type f | wc -l)
