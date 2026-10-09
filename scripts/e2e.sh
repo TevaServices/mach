@@ -180,10 +180,10 @@ done
 curl -fsS "$BASE/healthz" >/dev/null; check "healthz responds" $?
 
 step "keys: scoped + admin + enroll"
-ENROLL_KEY=$(MACH_DB="$DB" "$WORKDIR/mach-server" add-api-key enroll-key enroll | grep -oE 'mach_[a-f0-9]+')
-CONSOLE_KEY=$(MACH_DB="$DB" "$WORKDIR/mach-server" add-api-key console exec:"$ORG-test-01" | grep -oE 'mach_[a-f0-9]+')
-ADMIN_KEY=$(MACH_DB="$DB" "$WORKDIR/mach-server" add-api-key admin admin | grep -oE 'mach_[a-f0-9]+')
-RO_KEY=$(MACH_DB="$DB" "$WORKDIR/mach-server" add-api-key readonly-key readonly | grep -oE 'mach_[a-f0-9]+')
+ENROLL_KEY=$(MACH_DB="$DB" MACH_ORG="$ORG" "$WORKDIR/mach-server" add-api-key enroll-key enroll | grep -oE 'mach_[a-f0-9]+')
+CONSOLE_KEY=$(MACH_DB="$DB" MACH_ORG="$ORG" "$WORKDIR/mach-server" add-api-key console exec:"$ORG-test-01" | grep -oE 'mach_[a-f0-9]+')
+ADMIN_KEY=$(MACH_DB="$DB" MACH_ORG="$ORG" "$WORKDIR/mach-server" add-api-key admin admin | grep -oE 'mach_[a-f0-9]+')
+RO_KEY=$(MACH_DB="$DB" MACH_ORG="$ORG" "$WORKDIR/mach-server" add-api-key readonly-key readonly | grep -oE 'mach_[a-f0-9]+')
 [[ -n "$ENROLL_KEY" && -n "$CONSOLE_KEY" && -n "$ADMIN_KEY" && -n "$RO_KEY" ]]; check "four keys generated" $?
 
 step "console config (admin box)"
@@ -197,7 +197,7 @@ step "api-key revocation (admin)"
 # is the gate every bearer-key request passes, and nothing may keep serving a
 # retirement on the strength of an in-memory cache. The row stays — revocation
 # is a tombstone, not a delete — and the list says so.
-REVOKED_KEY=$(MACH_DB="$DB" "$WORKDIR/mach-server" add-api-key doomed exec:"$ORG-test-01" | grep -oE 'mach_[a-f0-9]+')
+REVOKED_KEY=$(MACH_DB="$DB" MACH_ORG="$ORG" "$WORKDIR/mach-server" add-api-key doomed exec:"$ORG-test-01" | grep -oE 'mach_[a-f0-9]+')
 [[ -n "$REVOKED_KEY" ]]; check "doomed key created" $?
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/machines" -H "Authorization: Bearer $REVOKED_KEY")
 [[ "$CODE" == "200" ]]; check "doomed key works before revocation" $?
@@ -350,7 +350,7 @@ machc exec "$ORG-test-02" "echo nope" >/dev/null 2>&1 || CODE=$?
 [[ "$CODE" -ne 0 ]]; check "exec on unscoped machine refused" $?
 
 step "policy: agent refuses denied command (policy on second machine, exec-all console)"
-ALLKEY=$(MACH_DB="$DB" "$WORKDIR/mach-server" add-api-key allkeys 'exec:*' | grep -oE 'mach_[a-f0-9]+')
+ALLKEY=$(MACH_DB="$DB" MACH_ORG="$ORG" "$WORKDIR/mach-server" add-api-key allkeys 'exec:*' | grep -oE 'mach_[a-f0-9]+')
 [[ -n "$ALLKEY" ]]; check "exec-all key created" $?
 printf '{"server": "%s", "api_key": "%s"}\n' "$BASE" "$ALLKEY" > "$CONSOLE_DIR/console.json"
 MACH_POLICY="deny:secret-marker" MACH_STATE_DIR="$WORKDIR/agent2" \
@@ -642,7 +642,7 @@ step "admin commands report what they did, and refuse what they cannot"
 # add-api-key prints the values it STORED. The secret is shown exactly once, so
 # that line is the operator's only record of what was minted — and "admin" is an
 # alias for exec:*, so printing the arguments made it wrong.
-OUT=$(MACH_DB="$DB" "$WORKDIR/mach-server" add-api-key AuditKey admin 2>&1)
+OUT=$(MACH_DB="$DB" MACH_ORG="$ORG" "$WORKDIR/mach-server" add-api-key AuditKey admin 2>&1)
 [[ "$OUT" == *'scopes="exec:*"'* ]] || echo "    output was: $OUT"
 [[ "$OUT" == *'scopes="exec:*"'* ]]; check "add-api-key prints the scopes it stored" $?
 [[ "$OUT" == *'name="auditkey"'* ]]; check "and the name it stored, not the one typed" $?
@@ -1049,8 +1049,16 @@ if ! kill -0 "$UI_SERVER_PID" 2>/dev/null || ! grep -q "listening on" "$WORKDIR/
 fi
 curl -fsS "$UI_BASE/healthz" >/dev/null; check "second control plane up (UI+OIDC configured)" $?
 
-UI_ENROLL=$(MACH_DB="$UI_DB" "$WORKDIR/mach-server" add-api-key ui-enroll enroll | grep -oE 'mach_[a-f0-9]+')
-UI_ADMIN=$(MACH_DB="$UI_DB" "$WORKDIR/mach-server" add-api-key ui-admin admin | grep -oE 'mach_[a-f0-9]+')
+# Tenancy bootstrap. The UI's authorization is membership now: an identity with
+# no membership row signs in and finds itself powerless, so the identity the
+# fake issuer mints must hold a row before this section can act. This is the
+# same step a real deployment runs first (see SECURITY-NOTES's checklist) — the
+# CLI creates the first member because the UI cannot create its own authority.
+MACH_DB="$UI_DB" "$WORKDIR/mach-server" add-member --org "" "e2e@example.com" superadmin >/dev/null
+check "UI superadmin member bootstrapped (tenancy)" $?
+
+UI_ENROLL=$(MACH_DB="$UI_DB" MACH_ORG="$ORG" "$WORKDIR/mach-server" add-api-key ui-enroll enroll | grep -oE 'mach_[a-f0-9]+')
+UI_ADMIN=$(MACH_DB="$UI_DB" MACH_ORG="$ORG" "$WORKDIR/mach-server" add-api-key ui-admin admin | grep -oE 'mach_[a-f0-9]+')
 [[ -n "$UI_ENROLL" && -n "$UI_ADMIN" ]]; check "UI control plane keys generated" $?
 
 # A real agent, so "block keeps the client connected" is observed rather than
@@ -1138,12 +1146,19 @@ OUT=$(grep -o '<code>acme</code>' "$WORKDIR/ui-orgs.html" | head -1); [[ "$OUT" 
 check "the new org is listed" $?
 OUT=$(grep -o 'badge pinned' "$WORKDIR/ui-orgs.html" | head -1); [[ "$OUT" == "badge pinned" ]]
 check "the environment's org is shown as pinned" $?
-# The behaviour change this feature forced: enrollment now resolves any
-# configured org, not just the primary one.
+# Tenancy: enrollment is bound to the KEY's org. The ui-enroll key belongs
+# to the primary org, so enrolling under the NEW org needs a key minted for
+# it — that is the boundary holding, not a regression — and the response
+# names the org the machine landed in.
+ACME_ENROLL=$(MACH_DB="$UI_DB" MACH_ORG=acme "$WORKDIR/mach-server" add-api-key acme-enroll enroll | grep -oE 'mach_[a-f0-9]+')
+[[ -n "$ACME_ENROLL" ]]; check "an enroll key minted for the new org" $?
+ACME_ADMIN=$(MACH_DB="$UI_DB" MACH_ORG=acme "$WORKDIR/mach-server" add-api-key acme-admin admin | grep -oE 'mach_[a-f0-9]+')
+[[ -n "$ACME_ADMIN" ]]; check "an admin key minted for the new org" $?
 PUB_UI=$(python3 -c "print('ef'*32)")
 OUT=$(curl -sS -X POST "$UI_BASE/v1/register/apikey" -H 'Content-Type: application/json' \
-  -d "{\"api_key\":\"$UI_ENROLL\",\"pub_key\":\"$PUB_UI\",\"name\":\"acme-ui-01\"}" 2>&1)
-[[ "$OUT" == *'"ok":"enrolled"'* ]]; check "a machine enrolls under an org added through the UI" $?
+  -d "{\"api_key\":\"$ACME_ENROLL\",\"pub_key\":\"$PUB_UI\",\"name\":\"acme-ui-01\"}" 2>&1)
+[[ "$OUT" == *'"ok":"enrolled"'* && "$OUT" == *'"org":"acme"'* ]]
+check "a machine enrolls under an org added through the UI, in that org" $?
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$UI_BASE/ui/orgs/remove" -b "$JAR" \
   -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' --data-urlencode 'org=acme')
 [[ "$CODE" == "409" ]]; check "removing an org that still has machines is refused" $?
@@ -1153,7 +1168,7 @@ OUT=$(curl -sS -X POST "$UI_BASE/ui/orgs/remove" -b "$JAR" -H "X-CSRF-Token: $CS
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$UI_BASE/ui/orgs/e2e" -b "$JAR" \
   -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' --data-urlencode 'org=acme' --data-urlencode 'mode=off')
 [[ "$CODE" == "200" ]]; check "sealed exec can be set per org from the UI" $?
-OUT=$(curl -sS "$UI_BASE/v1/machines" -H "Authorization: Bearer $UI_ADMIN" 2>&1)
+OUT=$(curl -sS "$UI_BASE/v1/machines" -H "Authorization: Bearer $ACME_ADMIN" 2>&1)
 [[ "$OUT" == *'"e2e":"off"'* ]]; check "the per-org sealed-exec setting reaches the fleet listing" $?
 
 step "web UI: refusals are visible and actions are confirmed"

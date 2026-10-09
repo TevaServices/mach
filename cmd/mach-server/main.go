@@ -24,23 +24,38 @@ func main() {
 	case "serve":
 		controlplane.Serve()
 	case "add-api-key":
-		// mach-server add-api-key <name> <scopes>
+		// mach-server add-api-key <name> <scopes> [--org ORG]
 		// scopes: enroll | readonly | exec:* | exec:m1|m2|...
 		// The key secret is generated server-side (192-bit) and printed ONCE.
+		// --org binds the key to one tenant; omitted means the primary org.
 		if len(args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: mach-server add-api-key <name> <scopes>\n       scopes: enroll | readonly | exec:* | exec:m1|m2|...")
+			fmt.Fprintln(os.Stderr, "usage: mach-server add-api-key <name> <scopes> [--org ORG]\n       scopes: enroll | readonly | exec:* | exec:m1|m2|...")
 			os.Exit(2)
+		}
+		org := ""
+		rest := args[3:]
+		for i := 0; i < len(rest); i++ {
+			switch {
+			case rest[i] == "--org" && i+1 < len(rest):
+				org = rest[i+1]
+				i++
+			case strings.HasPrefix(rest[i], "--org="):
+				org = strings.TrimPrefix(rest[i], "--org=")
+			default:
+				fmt.Fprintln(os.Stderr, "usage: mach-server add-api-key <name> <scopes> [--org ORG]")
+				os.Exit(2)
+			}
 		}
 		// Printed are the values that were STORED, not the arguments as typed.
 		// The secret below is shown once, so this line is the operator's only
 		// record of what was minted — and the two can differ, because "admin"
 		// is an alias for exec:* and the name is lowercased.
-		key, storedName, storedScopes, err := controlplane.AddAPIKey(args[1], args[2])
+		key, storedName, storedScopes, storedOrg, err := controlplane.AddAPIKey(args[1], args[2], org)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "mach-server: "+err.Error())
 			os.Exit(1)
 		}
-		fmt.Printf("api key created: name=%q scopes=%q\n", storedName, storedScopes)
+		fmt.Printf("api key created: name=%q scopes=%q org=%q\n", storedName, storedScopes, storedOrg)
 		fmt.Printf("KEY (shown once, store it now): %s\n", key)
 	case "revoke-api-key":
 		// mach-server revoke-api-key <name>
@@ -123,6 +138,90 @@ func main() {
 			fmt.Fprintln(os.Stderr, "mach-server: "+err.Error())
 			os.Exit(1)
 		}
+	case "add-org":
+		// mach-server add-org <name> — create a tenant. The UI's org
+		// management belongs to the superadmin; the CLI is the bootstrap and
+		// the host-shell path for the same power.
+		if len(args) != 2 {
+			fmt.Fprintln(os.Stderr, "usage: mach-server add-org <name>")
+			os.Exit(2)
+		}
+		if err := controlplane.AddOrg(args[1]); err != nil {
+			fmt.Fprintln(os.Stderr, "mach-server: "+err.Error())
+			os.Exit(1)
+		}
+	case "add-member":
+		// mach-server add-member [--org ORG] <email> <role>
+		// role: superadmin | admin | operator | viewer. The first member of a
+		// fresh control plane must be created here: the UI grants nothing to
+		// an identity without a membership row.
+		org, email, role := "", "", ""
+		rest := args[1:]
+		var positional []string
+		for i := 0; i < len(rest); i++ {
+			switch {
+			case rest[i] == "--org" && i+1 < len(rest):
+				org = rest[i+1]
+				i++
+			case strings.HasPrefix(rest[i], "--org="):
+				org = strings.TrimPrefix(rest[i], "--org=")
+			default:
+				positional = append(positional, rest[i])
+			}
+		}
+		if len(positional) != 2 {
+			fmt.Fprintln(os.Stderr, "usage: mach-server add-member [--org ORG] <email> <role>\n       role: superadmin | admin | operator | viewer")
+			os.Exit(2)
+		}
+		email, role = positional[0], positional[1]
+		if err := controlplane.AddMember(org, email, role); err != nil {
+			fmt.Fprintln(os.Stderr, "mach-server: "+err.Error())
+			os.Exit(1)
+		}
+	case "remove-member":
+		// mach-server remove-member [--org ORG] <email>
+		org := ""
+		rest := args[1:]
+		var positional []string
+		for i := 0; i < len(rest); i++ {
+			switch {
+			case rest[i] == "--org" && i+1 < len(rest):
+				org = rest[i+1]
+				i++
+			case strings.HasPrefix(rest[i], "--org="):
+				org = strings.TrimPrefix(rest[i], "--org=")
+			default:
+				positional = append(positional, rest[i])
+			}
+		}
+		if len(positional) != 1 {
+			fmt.Fprintln(os.Stderr, "usage: mach-server remove-member [--org ORG] <email>")
+			os.Exit(2)
+		}
+		if err := controlplane.RemoveMember(org, positional[0]); err != nil {
+			fmt.Fprintln(os.Stderr, "mach-server: "+err.Error())
+			os.Exit(1)
+		}
+	case "list-members":
+		// mach-server list-members [--org ORG]
+		org := ""
+		rest := args[1:]
+		for i := 0; i < len(rest); i++ {
+			switch {
+			case rest[i] == "--org" && i+1 < len(rest):
+				org = rest[i+1]
+				i++
+			case strings.HasPrefix(rest[i], "--org="):
+				org = strings.TrimPrefix(rest[i], "--org=")
+			default:
+				fmt.Fprintln(os.Stderr, "usage: mach-server list-members [--org ORG]")
+				os.Exit(2)
+			}
+		}
+		if err := controlplane.ListMembers(org); err != nil {
+			fmt.Fprintln(os.Stderr, "mach-server: "+err.Error())
+			os.Exit(1)
+		}
 	case "version":
 		fmt.Printf("mach-server %s (%s/%s)\n", version.Version, runtime.GOOS, runtime.GOARCH)
 	default:
@@ -144,10 +243,24 @@ func usage() {
                                                  drop an org's override). Stored in the database;
                                                  MACH_E2E overrides every org when set. Clients
                                                  are told which it is and obey or refuse to run.
-  mach-server add-api-key <name> <scopes>        create a key: enroll | readonly | exec:* | exec:m1|m2
-                                                 (secret generated server-side, printed once)
+  mach-server add-api-key <name> <scopes> [--org ORG]
+                                                 create a key: enroll | readonly | exec:* | exec:m1|m2
+                                                 (secret generated server-side, printed once;
+                                                 --org binds the key to one tenant — omitted
+                                                 means the primary org)
   mach-server revoke-api-key <name>              revoke a key: it stops authenticating (row is kept;
                                                  an unknown name errors out)
+  mach-server add-org <name>                     create a tenant (the UI's org management belongs
+                                                 to a superadmin; this is the bootstrap path)
+  mach-server add-member [--org ORG] <email> <role>
+                                                 grant a signed-in identity its powers: superadmin
+                                                 (every org, plus org management), admin (full
+                                                 control of one org), operator (exec + approve),
+                                                 viewer (read-only). The FIRST member of a fresh
+                                                 control plane must be created here — the UI
+                                                 grants nothing to an identity without a row
+  mach-server remove-member [--org ORG] <email>  drop one membership binding
+  mach-server list-members [--org ORG]           list membership rows
   mach-server revoke-machine <name> [--purge-audit]
                                                  revoke a machine; its agent self-retires
   mach-server delete-machine <name> [--purge-audit]

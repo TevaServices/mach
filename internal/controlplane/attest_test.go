@@ -192,13 +192,13 @@ func TestAddAPIKeyRefusesALiteralStarEntry(t *testing.T) {
 	t.Setenv("MACH_SERVER_KEY", filepath.Join(dir, "mach.db.key"))
 
 	for _, scopes := range []string{"exec:web|*", "exec:*|web", "exec:* | web"} {
-		if _, _, _, err := AddAPIKey("k", scopes); err == nil {
+		if _, _, _, _, err := AddAPIKey("k", scopes, ""); err == nil {
 			t.Errorf("AddAPIKey(%q) was accepted", scopes)
 		}
 	}
 	// The forms that mean what they say still mint.
 	for _, scopes := range []string{"exec:*", "exec:web|db-1", "readonly", "enroll"} {
-		if _, _, _, err := AddAPIKey("k", scopes); err != nil {
+		if _, _, _, _, err := AddAPIKey("k", scopes, ""); err != nil {
 			t.Errorf("AddAPIKey(%q) was refused: %v", scopes, err)
 		}
 	}

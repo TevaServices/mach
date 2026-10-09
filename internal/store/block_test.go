@@ -20,7 +20,7 @@ func TestSetMachineBlockedRoundTripAndSurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if ok, err := st.SetMachineBlocked("bcross-a", true); err != nil || !ok {
@@ -71,7 +71,7 @@ func TestSetMachineBlockedUnknownMachine(t *testing.T) {
 // permanent tombstone, block is a reversible freeze.
 func TestSetMachineBlockedDoesNotTouchRevoked(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if err := st.RevokeMachine("bcross-a"); err != nil {
@@ -130,10 +130,10 @@ func TestVerifySchemaRejectsDatabaseWithoutBlocked(t *testing.T) {
 // name and the agent key become reusable.
 func TestDeleteMachineFreesNameAndKeyKeepsAudit(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := st.AuditInsert("2026-01-01T00:00:00Z", "bcross-a", "echo hi", "console:x",
+	if err := st.AuditInsert("2026-01-01T00:00:00Z", "bcross", "bcross-a", "echo hi", "console:x",
 		sql.NullInt64{Int64: 0, Valid: true}, "hi", ""); err != nil {
 		t.Fatalf("audit: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestDeleteMachineFreesNameAndKeyKeepsAudit(t *testing.T) {
 		t.Fatalf("agent key survived delete: %v %+v", err, m)
 	}
 	// Audit is a record about the fleet, not a property of the machine row.
-	entries, err := st.AuditList("bcross-a", 50)
+	entries, err := st.AuditList("bcross", "bcross-a", 50)
 	if err != nil {
 		t.Fatalf("audit list: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestDeleteMachineFreesNameAndKeyKeepsAudit(t *testing.T) {
 	}
 
 	// The whole point: the same name AND the same key material may enroll again.
-	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("re-enroll with the freed name and key: %v", err)
 	}
 	m, err := st.MachineByName("bcross-a")

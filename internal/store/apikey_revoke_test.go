@@ -11,20 +11,20 @@ import (
 // and revoking twice is fine — the command asks for an end state.
 func TestRevokeAPIKeyRevokesAndStaysListed(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateAPIKey("auditkey", "mach_deadbeef01", "exec:*"); err != nil {
+	if err := st.CreateAPIKey("auditkey", "mach_deadbeef01", "exec:*", "bcross"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if ok, _, _, err := st.APIKeyExists("mach_deadbeef01"); err != nil || !ok {
+	if ok, _, _, _, err := st.APIKeyExists("mach_deadbeef01"); err != nil || !ok {
 		t.Fatalf("fresh key should resolve: ok=%v err=%v", ok, err)
 	}
 	ok, err := st.RevokeAPIKey("auditkey")
 	if err != nil || !ok {
 		t.Fatalf("revoke: ok=%v err=%v, want true, nil", ok, err)
 	}
-	if ok, name, _, err := st.APIKeyExists("mach_deadbeef01"); err != nil || ok {
+	if ok, name, _, _, err := st.APIKeyExists("mach_deadbeef01"); err != nil || ok {
 		t.Fatalf("revoked key must not resolve: ok=%v name=%q err=%v", ok, name, err)
 	}
-	keys, err := st.ListAPIKeys()
+	keys, err := st.ListAPIKeys("")
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}

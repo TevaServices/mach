@@ -42,7 +42,7 @@ func newSealedHarness(t *testing.T) *sealedHarness {
 	t.Cleanup(srv.Close)
 	h.s, h.st = s, st
 
-	pubHex, priv := seedMachine(t, st, h.mach)
+	pubHex, priv := seedMachine(t, st, h.mach, "bcross")
 	h.agent = dialAgent(t, srv.URL, h.mach, pubHex, priv)
 	return h
 }
@@ -119,7 +119,7 @@ func TestSealedExecAuditsTheReportedExitStatus(t *testing.T) {
 		t.Fatalf("sealed reply reports exit %v, want 42 (%s)", wire.ExitCode, body)
 	}
 
-	entries, err := h.st.AuditList(h.mach, 10)
+	entries, err := h.st.AuditList("", h.mach, 10)
 	if err != nil {
 		t.Fatalf("audit list: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestSealedExecAuditsAReportedZero(t *testing.T) {
 	if code, body := h.run(t, key, ptr(0)); code != http.StatusOK {
 		t.Fatalf("sealed exec returned %d, want 200 (%s)", code, body)
 	}
-	entries, err := h.st.AuditList(h.mach, 10)
+	entries, err := h.st.AuditList("", h.mach, 10)
 	if err != nil {
 		t.Fatalf("audit list: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestSealedExecWithoutAReportedStatusAuditsNone(t *testing.T) {
 	if code, body := h.run(t, key, nil); code != http.StatusOK {
 		t.Fatalf("sealed exec returned %d, want 200 (%s)", code, body)
 	}
-	entries, err := h.st.AuditList(h.mach, 10)
+	entries, err := h.st.AuditList("", h.mach, 10)
 	if err != nil {
 		t.Fatalf("audit list: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestSealedRefusalAuditsThePlaceholder(t *testing.T) {
 	if code != http.StatusForbidden {
 		t.Fatalf("sealed exec to a blocked machine returned %d, want 403 (%s)", code, body)
 	}
-	entries, err := h.st.AuditList(h.mach, 10)
+	entries, err := h.st.AuditList("", h.mach, 10)
 	if err != nil {
 		t.Fatalf("audit list: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestSealedWithPlaintextIsRefused(t *testing.T) {
 			t.Fatalf("sealed + plaintext returned %d, want 400 (%s)", code, resp)
 		}
 	}
-	entries, err := h.st.AuditList(h.mach, 10)
+	entries, err := h.st.AuditList("", h.mach, 10)
 	if err != nil {
 		t.Fatalf("audit list: %v", err)
 	}

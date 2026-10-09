@@ -39,7 +39,7 @@ const killGrace = 15 * time.Second
 
 // streamConsole connects to the streaming endpoint and runs one command,
 // printing output as it arrives. Returns the remote exit code.
-func streamConsole(server, apiKey, machine, command string) int {
+func streamConsole(server, apiKey, machine, command string, inject []string) int {
 	url := wsURLFrom(server) + "/v1/console/stream?machine=" + url.QueryEscape(machine)
 	h := http.Header{}
 	h.Set("Authorization", "Bearer "+apiKey)
@@ -54,7 +54,7 @@ func streamConsole(server, apiKey, machine, command string) int {
 	}
 	defer ws.Close()
 
-	start, _ := json.Marshal(protocol.StreamStart{Command: command})
+	start, _ := json.Marshal(protocol.StreamStart{Command: command, InjectEnv: inject})
 	if err := ws.WriteMessage(websocket.TextMessage, mustJSON(protocol.Envelope{
 		Type:    "exec_stream",
 		ReqID:   "console",

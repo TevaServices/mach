@@ -31,8 +31,19 @@ import (
 	"github.com/TevaServices/mach/internal/store"
 )
 
+// newPairTestServer is a control plane with the web UI enabled and a signed-in
+// superadmin session. Under tenancy the pair page is behind a signed-in
+// session — the machine's org is assigned by the approver, from their own
+// memberships — so these tests start from the same operator the UI tests
+// assume and then drive the page exactly as a phone-adjacent operator would.
+func newPairTestServer(t *testing.T) (*Server, *store.Store, *http.Cookie) {
+	s, st, p := newUITestServer(t)
+	session, _ := uiSignIn(t, s, p)
+	return s, st, session
+}
+
 func TestPairApprovalWorksOverHTTP(t *testing.T) {
-	s, st := newAuthTestServer(t)
+	s, st, session := newPairTestServer(t)
 	h := s.Routes()
 
 	// The agent asks to pair, with a real keypair — the claim has to be signed
@@ -70,6 +81,7 @@ func TestPairApprovalWorksOverHTTP(t *testing.T) {
 	req := httptest.NewRequest("POST", "/pair/"+start.Token, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.AddCookie(session)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -110,7 +122,7 @@ func TestPairApprovalWorksOverHTTP(t *testing.T) {
 // A wrong code must still be refused — the fix for the above must not have
 // turned the comparison into one that accepts anything.
 func TestPairApprovalRefusesAWrongCodeOverHTTP(t *testing.T) {
-	s, st := newAuthTestServer(t)
+	s, st, session := newPairTestServer(t)
 	h := s.Routes()
 
 	code, body := bearerJSON(t, h, "POST", "/v1/pair/start", "",
@@ -125,6 +137,7 @@ func TestPairApprovalRefusesAWrongCodeOverHTTP(t *testing.T) {
 	req := httptest.NewRequest("POST", "/pair/"+start.Token, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.AddCookie(session)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if !strings.Contains(rec.Body.String(), "Wrong code") {
@@ -145,13 +158,13 @@ func TestPairApprovalRefusesAWrongCodeOverHTTP(t *testing.T) {
 // enrollment page, so the keyspace came with it. The code is what approval is
 // gated on; it has to gate the fleet's answers too.
 func TestPairPageDoesNotLeakNamesToAWrongCode(t *testing.T) {
-	s, st := newAuthTestServer(t)
+	s, st, session := newPairTestServer(t)
 	h := s.Routes()
 
 	// One name that exists and is active, one that does not. The pair page must
 	// not tell them apart to a caller who cannot read the agent's console.
 	livePub, _ := newKeyHex(t)
-	if err := st.CreateMachine("bcross-live", livePub, "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-live", livePub, "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -160,6 +173,7 @@ func TestPairPageDoesNotLeakNamesToAWrongCode(t *testing.T) {
 		req := httptest.NewRequest("POST", "/pair/"+token, strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		req.AddCookie(session)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
@@ -195,7 +209,7 @@ func TestPairPageDoesNotLeakNamesToAWrongCode(t *testing.T) {
 	// The name check still happens — it just happens after the code now. A
 	// correct code on a taken name is refused exactly as it always was.
 	takenPub, _ := newKeyHex(t)
-	page, state := approvePair(t, s, takenPub, "bcross-live")
+	page, state := approvePair(t, s, session, takenPub, "bcross-live")
 	if !strings.Contains(page, "already taken") {
 		t.Fatalf("a taken name was accepted after a correct code: %s", page)
 	}
@@ -206,7 +220,7 @@ func TestPairPageDoesNotLeakNamesToAWrongCode(t *testing.T) {
 
 // approvePair drives the pair page for a machine name and returns the rendered
 // page plus the pairing's resulting state.
-func approvePair(t *testing.T, s *Server, pubHex, name string) (page, state string) {
+func approvePair(t *testing.T, s *Server, session *http.Cookie, pubHex, name string) (page, state string) {
 	t.Helper()
 	h := s.Routes()
 	code, body := bearerJSON(t, h, "POST", "/v1/pair/start", "",
@@ -223,6 +237,7 @@ func approvePair(t *testing.T, s *Server, pubHex, name string) (page, state stri
 	req := httptest.NewRequest("POST", "/pair/"+start.Token, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.AddCookie(session)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -250,8 +265,8 @@ func TestPairPageAcceptsANameARevokedOrTemporaryMachineHolds(t *testing.T) {
 		{"revoked and temporary", true, true},
 	} {
 		t.Run(tc.what, func(t *testing.T) {
-			s, st := newAuthTestServer(t)
-			if err := st.CreateMachine("bcross-tmp", strings.Repeat("11", 32), "h", "linux", "amd64", "v", "", tc.temporary); err != nil {
+			s, st, session := newPairTestServer(t)
+			if err := st.CreateMachine("bcross-tmp", strings.Repeat("11", 32), "h", "linux", "amd64", "v", "", tc.temporary, "bcross"); err != nil {
 				t.Fatalf("seed: %v", err)
 			}
 			if tc.revoked {
@@ -259,7 +274,7 @@ func TestPairPageAcceptsANameARevokedOrTemporaryMachineHolds(t *testing.T) {
 					t.Fatalf("revoke: %v", err)
 				}
 			}
-			page, state := approvePair(t, s, strings.Repeat("22", 32), "bcross-tmp")
+			page, state := approvePair(t, s, session, strings.Repeat("22", 32), "bcross-tmp")
 			if strings.Contains(page, "already taken") {
 				t.Fatalf("the pair page refused a %s machine's name: %s", tc.what, page)
 			}
@@ -273,11 +288,11 @@ func TestPairPageAcceptsANameARevokedOrTemporaryMachineHolds(t *testing.T) {
 // And an ACTIVE, permanent machine's name is still refused — the page must not
 // have been loosened into accepting anything.
 func TestPairPageStillRefusesAnActiveMachinesName(t *testing.T) {
-	s, st := newAuthTestServer(t)
-	if err := st.CreateMachine("bcross-live", strings.Repeat("33", 32), "h", "linux", "amd64", "v", "", false); err != nil {
+	s, st, session := newPairTestServer(t)
+	if err := st.CreateMachine("bcross-live", strings.Repeat("33", 32), "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	page, _ := approvePair(t, s, strings.Repeat("44", 32), "bcross-live")
+	page, _ := approvePair(t, s, session, strings.Repeat("44", 32), "bcross-live")
 	if !strings.Contains(page, "already taken") {
 		t.Fatalf("an active machine's name was offered to a new agent: %s", page)
 	}
@@ -289,7 +304,7 @@ func TestPairPageStillRefusesAnActiveMachinesName(t *testing.T) {
 // suggestion is agent-reported text (a hostname), so nothing downstream of it
 // may be treated as trusted, and the challenge code is not part of it at all.
 func TestPairPagePrefillsFromTheQRQuery(t *testing.T) {
-	s, _ := newAuthTestServer(t)
+	s, _, session := newPairTestServer(t)
 	h := s.Routes()
 
 	code, body := bearerJSON(t, h, "POST", "/v1/pair/start", "",
@@ -303,8 +318,10 @@ func TestPairPagePrefillsFromTheQRQuery(t *testing.T) {
 	}
 	get := func(q string) string {
 		t.Helper()
+		req := httptest.NewRequest("GET", "/pair/"+start.Token+q, nil)
+		req.AddCookie(session)
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest("GET", "/pair/"+start.Token+q, nil))
+		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("GET /pair/...%s: %d", q, rec.Code)
 		}
@@ -345,7 +362,7 @@ func TestPairPagePrefillsFromTheQRQuery(t *testing.T) {
 // A refused approval hands back the org and the name the operator typed, so a
 // mistyped challenge code does not also cost them the rest of the form.
 func TestPairPageKeepsTypedValuesOnARetry(t *testing.T) {
-	s, _ := newAuthTestServer(t)
+	s, _, session := newPairTestServer(t)
 	h := s.Routes()
 
 	_, body := bearerJSON(t, h, "POST", "/v1/pair/start", "",
@@ -357,6 +374,7 @@ func TestPairPageKeepsTypedValuesOnARetry(t *testing.T) {
 	req := httptest.NewRequest("POST", "/pair/"+start.Token, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.AddCookie(session)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	page := rec.Body.String()
@@ -375,7 +393,7 @@ func TestPairPageKeepsTypedValuesOnARetry(t *testing.T) {
 // does not route). Every other terminal state goes through terminalPair; this
 // one now does too.
 func TestPairDenyRendersTerminalPage(t *testing.T) {
-	s, st := newAuthTestServer(t)
+	s, st, session := newPairTestServer(t)
 	_, token, code, err := st.CreatePairing("pub", "agent-host", "linux", "amd64", "v", 10*time.Minute)
 	if err != nil {
 		t.Fatalf("create pairing: %v", err)
@@ -385,6 +403,7 @@ func TestPairDenyRendersTerminalPage(t *testing.T) {
 	form := url.Values{"deny": {"1"}, "code": {code}}
 	req := httptest.NewRequest("POST", "/pair/"+token, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(session)
 	rec := httptest.NewRecorder()
 	s.Routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -424,7 +443,7 @@ func TestPairDenyRendersTerminalPage(t *testing.T) {
 // documented in SECURITY-NOTES instead: five wrong codes burn the pairing, and
 // the GET page shows what the machine reported about itself.
 func TestPairDenyWithoutTheCodeIsRefused(t *testing.T) {
-	s, st := newAuthTestServer(t)
+	s, st, session := newPairTestServer(t)
 	_, token, code, err := st.CreatePairing("pub", "agent-host", "linux", "amd64", "v", 10*time.Minute)
 	if err != nil {
 		t.Fatalf("create pairing: %v", err)
@@ -435,6 +454,7 @@ func TestPairDenyWithoutTheCodeIsRefused(t *testing.T) {
 		req := httptest.NewRequest("POST", "/pair/"+token, strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		req.AddCookie(session)
 		rec := httptest.NewRecorder()
 		s.Routes().ServeHTTP(rec, req)
 		return rec
@@ -492,7 +512,7 @@ func TestPairClaimRequiresProofOfPossession(t *testing.T) {
 		t.Fatalf("create pairing: %v", err)
 	}
 	// Approved by the operator, with the code from the machine's console.
-	if ok, why, err := st.ApprovePairing(mustPairingID(t, st, token), code, "bcross-web"); err != nil || !ok {
+	if ok, why, err := st.ApprovePairing(mustPairingID(t, st, token), code, "bcross-web", "bcross"); err != nil || !ok {
 		t.Fatalf("approve: ok=%v why=%q err=%v", ok, why, err)
 	}
 

@@ -12,7 +12,12 @@ import (
 )
 
 type AgentConn struct {
-	Name     string
+	Name string
+	// Org is the tenant the machine belongs to, from the machine row at
+	// hello. Carried on the connection so server-side decisions about this
+	// agent (per-org policy, per-org settings) read one fact instead of
+	// re-deriving an org from the name.
+	Org      string
 	Conn     *protocol.WSConn
 	LastSeen time.Time
 	Hostname string

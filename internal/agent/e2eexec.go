@@ -58,10 +58,18 @@ func handleSealedExec(conn *protocol.WSConn, env protocol.Envelope, sealed proto
 	// the temporary session, and a sealed command's text exists here and nowhere
 	// else on this machine — the control plane relayed ciphertext it could not
 	// read. So the operator watching their own box sees what was run on it.
-	ctl.announce("exec (sealed): %q", describeCommandText(cmd.Command, cmd.Argv))
+	// The text is scrubbed against the locally stored secrets like every other
+	// byte this agent sends out.
+	store := activeSecrets()
+	ctl.announce("exec (sealed): %q", scrubTrace(store, describeCommandText(cmd.Command, cmd.Argv)))
 
 	// Execute with the standard path but capture the result for sealing.
 	res := runCommandResult(cmdPayload, sem)
+	// A refused-because-missing secret re-announces: the store may have
+	// changed since the last announce.
+	if isSecretsRefusal(res) {
+		announceSecrets(conn, store)
+	}
 	ctl.announce("exec (sealed): exit %d", res.ExitCode)
 
 	// The same encoding the plaintext path uses, so a sealed result and an

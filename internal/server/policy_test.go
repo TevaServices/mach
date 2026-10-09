@@ -19,7 +19,7 @@ import (
 func TestGlobalExecPolicyBlocksFleetWide(t *testing.T) {
 	s, st := newAuthTestServer(t)
 	s.SetExecPolicy("deny:rm -rf /")
-	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -64,7 +64,7 @@ func TestGlobalExecPolicyBlocksFleetWide(t *testing.T) {
 func TestApprovedCommandDispatchesOnce(t *testing.T) {
 	s, st := newAuthTestServer(t)
 	s.SetExecPolicy("deny:rm -rf /")
-	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	key := adminKey(t, s, "exec:*")
@@ -115,7 +115,7 @@ func TestApprovedCommandDispatchesOnce(t *testing.T) {
 func TestGlobalExecPolicyRefusalIsAudited(t *testing.T) {
 	s, st := newAuthTestServer(t)
 	s.SetExecPolicy("deny:shutdown")
-	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	key := adminKey(t, s, "exec:*")
@@ -124,7 +124,7 @@ func TestGlobalExecPolicyRefusalIsAudited(t *testing.T) {
 	if code, _ := execReq(t, s, key, `{"machine":"bcross-a","command":"shutdown -h now"}`); code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202 pending_approval", code)
 	}
-	entries, err := st.AuditList("bcross-a", 10)
+	entries, err := st.AuditList("", "bcross-a", 10)
 	if err != nil {
 		t.Fatalf("audit: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestGlobalExecPolicyRefusalIsAudited(t *testing.T) {
 // two commands, and must be judged as such.)
 func TestGlobalExecPolicyAndArgvMode(t *testing.T) {
 	s, st := newAuthTestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	key := adminKey(t, s, "exec:*")
@@ -185,7 +185,7 @@ func TestGlobalExecPolicyAndArgvMode(t *testing.T) {
 func TestGlobalExecPolicyAllowOnlyFleetWide(t *testing.T) {
 	s, st := newAuthTestServer(t)
 	s.SetExecPolicy("allowonly\nallow:uptime\nallow:df")
-	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	key := adminKey(t, s, "exec:*")

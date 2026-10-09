@@ -96,8 +96,11 @@ func DefaultClient() (*client, error) {
 }
 
 type client struct {
-	cfg  *Config
-	http *http.Client
+	// inject is the session's secret-injection name list for `mach console`,
+	// set by Console() and carried into every command the session starts.
+	inject []string
+	cfg    *Config
+	http   *http.Client
 	// pins remembers each machine's E2E key on first use. See pins.go for what
 	// that does and does not protect against.
 	pins *pinStore
@@ -263,7 +266,7 @@ func (c *client) Machines() ([]MachineInfo, error) {
 // exits with a message instead of quietly sending the command in the clear.
 // Nothing here downgrades silently — a client that thinks it is encrypting and
 // is not, is worse off than one that refuses.
-func (c *client) runExec(machine, command string, argv []string, timeout int, asJSON bool, mode E2EMode) int {
+func (c *client) runExec(machine, command string, argv, inject []string, timeout int, asJSON bool, mode E2EMode) int {
 	buildBody := func() map[string]any {
 		body := map[string]any{"machine": machine}
 		if command != "" {
@@ -273,6 +276,10 @@ func (c *client) runExec(machine, command string, argv []string, timeout int, as
 		}
 		if timeout > 0 {
 			body["timeout"] = timeout
+		}
+		if len(inject) > 0 {
+			// Names only, by construction: this client never holds the values.
+			body["inject_env"] = inject
 		}
 		return body
 	}
@@ -329,7 +336,7 @@ func (c *client) runExec(machine, command string, argv []string, timeout int, as
 					"a later change is refused until you run `mach trust %s`\n",
 					machine, KeyFingerprint(info.PubE2E), machine)
 			}
-			if code, done := c.sealedExec(machine, command, argv, timeout, asJSON, info.PubE2E, mode); done {
+			if code, done := c.sealedExec(machine, command, argv, inject, timeout, asJSON, info.PubE2E, mode); done {
 				return code
 			}
 		}
@@ -363,11 +370,19 @@ func (c *client) runExec(machine, command string, argv []string, timeout int, as
 // operator did not ask for sealing specifically); a command the server refused
 // before dispatch has not run anywhere, so that fallback cannot execute
 // anything twice.
-func (c *client) sealedExec(machine, command string, argv []string, timeout int, asJSON bool, e2ePub string, mode E2EMode) (code int, done bool) {
-	inner, _ := json.Marshal(map[string]any{
+func (c *client) sealedExec(machine, command string, argv, inject []string, timeout int, asJSON bool, e2ePub string, mode E2EMode) (code int, done bool) {
+	innerMap := map[string]any{
 		"command": command, "argv": argv,
 		"timeout": mapDefaultTimeout(timeout),
-	})
+	}
+	if len(inject) > 0 {
+		// The names ride INSIDE the seal: the control plane relays the blob
+		// blind, so it cannot apply its registry check — the machine resolves
+		// and judges them at exec time, exactly as it judges the sealed text
+		// against the mirrored fleet rules.
+		innerMap["inject_env"] = inject
+	}
+	inner, _ := json.Marshal(innerMap)
 	consoleE2E, err := newConsoleE2E()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "mach: e2e: "+err.Error())
@@ -615,16 +630,18 @@ func (c *consoleE2E) OpenB64(b64 string) ([]byte, error) {
 	return e2e.Open(&c.kp.Private, raw)
 }
 
-// Exec runs a shell-mode command (parsed once by the remote sh -c).
-func (c *client) Exec(machine, command string, timeout int, asJSON bool, e2e E2EMode) int {
-	return c.runExec(machine, command, nil, timeout, asJSON, e2e)
+// Exec runs a shell-mode command (parsed once by the remote sh -c). inject
+// names the machine's local secrets to resolve into the command's
+// environment — names only; the values never leave the target.
+func (c *client) Exec(machine, command string, inject []string, timeout int, asJSON bool, e2e E2EMode) int {
+	return c.runExec(machine, command, nil, inject, timeout, asJSON, e2e)
 }
 
 // ExecArgv runs in no-shell mode: each argument is delivered as its own
 // JSON string and exec'd directly on the machine — nothing parses anything,
 // so spaces, quotes, $, and newlines inside arguments survive exactly.
-func (c *client) ExecArgv(machine string, argv []string, timeout int, asJSON bool, e2e E2EMode) int {
-	return c.runExec(machine, "", argv, timeout, asJSON, e2e)
+func (c *client) ExecArgv(machine string, argv, inject []string, timeout int, asJSON bool, e2e E2EMode) int {
+	return c.runExec(machine, "", argv, inject, timeout, asJSON, e2e)
 }
 
 // Console is the interactive mode: streams a persistent shell session
@@ -635,7 +652,12 @@ func (c *client) ExecArgv(machine string, argv []string, timeout int, asJSON boo
 // design (see SECURITY-NOTES.md): the console never seals, whatever the E2E
 // setting is, because a live session is not a shape that can be sealed. A
 // caller who needs sealing needs `mach exec`.
-func (c *client) Console(machine string) int {
+func (c *client) Console(machine string, inject []string) int {
+	// The session's injection list is carried for every command the session
+	// starts; stdin typed later is not re-judged (there is no honest way to
+	// match a stream against anything), so the names resolve once, at each
+	// command's start, on the machine.
+	c.inject = inject
 	fmt.Printf("mach console — %s (Ctrl-C kills the remote session; Ctrl-D exits)\n", machine)
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 1<<20), 1<<20)
@@ -667,14 +689,14 @@ func (c *client) Console(machine string) int {
 			continue
 		}
 		// Live streaming path.
-		code := streamConsole(c.cfg.Server, c.cfg.APIKey, machine, line)
+		code := streamConsole(c.cfg.Server, c.cfg.APIKey, machine, line, c.inject)
 		if code == streamDialFailed {
 			// The stream endpoint could not be reached — an older control
 			// plane, typically. Falling back to buffered exec is safe here
 			// because nothing was dispatched. It is deliberately NOT done for a
 			// stream that died after starting: that command already ran on the
 			// machine, and replaying it would run it a second time.
-			code = c.Exec(machine, line, 0, false, E2EObey)
+			code = c.Exec(machine, line, c.inject, 0, false, E2EObey)
 		}
 		if code != 0 {
 			fmt.Printf("[exit %d]\n", code)

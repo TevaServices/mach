@@ -11,10 +11,10 @@ import (
 	"errors"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 
 	"github.com/TevaServices/mach/internal/store"
+	"github.com/TevaServices/mach/internal/version"
 )
 
 type orgRow struct {
@@ -33,18 +33,19 @@ type orgsData struct {
 	Notice string
 }
 
-// memberData is one org's membership view.
-//
-// Keys are split into two groups because they have no org column — scopes is a
-// free string — so membership is *derived*, and presenting a single list would
-// imply keys belong to an org when they do not.
+// memberData is one org's membership view. Keys are org-bound rows now, so
+// the org page lists exactly the keys whose binding is this org — a stored
+// fact, not a derivation from the scope text.
 type memberData struct {
 	Org        string
 	Pinned     bool
 	Machines   []fleetRow
 	ScopedKeys []store.APIKeyInfo
-	FleetKeys  []store.APIKeyInfo
-	CSRF       string
+	// CanRemove gates the remove-org form: only a superadmin sees it. An org
+	// with machines cannot be removed at all (store.DeleteOrg refuses), and
+	// a pinned org cannot be removed from the UI.
+	CanRemove bool
+	CSRF      string
 	// E2EOn is the *effective* value for this org — what a command sent to one of
 	// its machines will actually do — and E2ESource says where it came from.
 	// E2EOverridden separates "this org has its own setting" from "this org
@@ -64,23 +65,42 @@ type memberData struct {
 }
 
 func (s *Server) orgRows() ([]orgRow, error) {
-	orgs, err := s.configuredOrgs()
+	return s.orgRowsFor(nil)
+}
+
+// orgRowsFor is the org listing a session may see: nil (or an empty slice)
+// means every org — the superadmin's view and the CLI's; a session's list is
+// its member orgs. Machine counts read the stored org column, the same fact
+// enrollment wrote, rather than re-deriving membership from name prefixes.
+func (s *Server) orgRowsFor(orgs []string) ([]orgRow, error) {
+	configured, err := s.configuredOrgs()
 	if err != nil {
 		return nil, err
+	}
+	allowed := map[string]bool{}
+	for _, o := range orgs {
+		allowed[o] = true
 	}
 	machines, err := s.st.ListMachines()
 	if err != nil {
 		return nil, err
 	}
-	rows := make([]orgRow, 0, len(orgs))
-	for _, o := range orgs {
+	counts := map[string]int{}
+	for _, m := range machines {
+		counts[m.Org]++
+	}
+	rows := make([]orgRow, 0, len(configured))
+	for _, o := range configured {
+		if allowed != nil && len(allowed) > 0 && !allowed[o.Name] {
+			continue
+		}
 		// E2EMode reports the effective setting and where it came from, so a
 		// MACH_E2E pin is shown as the pin rather than as the stored value.
 		mode, source := E2EMode(s.st, o.Name)
 		rows = append(rows, orgRow{
 			Name:       o.Name,
 			Pinned:     o.Pinned,
-			Machines:   countMachinesInOrg(machines, o.Name),
+			Machines:   counts[o.Name],
 			E2EEnabled: mode == e2eOn,
 			E2ESource:  source,
 		})
@@ -88,11 +108,12 @@ func (s *Server) orgRows() ([]orgRow, error) {
 	return rows, nil
 }
 
-func (s *Server) orgMembership(org string) (memberData, error) {
-	rows, err := s.fleetRows()
+func (s *Server) orgMembership(org string, sess uiSession) (memberData, error) {
+	machines, err := s.st.ListMachinesByOrg(org)
 	if err != nil {
 		return memberData{}, err
 	}
+	online := s.br.OnlineNames()
 	data := memberData{Org: org, Pinned: s.orgPinned(org)}
 	mode, source := E2EMode(s.st, org)
 	data.E2EOn = mode == e2eOn
@@ -100,57 +121,39 @@ func (s *Server) orgMembership(org string) (memberData, error) {
 	data.E2ESource = source
 	_, data.E2EOverridden = storedE2E(s.st, e2eOrgKey(org))
 	data.E2EPinned = strings.TrimSpace(os.Getenv(e2eEnv)) != ""
-	for _, r := range rows {
-		if machineInOrg(r.Name, org) {
-			data.Machines = append(data.Machines, r)
-		}
+	for _, m := range machines {
+		data.Machines = append(data.Machines, fleetRow{
+			Name: m.Name, Hostname: m.Hostname, OS: m.OS, Arch: m.Arch,
+			AgentVer:  m.AgentVer,
+			AgentSkew: m.AgentVer != "" && m.AgentVer != version.Version,
+			Online:    online[m.Name],
+			Blocked:   m.Blocked, Revoked: m.Revoked, Temporary: m.Temporary,
+		})
 	}
-	keys, err := s.st.ListAPIKeys()
+	// Keys are org-bound rows now, so membership is a stored fact and the
+	// derived prefix-matching helpers are gone: an org page lists the keys
+	// whose binding is this org, and — for the superadmin's convenience —
+	// nothing else. There is no third bucket to leak into.
+	keys, err := s.st.ListAPIKeys(org)
 	if err != nil {
 		return memberData{}, err
 	}
-	for _, k := range keys {
-		switch {
-		case keyScopedToOrg(k.Scopes, org):
-			data.ScopedKeys = append(data.ScopedKeys, k)
-		case keyFleetWide(k.Scopes):
-			data.FleetKeys = append(data.FleetKeys, k)
-		}
-	}
+	data.ScopedKeys = keys
+	data.CanRemove = sess.isSuper() && !data.Pinned
 	return data, nil
-}
-
-// keyScopedToOrg reports whether a key's exec allowlist names a machine in this
-// org. It reuses the authorization path's own scope parser rather than splitting
-// the scope string a second way — a second parser is how a key gets reported as
-// belonging somewhere it cannot actually reach.
-func keyScopedToOrg(scopes, org string) bool {
-	allowed, all := execAllowlist(scopes)
-	if all {
-		return false // fleet-wide, so not org-scoped
-	}
-	for _, m := range allowed {
-		if machineInOrg(m, org) {
-			return true
-		}
-	}
-	return false
-}
-
-// keyFleetWide reports whether a key reaches every org. exec:* does; so do
-// readonly and enroll, which are not machine-scoped at all — readonly reads the
-// whole fleet and enroll can enroll under any configured org.
-func keyFleetWide(scopes string) bool {
-	if hasScope(scopes, "readonly") || hasScope(scopes, "enroll") {
-		return true
-	}
-	_, all := execAllowlist(scopes)
-	return all
 }
 
 // ---- actions ----
 
 func (s *Server) handleUIOrgAdd(w http.ResponseWriter, r *http.Request, sess uiSession) {
+	if !sess.isSuper() {
+		// Org management is the superadmin's power: creating an org makes a
+		// prefix enrollable, which is exactly the capability SECURITY-NOTES
+		// flags as new when it left the CLI. A non-super gets the same
+		// refusal whether or not the org exists, so the page cannot probe.
+		s.uiFail(w, r, http.StatusForbidden, "Only a superadmin can add orgs.")
+		return
+	}
 	org := strings.ToLower(strings.TrimSpace(r.PostFormValue("org")))
 	if !store.ValidOrgLabel(org) {
 		s.uiFail(w, r, http.StatusBadRequest, "an org must be 2-20 characters: letters, digits and hyphen")
@@ -176,6 +179,10 @@ func (s *Server) handleUIOrgAdd(w http.ResponseWriter, r *http.Request, sess uiS
 }
 
 func (s *Server) handleUIOrgRemove(w http.ResponseWriter, r *http.Request, sess uiSession) {
+	if !sess.isSuper() {
+		s.uiFail(w, r, http.StatusForbidden, "Only a superadmin can remove orgs.")
+		return
+	}
 	org := strings.ToLower(strings.TrimSpace(r.PostFormValue("org")))
 	if s.orgPinned(org) {
 		// A FIXED sentence, with no echo of the submitted value — every other
@@ -193,22 +200,12 @@ func (s *Server) handleUIOrgRemove(w http.ResponseWriter, r *http.Request, sess 
 		s.uiFail(w, r, http.StatusNotFound, "No org by that name.")
 		return
 	}
-	// Refused while machines exist, deliberately. Removing an org does not revoke
-	// or delete them — they keep running and their names stay taken — so the
-	// operator would silently lose the ability to replace those machines under
-	// their existing names, which is a confusing state to discover later.
-	machines, err := s.st.ListMachines()
-	if err != nil {
-		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
-		return
-	}
-	if n := countMachinesInOrg(machines, org); n > 0 {
-		s.uiFail(w, r, http.StatusConflict,
-			"org "+org+" still has "+strconv.Itoa(n)+" machine(s); block, revoke or delete them first")
-		return
-	}
+	// Refused while machines exist — the guard lives in store.DeleteOrg now,
+	// so every caller of the removal gets it, not only this handler. The
+	// error's own sentence is surfaced rather than paraphrased, because it
+	// counts the machines the operator must deal with first.
 	if err := s.st.DeleteOrg(org); err != nil {
-		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
+		s.uiFail(w, r, http.StatusConflict, err.Error())
 		return
 	}
 	s.logf("ui: org removed: %q (by %q)", org, sess.Ident.Subject)
@@ -220,6 +217,10 @@ func (s *Server) handleUIOrgE2E(w http.ResponseWriter, r *http.Request, sess uiS
 	mode := strings.ToLower(strings.TrimSpace(r.PostFormValue("mode")))
 	if !s.orgRegistered(org) {
 		s.uiFail(w, r, http.StatusNotFound, "No org by that name.")
+		return
+	}
+	if !sess.uiCanAdminOrg(org) {
+		s.uiFail(w, r, http.StatusForbidden, "Only an admin of this org can change its E2E setting.")
 		return
 	}
 	var err error
@@ -249,7 +250,7 @@ func (s *Server) handleUIOrgE2E(w http.ResponseWriter, r *http.Request, sess uiS
 	// any client still posting without the view field.
 	if strings.ToLower(strings.TrimSpace(r.PostFormValue("view"))) == "member" {
 		if r.Header.Get("HX-Request") != "" {
-			data, err := s.orgMembership(org)
+			data, err := s.orgMembership(org, sess)
 			if err != nil {
 				s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 				return

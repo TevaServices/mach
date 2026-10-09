@@ -13,7 +13,7 @@ import "testing"
 
 func TestReenrollMachineRevivesARevokedRow(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateMachine("bcross-web", "old-key", "old-host", "linux", "amd64", "v1", "olde2e", false); err != nil {
+	if err := st.CreateMachine("bcross-web", "old-key", "old-host", "linux", "amd64", "v1", "olde2e", false, "bcross"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if err := st.RevokeMachine("bcross-web"); err != nil {
@@ -57,7 +57,7 @@ func TestReenrollMachineRevivesARevokedRow(t *testing.T) {
 // in Go: an active machine's name and key must not be takeable by an enrollment.
 func TestReenrollMachineRefusesAnActiveMachine(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateMachine("bcross-web", "live-key", "host", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-web", "live-key", "host", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	ok, err := st.ReenrollMachine("bcross-web", "attacker-key", "host", "linux", "amd64", "v", "", false)
@@ -93,7 +93,7 @@ func TestReenrollMachineIsNoOpForAnUnknownName(t *testing.T) {
 // is discoverable, where quietly discarding it would not be.
 func TestReenrollMachineLeavesBlockedAlone(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateMachine("bcross-web", "k1", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-web", "k1", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if err := st.RevokeMachine("bcross-web"); err != nil {
@@ -123,7 +123,7 @@ func TestReenrollMachineLeavesBlockedAlone(t *testing.T) {
 // survivable rather than a wedged name.
 func TestReenrollTakesOverATemporaryMachine(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateMachine("bcross-tmp", "tmp-key", "h", "linux", "amd64", "v", "", true); err != nil {
+	if err := st.CreateMachine("bcross-tmp", "tmp-key", "h", "linux", "amd64", "v", "", true, "bcross"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	m, _ := st.MachineByName("bcross-tmp")
@@ -146,7 +146,7 @@ func TestReenrollTakesOverATemporaryMachine(t *testing.T) {
 // whole reason the flag is recorded per enrollment rather than set once.
 func TestPermanentEnrollmentClearsTheTemporaryFlag(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateMachine("bcross-here", "k1", "h", "linux", "amd64", "v", "", true); err != nil {
+	if err := st.CreateMachine("bcross-here", "k1", "h", "linux", "amd64", "v", "", true, "bcross"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if m, _ := st.MachineByName("bcross-here"); m == nil || !m.Temporary {
@@ -177,7 +177,7 @@ func TestPermanentEnrollmentClearsTheTemporaryFlag(t *testing.T) {
 // A temporary machine that also got revoked is takeable under either condition.
 func TestReenrollTakesOverATemporaryRevokedMachine(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateMachine("bcross-both", "k1", "h", "linux", "amd64", "v", "", true); err != nil {
+	if err := st.CreateMachine("bcross-both", "k1", "h", "linux", "amd64", "v", "", true, "bcross"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if err := st.RevokeMachine("bcross-both"); err != nil {

@@ -75,7 +75,7 @@ func TestUIActionNoticeArrivesOutOfBand(t *testing.T) {
 	s, st, p := newUITestServer(t)
 	h := s.Routes()
 	session, csrf := uiSignIn(t, s, p)
-	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -118,7 +118,7 @@ func TestUIDeleteConfirmWithoutHtmxIsAPage(t *testing.T) {
 	s, st, p := newUITestServer(t)
 	h := s.Routes()
 	session, csrf := uiSignIn(t, s, p)
-	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -221,10 +221,10 @@ func TestScopeRefusalsAreAudited(t *testing.T) {
 	s, st := newAuthTestServer(t)
 	srv := httptest.NewServer(s.Routes())
 	t.Cleanup(srv.Close)
-	if err := st.CreateMachine("bcross-web", "pub-web", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-web", "pub-web", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed web: %v", err)
 	}
-	if err := st.CreateMachine("bcross-db", "pub-db", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-db", "pub-db", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed db: %v", err)
 	}
 	// Scoped to web, probing db.
@@ -251,7 +251,7 @@ func TestScopeRefusalsAreAudited(t *testing.T) {
 
 	// Nothing was written against the machine the key *is* allowed to use: the
 	// row names what was asked for, not what was permitted.
-	if entries, _ := st.AuditList("bcross-web", 10); len(entries) != 0 {
+	if entries, _ := st.AuditList("", "bcross-web", 10); len(entries) != 0 {
 		t.Fatalf("a scope refusal was recorded against the wrong machine: %+v", entries)
 	}
 	// And the key's own machine still passes the scope gate, so recording the
@@ -266,7 +266,7 @@ func TestScopeRefusalsAreAudited(t *testing.T) {
 // code are what keep those rows distinguishable from a real command.
 func assertNotScopedRows(t *testing.T, st *store.Store, machine string, want int) {
 	t.Helper()
-	entries, err := st.AuditList(machine, 10)
+	entries, err := st.AuditList("", machine, 10)
 	if err != nil {
 		t.Fatalf("audit list: %v", err)
 	}
@@ -323,7 +323,7 @@ func TestAdminPowerComesFromTheUnrestrictedScopeOnly(t *testing.T) {
 // control is where the documentation says it is.
 func TestRegisterEndpointCountsFailedKeyAttempts(t *testing.T) {
 	s, st := newAuthTestServer(t)
-	if err := st.CreateMachine("bcross-web", "pub-web", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-web", "pub-web", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -348,7 +348,7 @@ func TestRegisterEndpointCountsFailedKeyAttempts(t *testing.T) {
 	// limit and not a lockout. (A new server: the failed attempts are keyed to
 	// the test's own loopback address and the limiter is in-memory.)
 	s2, st2 := newAuthTestServer(t)
-	if err := st2.CreateMachine("bcross-web", "pub-web", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st2.CreateMachine("bcross-web", "pub-web", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	key := adminKey(t, s2, "enroll")

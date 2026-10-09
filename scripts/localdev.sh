@@ -390,8 +390,8 @@ mint_keys() {
 	if [ -s "$KEYS_DIR/agent.key" ] && [ -s "$KEYS_DIR/console.key" ]; then return 0; fi
 	mkdir -p "$KEYS_DIR"
 	log "minting API keys (enroll for the agent, exec:* for the console)"
-	a=$(MACH_DB="$SERVER_DIR/mach.db" "$BIN_SERVER" add-api-key local-agent-enroll enroll | grep -oE 'mach_[a-f0-9]+' || true)
-	c=$(MACH_DB="$SERVER_DIR/mach.db" "$BIN_SERVER" add-api-key local-console 'exec:*' | grep -oE 'mach_[a-f0-9]+' || true)
+	a=$(MACH_DB="$SERVER_DIR/mach.db" MACH_ORG="$ORG" "$BIN_SERVER" add-api-key local-agent-enroll enroll | grep -oE 'mach_[a-f0-9]+' || true)
+	c=$(MACH_DB="$SERVER_DIR/mach.db" MACH_ORG="$ORG" "$BIN_SERVER" add-api-key local-console 'exec:*' | grep -oE 'mach_[a-f0-9]+' || true)
 	[ -n "$a" ] && [ -n "$c" ] || die "could not mint API keys"
 	printf '%s\n' "$a" >"$KEYS_DIR/agent.key"
 	printf '%s\n' "$c" >"$KEYS_DIR/console.key"

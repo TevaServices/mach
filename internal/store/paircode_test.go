@@ -43,7 +43,7 @@ func TestApprovePairingAcceptsTheCodeItReturned(t *testing.T) {
 		t.Fatalf("CreatePairing returned %q, which is not the dashed display form", code)
 	}
 
-	ok, why, err := st.ApprovePairing(id, code, "bcross-x")
+	ok, why, err := st.ApprovePairing(id, code, "bcross-x", "bcross")
 	if err != nil {
 		t.Fatalf("approve: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestApprovePairingAcceptsEitherForm(t *testing.T) {
 		if form == "normalized" {
 			submitted = NormalizeCode(code)
 		}
-		ok, why, err := st.ApprovePairing(id, submitted, "bcross-x")
+		ok, why, err := st.ApprovePairing(id, submitted, "bcross-x", "bcross")
 		if err != nil || !ok {
 			t.Fatalf("%s form refused: ok=%v why=%q err=%v", form, ok, why, err)
 		}
@@ -86,7 +86,7 @@ func TestApprovePairingStillRefusesAWrongCode(t *testing.T) {
 	} else {
 		wrong = "A" + wrong[1:]
 	}
-	ok, why, err := st.ApprovePairing(id, wrong, "bcross-x")
+	ok, why, err := st.ApprovePairing(id, wrong, "bcross-x", "bcross")
 	if err != nil {
 		t.Fatalf("approve: %v", err)
 	}

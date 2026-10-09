@@ -140,9 +140,11 @@ const enrollSource = `{{define "enroll"}}
 </table>
 </div>
 <p class="muted">Enrollment happens on the target machine: run <code>mach</code>
-there and scan the QR it prints. Orgs on this control plane:
+there and scan the QR it prints{{if .Orgs}}. Orgs you can enroll into:
 {{range .Orgs}}<code>{{.}}</code> {{end}}— names will be
-<code>&lt;org&gt;-&lt;machine&gt;</code>.</p>
+<code>&lt;org&gt;-&lt;machine&gt;</code>{{else}} — then sign in to the control
+plane UI to approve it; the machine will be assigned to your
+organization{{end}}.</p>
 {{end}}`
 
 // One template set holds both defines: "enroll" (the page body) and
@@ -214,7 +216,24 @@ func (s *Server) handleEnrollRoot(w http.ResponseWriter, r *http.Request) {
 	arch := detectArchFromUA(r.UserAgent())
 	data := s.enrollDataFor(osKey, arch, pretty)
 	data.Detected = true
-	data.Orgs = s.ListOrgs()
+	// With the UI configured, the org list is no longer public (SECURITY-NOTES
+	// gap 26 closes): a signed-in member sees the orgs they can enroll into,
+	// a superadmin sees every configured org, and an anonymous visitor is
+	// told to sign in rather than being handed the tenant namespace.
+	// Enrollment itself assigns the machine to the approver's org on the
+	// pair page. Without the UI there are no sessions and no memberships —
+	// a deployment of that shape is administered from its own host — and the
+	// page keeps the full list, exactly as it always did, for the same
+	// reason the pair page does.
+	if s.ui != nil {
+		if sess, ok := s.uiSessionFrom(r); ok {
+			if sess.isSuper() {
+				data.Orgs = s.ListOrgs()
+			} else {
+				data.Orgs = sess.memberOrgs()
+			}
+		}
+	}
 	// One string serves as both the tab title and the page's h1 (see the shell),
 	// so it is written to read as a heading: "set up this machine" addresses the
 	// person on the target host, which "a machine" did not.

@@ -115,25 +115,3 @@ func (s *Server) resolveOrgForName(name string) (string, bool) {
 	}
 	return "", false
 }
-
-// machineInOrg reports whether a machine name carries an org's prefix.
-//
-// The separator matters: "acme-2-host" belongs to org "acme-2", not to "acme",
-// and a bare strings.HasPrefix would say both. Since an org label may itself
-// contain a hyphen, the only safe test is the prefix followed by the separator.
-// Callers that need longest-match resolution use e2eflag.go's orgOf, which sorts
-// by length first; this is the membership test, where the org is already known.
-func machineInOrg(machine, org string) bool {
-	return strings.HasPrefix(machine, org+"-")
-}
-
-// countMachinesInOrg counts a machine slice's members of one org.
-func countMachinesInOrg(machines []store.Machine, org string) int {
-	n := 0
-	for _, m := range machines {
-		if machineInOrg(m.Name, org) {
-			n++
-		}
-	}
-	return n
-}

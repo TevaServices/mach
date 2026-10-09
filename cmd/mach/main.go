@@ -52,6 +52,30 @@ func main() {
 		case "register", "run", "service", "version", "help":
 			agentMain(args)
 			return
+		case "secrets":
+			// Routing by subcommand: `push` and a plain `list` talk to the
+			// control plane (the names-only registry, and the sealed-push
+			// relay); `add`, `remove`, and `list --local` manage the state
+			// dir store on this box. `mach secrets list --local` is the
+			// machine's own answer; `mach secrets list` is the registry's.
+			sub := ""
+			if len(args) >= 2 {
+				sub = args[1]
+			}
+			local := false
+			for _, a := range args[2:] {
+				if a == "--local" {
+					local = true
+				}
+			}
+			switch {
+			case sub == "push":
+				os.Exit(consoleSecretsPush(args[2:]))
+			case sub == "list" && !local:
+				os.Exit(consoleSecretsList(args[2:]))
+			default:
+				os.Exit(agent.SecretsCommand(args))
+			}
 		default:
 			usage()
 			os.Exit(2)
@@ -73,6 +97,7 @@ Run commands:              mach exec <m> <cmd...>   |   mach exec <m> -- <argv> 
 Sealed exec (E2E):         mach exec --e2e <m> <cmd...>  (fail rather than send plaintext)
                            mach trust               pinned E2E keys for each machine
 Agent:                     mach register [--server URL | --api-key K --name N], mach run, mach version
+Secrets (on a target):     mach secrets add NAME | remove NAME | list   (names only; values never printed)
 
 The control plane is a separate binary: mach-server (runs in a container).
 `)
@@ -158,6 +183,64 @@ func promptOrg() string {
 	return s
 }
 
+// consoleSecretsList implements `mach secrets list [machine]` against the
+// control plane: no machine = the registry for this key's org; a machine =
+// the names that machine itself reports, live.
+func consoleSecretsList(args []string) int {
+	cfg, err := console.LoadConfig()
+	if err != nil {
+		if isNotConfigured(err) {
+			os.Exit(console.FirstRunWizard())
+		}
+		fmt.Fprintln(os.Stderr, "mach: "+err.Error())
+		return 2
+	}
+	c := console.New(cfg)
+	machine := ""
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			machine = a
+		}
+	}
+	if machine == "" {
+		return c.SecretsRegistryList()
+	}
+	return c.SecretsMachineList(machine)
+}
+
+// consoleSecretsPush implements `mach secrets push <machine> NAME --value-file F`.
+// The value comes from a file or stdin, never argv; it is sealed to the
+// machine before it leaves this process.
+func consoleSecretsPush(args []string) int {
+	valueFile := ""
+	var positional []string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--value-file" && i+1 < len(args):
+			valueFile = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--value-file="):
+			valueFile = strings.TrimPrefix(args[i], "--value-file=")
+		default:
+			positional = append(positional, args[i])
+		}
+	}
+	if len(positional) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: mach secrets push <machine> NAME --value-file <path|->")
+		return 2
+	}
+	cfg, err := console.LoadConfig()
+	if err != nil {
+		if isNotConfigured(err) {
+			os.Exit(console.FirstRunWizard())
+		}
+		fmt.Fprintln(os.Stderr, "mach: "+err.Error())
+		return 2
+	}
+	c := console.New(cfg)
+	return c.SecretsPush(positional[0], positional[1], valueFile)
+}
+
 func consoleMain(args []string) {
 	if len(args) == 0 {
 		// Default console UI: plain fleet status (one shot).
@@ -234,19 +317,25 @@ func consoleMain(args []string) {
 		rest := args[1:]
 		asJSON := false
 		e2e := console.E2EObey
+		inject := ""
 		// Flags stop at the machine name, so nothing in a command can be
 		// swallowed as a flag. A bare -- also ends them, for scripts that
 		// want to be explicit.
 		i := 0
 		for i < len(rest) && strings.HasPrefix(rest[i], "--") {
-			switch rest[i] {
-			case "--json":
+			switch {
+			case rest[i] == "--json":
 				asJSON = true
-			case "--e2e":
+			case rest[i] == "--e2e":
 				e2e = console.E2ERequire
-			case "--no-e2e":
+			case rest[i] == "--no-e2e":
 				e2e = console.E2EForbid
-			case "--":
+			case rest[i] == "--inject" && i+1 < len(rest):
+				inject = rest[i+1]
+				i++
+			case strings.HasPrefix(rest[i], "--inject="):
+				inject = strings.TrimPrefix(rest[i], "--inject=")
+			case rest[i] == "--":
 				// explicit end of flags
 			default:
 				fmt.Fprintf(os.Stderr, "mach: unknown flag %q\n", rest[i])
@@ -255,6 +344,11 @@ func consoleMain(args []string) {
 			i++
 		}
 		rest = rest[i:]
+		injectNames, injErr := console.ParseInjectNames(inject)
+		if injErr != nil {
+			fmt.Fprintln(os.Stderr, "mach: "+injErr.Error())
+			os.Exit(2)
+		}
 		if len(rest) < 2 {
 			fmt.Fprintln(os.Stderr, `usage: mach exec [--json] [--e2e|--no-e2e] <machine> <command...>
        mach exec [--json] [--e2e|--no-e2e] <machine> -- <argv...>   (no-shell mode: args pass through byte-exact)
@@ -279,9 +373,9 @@ on stderr when it cannot.`)
 			// own JSON string and exec'd directly on the machine. Your
 			// local shell does the only quoting pass; the remote side
 			// never splits or re-parses anything.
-			os.Exit(c.ExecArgv(machine, cmdArgs[1:], 0, asJSON, e2e))
+			os.Exit(c.ExecArgv(machine, cmdArgs[1:], injectNames, 0, asJSON, e2e))
 		}
-		os.Exit(c.Exec(machine, strings.Join(cmdArgs, " "), 0, asJSON, e2e))
+		os.Exit(c.Exec(machine, strings.Join(cmdArgs, " "), injectNames, 0, asJSON, e2e))
 
 	case "console":
 		// mach console [--no-e2e] <machine>
@@ -292,14 +386,27 @@ on stderr when it cannot.`)
 				"      Use `mach exec --e2e <machine> <command>` for a sealed one-shot command.")
 			os.Exit(2)
 		}
+		inject := ""
 		if len(rest) > 0 && rest[0] == "--no-e2e" {
 			rest = rest[1:]
 		}
+		if len(rest) > 1 && rest[0] == "--inject" {
+			inject = rest[1]
+			rest = rest[2:]
+		} else if len(rest) > 0 && strings.HasPrefix(rest[0], "--inject=") {
+			inject = strings.TrimPrefix(rest[0], "--inject=")
+			rest = rest[1:]
+		}
 		if len(rest) < 1 {
-			fmt.Fprintln(os.Stderr, "usage: mach console <machine>")
+			fmt.Fprintln(os.Stderr, "usage: mach console [--inject A,B] <machine>")
 			os.Exit(2)
 		}
-		os.Exit(c.Console(rest[0]))
+		injectNames, injErr := console.ParseInjectNames(inject)
+		if injErr != nil {
+			fmt.Fprintln(os.Stderr, "mach: "+injErr.Error())
+			os.Exit(2)
+		}
+		os.Exit(c.Console(rest[0], injectNames))
 
 	case "trust":
 		// mach trust                       list pinned E2E keys

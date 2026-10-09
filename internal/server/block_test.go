@@ -107,15 +107,15 @@ func frameTypes(envs []protocol.Envelope) []string {
 	return out
 }
 
-// seedMachine enrolls a machine and returns its agent key pair.
-func seedMachine(t *testing.T, st *store.Store, mach string) (pubHex string, priv ed25519.PrivateKey) {
+// seedMachine enrolls a machine (into org) and returns its agent key pair.
+func seedMachine(t *testing.T, st *store.Store, mach, org string) (pubHex string, priv ed25519.PrivateKey) {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("keygen: %v", err)
 	}
 	pubHex = hex.EncodeToString(pub)
-	if err := st.CreateMachine(mach, pubHex, "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine(mach, pubHex, "h", "linux", "amd64", "v", "", false, org); err != nil {
 		t.Fatalf("seed machine: %v", err)
 	}
 	return pubHex, priv
@@ -126,7 +126,7 @@ func seedMachine(t *testing.T, st *store.Store, mach string) (pubHex string, pri
 // answering "machine offline or unknown" — true-sounding, and wrong.
 func TestExecRefusedWhenMachineBlocked(t *testing.T) {
 	s, st := newAuthTestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if _, err := st.SetMachineBlocked("bcross-a", true); err != nil {
@@ -152,7 +152,7 @@ func TestExecRefusedWhenMachineBlocked(t *testing.T) {
 
 	// A block that silently swallowed commands would be indistinguishable in the
 	// record from a machine that was simply idle, so the refusal is audited.
-	entries, err := st.AuditList("bcross-a", 10)
+	entries, err := st.AuditList("", "bcross-a", 10)
 	if err != nil {
 		t.Fatalf("audit list: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestExecRefusedWhenMachineRevoked(t *testing.T) {
 		t.Fatalf("the refusal does not name the revocation: %s", body)
 	}
 	// Audited like every other refusal, so the record shows the attempt.
-	entries, err := h.st.AuditList(h.mach, 10)
+	entries, err := h.st.AuditList("", h.mach, 10)
 	if err != nil {
 		t.Fatalf("audit list: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestBlockSetDuringWaitOnlineStopsTheDispatch(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	mach := "bcross-late"
-	pubHex, priv := seedMachine(t, st, mach)
+	pubHex, priv := seedMachine(t, st, mach, "bcross")
 	key := adminKey(t, s, "exec:*")
 
 	type result struct {
@@ -280,10 +280,10 @@ func TestExecAllowedWhenNotBlocked(t *testing.T) {
 // the operator's own action invisible — they could not see it to unblock it.
 func TestMachinesReportsBlocked(t *testing.T) {
 	s, st := newAuthTestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := st.CreateMachine("bcross-b", "pub-b", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-b", "pub-b", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if _, err := st.SetMachineBlocked("bcross-a", true); err != nil {
@@ -376,7 +376,7 @@ func TestBlockEndsLiveStreamSession(t *testing.T) {
 	// the command is not cancelled by the console going away, so the row says
 	// the fate is unknown rather than pretending it finished.
 	waitFor(t, 3*time.Second, func() bool {
-		entries, err := h.st.AuditList(h.mach, 10)
+		entries, err := h.st.AuditList("", h.mach, 10)
 		if err != nil {
 			return false
 		}
@@ -429,7 +429,7 @@ func TestStreamStdinRefusedWhenBlocked(t *testing.T) {
 // pipeline must never reach one.
 func TestAdminBlockRequiresExecStar(t *testing.T) {
 	s, st := newAuthTestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	body := `{"machine":"bcross-a","blocked":true}`
@@ -457,7 +457,7 @@ func TestAdminBlockRequiresExecStar(t *testing.T) {
 // request must never change a machine's state.
 func TestAdminBlockRejectsMissingField(t *testing.T) {
 	s, st := newAuthTestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if _, err := st.SetMachineBlocked("bcross-a", true); err != nil {
@@ -487,7 +487,7 @@ func TestDeleteNotifiesAgentAndFreesName(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	mach := "bcross-gone"
-	pubHex, priv := seedMachine(t, st, mach)
+	pubHex, priv := seedMachine(t, st, mach, "bcross")
 	ws := dialAgent(t, srv.URL, mach, pubHex, priv)
 	frames := readAgentFrames(ws)
 
@@ -525,7 +525,7 @@ func TestDeleteNotifiesAgentAndFreesName(t *testing.T) {
 	}
 	// The name and the key material are free to enroll again — the recovery path
 	// revocation deliberately cannot express.
-	if err := st.CreateMachine(mach, pubHex, "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine(mach, pubHex, "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("re-enroll with the freed name and key: %v", err)
 	}
 }

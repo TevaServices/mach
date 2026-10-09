@@ -238,6 +238,11 @@ func RunEphemeral(server, org string) error {
 	if err := LoadLocalPolicy(); err != nil {
 		return err
 	}
+	// The temporary session's secrets store is memory only (invariant 23):
+	// injection works from memory, a control-plane push is refused, and
+	// nothing touches the state directory this mode refuses to write. The
+	// org comes from the enrollment response, not from the name's prefix.
+	installSecrets(newMemSecretStore(cfg.Org))
 	DropPrivileges()
 
 	ctl := newSessionCtl()
