@@ -13,7 +13,7 @@ import (
 
 func TestCommandApprovalCreateAndPendingLookup(t *testing.T) {
 	st := testStore(t)
-	id, err := st.CreateCommandApproval("bcross-web", "echo hello  world", "echo hello world", ApprovalScopeOnce, "console:ops")
+	id, err := st.CreateCommandApproval("bcross", "bcross-web", "echo hello  world", "echo hello world", ApprovalScopeOnce, "console:ops")
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -41,8 +41,8 @@ func TestCommandApprovalCreateAndPendingLookup(t *testing.T) {
 
 func TestCommandApprovalApproveAndDeny(t *testing.T) {
 	st := testStore(t)
-	approvedID, _ := st.CreateCommandApproval("bcross-web", "echo a", "echo a", ApprovalScopeOnce, "console:ops")
-	deniedID, _ := st.CreateCommandApproval("bcross-web", "echo b", "echo b", ApprovalScopeOnce, "console:ops")
+	approvedID, _ := st.CreateCommandApproval("bcross", "bcross-web", "echo a", "echo a", ApprovalScopeOnce, "console:ops")
+	deniedID, _ := st.CreateCommandApproval("bcross", "bcross-web", "echo b", "echo b", ApprovalScopeOnce, "console:ops")
 
 	if err := st.ApproveCommandApproval(approvedID, ApprovalScopeOnce); err != nil {
 		t.Fatalf("approve: %v", err)
@@ -75,7 +75,7 @@ func TestCommandApprovalApproveAndDeny(t *testing.T) {
 
 func TestCommandApprovalScopeUpgrade(t *testing.T) {
 	st := testStore(t)
-	id, _ := st.CreateCommandApproval("bcross-web", "echo a", "echo a", ApprovalScopeOnce, "console:ops")
+	id, _ := st.CreateCommandApproval("bcross", "bcross-web", "echo a", "echo a", ApprovalScopeOnce, "console:ops")
 	if err := st.ApproveCommandApproval(id, ApprovalScopeSession); err != nil {
 		t.Fatalf("approve as session: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestCommandApprovalScopeUpgrade(t *testing.T) {
 		t.Fatalf("session = %q, want the machine name", a.Session)
 	}
 	// An 'once' approval carries no session.
-	onceID, _ := st.CreateCommandApproval("bcross-web", "echo b", "echo b", ApprovalScopeOnce, "console:ops")
+	onceID, _ := st.CreateCommandApproval("bcross", "bcross-web", "echo b", "echo b", ApprovalScopeOnce, "console:ops")
 	if err := st.ApproveCommandApproval(onceID, ApprovalScopeOnce); err != nil {
 		t.Fatalf("approve as once: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestCommandApprovalScopeUpgrade(t *testing.T) {
 
 func TestCommandApprovalFinalizedGuard(t *testing.T) {
 	st := testStore(t)
-	id, _ := st.CreateCommandApproval("bcross-web", "echo a", "echo a", ApprovalScopeOnce, "console:ops")
+	id, _ := st.CreateCommandApproval("bcross", "bcross-web", "echo a", "echo a", ApprovalScopeOnce, "console:ops")
 	if err := st.DenyCommandApproval(id); err != nil {
 		t.Fatalf("deny: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestCommandApprovalFinalizedGuard(t *testing.T) {
 		t.Fatalf("deny after deny = %v, want ErrApprovalFinalized", err)
 	}
 	// An unknown scope is refused rather than stored.
-	id2, _ := st.CreateCommandApproval("bcross-web", "echo b", "echo b", ApprovalScopeOnce, "console:ops")
+	id2, _ := st.CreateCommandApproval("bcross", "bcross-web", "echo b", "echo b", ApprovalScopeOnce, "console:ops")
 	if err := st.ApproveCommandApproval(id2, "forever"); err == nil {
 		t.Fatal("approved with an unknown scope")
 	}
@@ -125,9 +125,9 @@ func TestCommandApprovalFinalizedGuard(t *testing.T) {
 
 func TestCommandApprovalListByStatus(t *testing.T) {
 	st := testStore(t)
-	a1, _ := st.CreateCommandApproval("bcross-web", "echo 1", "echo 1", ApprovalScopeOnce, "console:ops")
-	a2, _ := st.CreateCommandApproval("bcross-web", "echo 2", "echo 2", ApprovalScopeOnce, "console:ops")
-	a3, _ := st.CreateCommandApproval("bcross-web", "echo 3", "echo 3", ApprovalScopeOnce, "console:ops")
+	a1, _ := st.CreateCommandApproval("bcross", "bcross-web", "echo 1", "echo 1", ApprovalScopeOnce, "console:ops")
+	a2, _ := st.CreateCommandApproval("bcross", "bcross-web", "echo 2", "echo 2", ApprovalScopeOnce, "console:ops")
+	a3, _ := st.CreateCommandApproval("bcross", "bcross-web", "echo 3", "echo 3", ApprovalScopeOnce, "console:ops")
 	// Approve in an order different from creation, so "newest first" is
 	// observable rather than coincidental with insertion order.
 	if err := st.ApproveCommandApproval(a2, ApprovalScopeOnce); err != nil {
@@ -137,32 +137,32 @@ func TestCommandApprovalListByStatus(t *testing.T) {
 		t.Fatalf("deny: %v", err)
 	}
 
-	all, err := st.ListCommandApprovals("", 10)
+	all, err := st.ListCommandApprovals("", "", 10)
 	if err != nil {
 		t.Fatalf("list all: %v", err)
 	}
 	if len(all) != 3 || all[0].ID != a3 || all[1].ID != a2 || all[2].ID != a1 {
 		t.Fatalf("list all = %v, want newest first", ids(all))
 	}
-	approved, _ := st.ListCommandApprovals("approved", 10)
+	approved, _ := st.ListCommandApprovals("bcross", "approved", 10)
 	if len(approved) != 1 || approved[0].ID != a2 {
 		t.Fatalf("list approved = %v, want just %d", ids(approved), a2)
 	}
-	pending, _ := st.ListCommandApprovals("pending", 10)
+	pending, _ := st.ListCommandApprovals("bcross", "pending", 10)
 	if len(pending) != 1 || pending[0].ID != a1 {
 		t.Fatalf("list pending = %v, want just %d", ids(pending), a1)
 	}
-	denied, _ := st.ListCommandApprovals("denied", 10)
+	denied, _ := st.ListCommandApprovals("bcross", "denied", 10)
 	if len(denied) != 1 || denied[0].ID != a3 {
 		t.Fatalf("list denied = %v, want just %d", ids(denied), a3)
 	}
 	// "all" is the same as empty.
-	got, _ := st.ListCommandApprovals("all", 10)
+	got, _ := st.ListCommandApprovals("bcross", "all", 10)
 	if len(got) != 3 {
 		t.Fatalf("list all = %v, want 3 rows", ids(got))
 	}
 	// And the limit is honoured.
-	limited, _ := st.ListCommandApprovals("", 1)
+	limited, _ := st.ListCommandApprovals("", "", 1)
 	if len(limited) != 1 || limited[0].ID != a3 {
 		t.Fatalf("limited list = %v, want only the newest", ids(limited))
 	}
@@ -178,7 +178,7 @@ func ids(as []CommandApproval) []int64 {
 
 func TestCommandApprovalConsumeIsOnce(t *testing.T) {
 	st := testStore(t)
-	id, _ := st.CreateCommandApproval("bcross-web", "echo a", "echo a", ApprovalScopeOnce, "console:ops")
+	id, _ := st.CreateCommandApproval("bcross", "bcross-web", "echo a", "echo a", ApprovalScopeOnce, "console:ops")
 	if err := st.ApproveCommandApproval(id, ApprovalScopeOnce); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
@@ -205,9 +205,9 @@ func TestCommandApprovalConsumeIsOnce(t *testing.T) {
 
 func TestApprovalsForSessionWipe(t *testing.T) {
 	st := testStore(t)
-	s1, _ := st.CreateCommandApproval("bcross-web", "echo a", "echo a", ApprovalScopeOnce, "console:ops")
-	s2, _ := st.CreateCommandApproval("bcross-web", "echo b", "echo b", ApprovalScopeOnce, "console:ops")
-	other, _ := st.CreateCommandApproval("bcross-db", "echo c", "echo c", ApprovalScopeOnce, "console:ops")
+	s1, _ := st.CreateCommandApproval("bcross", "bcross-web", "echo a", "echo a", ApprovalScopeOnce, "console:ops")
+	s2, _ := st.CreateCommandApproval("bcross", "bcross-web", "echo b", "echo b", ApprovalScopeOnce, "console:ops")
+	other, _ := st.CreateCommandApproval("bcross", "bcross-db", "echo c", "echo c", ApprovalScopeOnce, "console:ops")
 	if err := st.ApproveCommandApproval(s1, ApprovalScopeSession); err != nil {
 		t.Fatalf("approve session: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestApprovalsForSessionWipe(t *testing.T) {
 		t.Fatalf("approve session (other machine): %v", err)
 	}
 	// A pending 'once' row on the same machine is not session-scoped and stays.
-	pending, _ := st.CreateCommandApproval("bcross-web", "echo d", "echo d", ApprovalScopeOnce, "console:ops")
+	pending, _ := st.CreateCommandApproval("bcross", "bcross-web", "echo d", "echo d", ApprovalScopeOnce, "console:ops")
 
 	n, err := st.ApprovalsForSession("bcross-web")
 	if err != nil || n != 2 {
@@ -240,9 +240,9 @@ func TestApprovalsForSessionWipe(t *testing.T) {
 
 func TestCleanupCommandApprovals(t *testing.T) {
 	st := testStore(t)
-	old1, _ := st.CreateCommandApproval("bcross-web", "echo old-1", "echo old-1", ApprovalScopeOnce, "console:ops")
-	old2, _ := st.CreateCommandApproval("bcross-web", "echo old-2", "echo old-2", ApprovalScopeOnce, "console:ops")
-	fresh, _ := st.CreateCommandApproval("bcross-web", "echo fresh", "echo fresh", ApprovalScopeOnce, "console:ops")
+	old1, _ := st.CreateCommandApproval("bcross", "bcross-web", "echo old-1", "echo old-1", ApprovalScopeOnce, "console:ops")
+	old2, _ := st.CreateCommandApproval("bcross", "bcross-web", "echo old-2", "echo old-2", ApprovalScopeOnce, "console:ops")
+	fresh, _ := st.CreateCommandApproval("bcross", "bcross-web", "echo fresh", "echo fresh", ApprovalScopeOnce, "console:ops")
 	if err := st.DenyCommandApproval(old1); err != nil {
 		t.Fatalf("deny: %v", err)
 	}
@@ -259,7 +259,7 @@ func TestCleanupCommandApprovals(t *testing.T) {
 	if err := ageApproval(st, old2, 25*time.Hour); err != nil {
 		t.Fatalf("age old2: %v", err)
 	}
-	aged, _ := st.CreateCommandApproval("bcross-web", "echo aged-pending", "echo aged-pending", ApprovalScopeOnce, "console:ops")
+	aged, _ := st.CreateCommandApproval("bcross", "bcross-web", "echo aged-pending", "echo aged-pending", ApprovalScopeOnce, "console:ops")
 	if err := ageApproval(st, aged, 25*time.Hour); err != nil {
 		t.Fatalf("age aged: %v", err)
 	}

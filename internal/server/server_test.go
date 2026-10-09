@@ -100,18 +100,18 @@ func bearerJSON(t *testing.T, h http.Handler, method, target, key string, body s
 func TestConsoleAPIAuthz(t *testing.T) {
 	s, st := newAuthTestServer(t)
 	h := s.Routes()
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "arm64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "arm64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed machine: %v", err)
 	}
-	if err := st.CreateMachine("other-b", "pub-b", "h", "linux", "arm64", "v", "", false); err != nil {
+	if err := st.CreateMachine("other-b", "pub-b", "h", "linux", "arm64", "v", "", false, "other"); err != nil {
 		t.Fatalf("seed machine: %v", err)
 	}
-	_ = st.AuditInsert("2026-01-01T00:00:00Z", "bcross-a", "echo hi", "console:x", sql.NullInt64{Int64: 0, Valid: true}, "hi", "")
-	_ = st.AuditInsert("2026-01-01T00:00:01Z", "other-b", "echo other", "console:x", sql.NullInt64{Int64: 0, Valid: true}, "other", "")
+	_ = st.AuditInsert("2026-01-01T00:00:00Z", "bcross", "bcross-a", "echo hi", "console:x", sql.NullInt64{Int64: 0, Valid: true}, "hi", "")
+	_ = st.AuditInsert("2026-01-01T00:00:01Z", "other", "other-b", "echo other", "console:x", sql.NullInt64{Int64: 0, Valid: true}, "other", "")
 
 	mk := func(name, scopes string) string {
 		key := "mach_" + store.RandToken(24)
-		if err := st.CreateAPIKey(name, key, scopes); err != nil {
+		if err := st.CreateAPIKey(name, key, scopes, ""); err != nil {
 			t.Fatalf("create key %s: %v", name, err)
 		}
 		return key

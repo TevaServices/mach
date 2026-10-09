@@ -203,8 +203,9 @@ type approvalPendingResponse struct {
 // pending record to create. It reports whether the caller may proceed to
 // dispatch (and whether the dispatch is an approved exception to the mirrored
 // fleet ruleset); when it returns false, the response is already written.
-func (s *Server) execPolicyGate(w http.ResponseWriter, req *protocol.ExecRequest, display, keyName, reason string) (dispatch, fleetApproved bool) {
+func (s *Server) execPolicyGate(w http.ResponseWriter, req *protocol.ExecRequest, display, keyName, keyOrg, reason string) (dispatch, fleetApproved bool) {
 	machine := req.Machine
+	org := s.auditOrgFor(machine, keyOrg)
 	normKey := normalizedCommandKey(req.Command, req.Argv)
 	source := "console:" + keyName
 
@@ -262,17 +263,17 @@ func (s *Server) execPolicyGate(w http.ResponseWriter, req *protocol.ExecRequest
 	// answer 202. The request does NOT wait: the console reports the pending
 	// approval and stops, an operator decides out of band, and the console
 	// re-runs the command — at which point step 1 dispatches it.
-	id, err := s.st.CreateCommandApproval(machine, display, normKey, store.ApprovalScopeOnce, source)
+	id, err := s.st.CreateCommandApproval(org, machine, display, normKey, store.ApprovalScopeOnce, source)
 	if err != nil {
 		// Fail closed: without a record there is nothing an operator could
 		// approve, so this stays a plain policy refusal.
-		s.auditRow(machine, display, source, sqlNullInt(execRefused), "", reason)
+		s.auditRow(org, machine, display, source, sqlNullInt(execRefused), "", reason)
 		writeJSON(w, http.StatusForbidden, map[string]string{
 			"error": "blocked by the server's global exec policy: " + reason})
 		return false, false
 	}
 	s.registerApprovalWaiter(id, machine, normKey, display, source)
-	s.auditRow(machine, display, source, sqlNullInt(execRefused), "", "awaiting operator approval: "+reason)
+	s.auditRow(org, machine, display, source, sqlNullInt(execRefused), "", "awaiting operator approval: "+reason)
 	writeJSON(w, http.StatusAccepted, approvalPendingResponse{
 		Status: "pending_approval", ApprovalID: id, Machine: machine,
 		Command: display, Reason: reason, Timeout: int(approvalPromptTimeout / time.Second),
@@ -287,7 +288,7 @@ func (s *Server) execPolicyGate(w http.ResponseWriter, req *protocol.ExecRequest
 // typed approval_needed frame plus an ExitApprovalPending stream_end, and ends
 // this command. The console decides what to do; a re-sent exec_stream is a new
 // command and reaches step 1 above like any other attempt.
-func (s *Server) streamExecPolicyGate(consoleConn *protocol.WSConn, machine, display, source string, start *protocol.StreamStart, reason string) (dispatch, fleetApproved bool) {
+func (s *Server) streamExecPolicyGate(consoleConn *protocol.WSConn, org, machine, display, source string, start *protocol.StreamStart, reason string) (dispatch, fleetApproved bool) {
 	normKey := normalizedCommandKey(start.Command, start.Argv)
 	if s.tryApprovedApproval(machine, normKey) {
 		return true, true
@@ -295,17 +296,17 @@ func (s *Server) streamExecPolicyGate(consoleConn *protocol.WSConn, machine, dis
 	// An existing pending record is reused rather than duplicated: the console
 	// is told the SAME id it may already be showing.
 	if p, err := s.st.PendingCommandApproval(machine, normKey); err == nil && p != nil {
-		s.sendStreamApprovalNeeded(consoleConn, machine, display, source, p.ID, reason)
+		s.sendStreamApprovalNeeded(consoleConn, org, machine, display, source, p.ID, reason)
 		return false, false
 	}
-	id, err := s.st.CreateCommandApproval(machine, display, normKey, store.ApprovalScopeOnce, source)
+	id, err := s.st.CreateCommandApproval(org, machine, display, normKey, store.ApprovalScopeOnce, source)
 	if err != nil {
-		s.auditRow(machine, display, source, sqlNullInt(execRefused), "", reason)
+		s.auditRow(org, machine, display, source, sqlNullInt(execRefused), "", reason)
 		s.streamRefuse(consoleConn, machine, "blocked by the server's global exec policy: "+reason)
 		return false, false
 	}
 	s.registerApprovalWaiter(id, machine, normKey, display, source)
-	s.sendStreamApprovalNeeded(consoleConn, machine, display, source, id, reason)
+	s.sendStreamApprovalNeeded(consoleConn, org, machine, display, source, id, reason)
 	return false, false
 }
 
@@ -313,8 +314,8 @@ func (s *Server) streamExecPolicyGate(consoleConn *protocol.WSConn, machine, dis
 // approval pending: the typed frame carries the id to approve, and the
 // terminal record ends the command with the approval-pending status so a
 // script sees a distinct exit rather than a silent nothing.
-func (s *Server) sendStreamApprovalNeeded(consoleConn *protocol.WSConn, machine, display, source string, id int64, reason string) {
-	s.auditRow(machine, display, source, sqlNullInt(execRefused), "", "awaiting operator approval: "+reason)
+func (s *Server) sendStreamApprovalNeeded(consoleConn *protocol.WSConn, org, machine, display, source string, id int64, reason string) {
+	s.auditRow(org, machine, display, source, sqlNullInt(execRefused), "", "awaiting operator approval: "+reason)
 	payload, _ := json.Marshal(protocol.StreamApprovalNeeded{
 		ApprovalID: id, Command: display, Reason: reason,
 		Timeout: int(approvalPromptTimeout / time.Second),
@@ -375,8 +376,10 @@ func approvalIDFromPath(r *http.Request) (int64, bool) {
 	return id, true
 }
 
-// handleListApprovals serves the approval queue an operator acts on.
-func (s *Server) handleListApprovals(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
+// handleListApprovals serves the approval queue an operator acts on. A
+// tenant key's queue is its org's rows — the store filters, so the boundary
+// is the query and not this handler's good intentions.
+func (s *Server) handleListApprovals(w http.ResponseWriter, r *http.Request, keyName, scopes, keyOrg string) {
 	if !adminScopeOK(scopes) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key lacks approval scope"})
 		return
@@ -397,7 +400,7 @@ func (s *Server) handleListApprovals(w http.ResponseWriter, r *http.Request, key
 			limit = n
 		}
 	}
-	rows, err := s.st.ListCommandApprovals(status, limit)
+	rows, err := s.st.ListCommandApprovals(keyOrg, status, limit)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
@@ -409,6 +412,7 @@ func (s *Server) handleListApprovals(w http.ResponseWriter, r *http.Request, key
 	type approvalJSON struct {
 		ID        int64  `json:"id"`
 		Machine   string `json:"machine"`
+		Org       string `json:"org,omitempty"`
 		Command   string `json:"command"`
 		Scope     string `json:"scope"`
 		Session   string `json:"session"`
@@ -419,7 +423,7 @@ func (s *Server) handleListApprovals(w http.ResponseWriter, r *http.Request, key
 	out := make([]approvalJSON, 0, len(rows))
 	for _, a := range rows {
 		out = append(out, approvalJSON{
-			ID: a.ID, Machine: a.Machine, Command: a.Command, Scope: a.Scope,
+			ID: a.ID, Machine: a.Machine, Org: a.Org, Command: a.Command, Scope: a.Scope,
 			Session: a.Session, Status: a.Status, CreatedAt: a.CreatedAt, ExpiresAt: a.ExpiresAt,
 		})
 	}
@@ -428,7 +432,7 @@ func (s *Server) handleListApprovals(w http.ResponseWriter, r *http.Request, key
 
 // handleApproveApproval grants a pending approval. The scope may upgrade a
 // 'once' request to 'session' in the same decision.
-func (s *Server) handleApproveApproval(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
+func (s *Server) handleApproveApproval(w http.ResponseWriter, r *http.Request, keyName, scopes, keyOrg string) {
 	if !adminScopeOK(scopes) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key lacks approval scope"})
 		return
@@ -448,7 +452,7 @@ func (s *Server) handleApproveApproval(w http.ResponseWriter, r *http.Request, k
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
 	}
-	if ap == nil {
+	if ap == nil || !approvalInOrg(ap, keyOrg) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown approval"})
 		return
 	}
@@ -467,7 +471,7 @@ func (s *Server) handleApproveApproval(w http.ResponseWriter, r *http.Request, k
 // handleDenyApproval refuses a pending approval. The row stays as the record;
 // a console waiting on it is woken and told, and future attempts of the same
 // command go through the policy refusal path again.
-func (s *Server) handleDenyApproval(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
+func (s *Server) handleDenyApproval(w http.ResponseWriter, r *http.Request, keyName, scopes, keyOrg string) {
 	if !adminScopeOK(scopes) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key lacks approval scope"})
 		return
@@ -482,7 +486,7 @@ func (s *Server) handleDenyApproval(w http.ResponseWriter, r *http.Request, keyN
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
 	}
-	if ap == nil {
+	if ap == nil || !approvalInOrg(ap, keyOrg) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown approval"})
 		return
 	}
@@ -498,7 +502,7 @@ func (s *Server) handleDenyApproval(w http.ResponseWriter, r *http.Request, keyN
 	// re-read in the gate is what actually decides, so an empty decision is
 	// enough to end the wait promptly.
 	s.resolveApproval(id, approvalDecision{})
-	s.auditRow(ap.Machine, ap.Command, "admin:"+keyName, sqlNullInt(0), "", "command approval denied")
+	s.auditRow(ap.Org, ap.Machine, ap.Command, "admin:"+keyName, sqlNullInt(0), "", "command approval denied")
 	s.logf("command approval %d denied for %q (by %s)", id, ap.Machine, "admin:"+keyName)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": "denied", "approval_id": id})
 }
@@ -509,8 +513,20 @@ func (s *Server) handleDenyApproval(w http.ResponseWriter, r *http.Request, keyN
 // before this runs, so a woken console re-reads the row and finds it approved.
 func (s *Server) grantApproval(ap *store.CommandApproval, scope, source, detail string) {
 	s.resolveApproval(ap.ID, approvalDecision{Approved: true, Scope: scope})
-	s.auditRow(ap.Machine, ap.Command, source, sqlNullInt(0), "", detail)
+	s.auditRow(ap.Org, ap.Machine, ap.Command, source, sqlNullInt(0), "", detail)
 	s.logf("command approval %d granted (%s) for %q (by %s)", ap.ID, scope, ap.Machine, source)
+}
+
+// approvalInOrg reports whether a key with the given org binding may even
+// see this approval row, let alone decide it. A tenant's queue is its own;
+// an approval of another org is an unknown approval — the same answer an
+// absent id gets, so a scoped key cannot probe the queue's contents by id.
+// keyOrg "" (a pre-binding key) sees everything, as it always did.
+func approvalInOrg(ap *store.CommandApproval, keyOrg string) bool {
+	if keyOrg == "" {
+		return true
+	}
+	return ap.Org == keyOrg
 }
 
 // ---- web UI ----
@@ -518,7 +534,7 @@ func (s *Server) grantApproval(ap *store.CommandApproval, scope, source, detail 
 // handleUIApprovals renders the pending-approvals fragment on its own, for the
 // no-JS path and for anything that wants the panel without the fleet table.
 func (s *Server) handleUIApprovals(w http.ResponseWriter, r *http.Request, sess uiSession) {
-	rows, err := s.pendingApprovalRows()
+	rows, err := s.pendingApprovalRowsFor(sess)
 	if err != nil {
 		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 		return
@@ -548,7 +564,9 @@ func (s *Server) uiApprovalDecision(w http.ResponseWriter, r *http.Request, sess
 		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 		return
 	}
-	if ap == nil {
+	if ap == nil || (!sess.isSuper() && !sess.uiCanActOnOrg(ap.Org)) {
+		// Same answer for an absent row and someone else's row: the queue's
+		// ids cannot be probed from a session that cannot decide them.
 		s.uiFail(w, r, http.StatusNotFound, "No approval by that id.")
 		return
 	}
@@ -599,7 +617,7 @@ func (s *Server) uiApprovalDecision(w http.ResponseWriter, r *http.Request, sess
 // no-JS gets the redirect.
 func (s *Server) approvalRefresh(w http.ResponseWriter, r *http.Request, sess uiSession, noticeCode string) {
 	if r.Header.Get("HX-Request") != "" {
-		rows, err := s.pendingApprovalRows()
+		rows, err := s.pendingApprovalRowsFor(sess)
 		if err != nil {
 			s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 			return
@@ -623,10 +641,22 @@ func (s *Server) uiApprovalFailure(w http.ResponseWriter, r *http.Request, err e
 }
 
 // pendingApprovalRows loads the pending queue for the fleet page's approvals
-// panel. Bounded the same way the API listing is: a page is not a place to
-// render an unbounded table.
-func (s *Server) pendingApprovalRows() ([]store.CommandApproval, error) {
-	return s.st.ListCommandApprovals("pending", 50)
+// panel, scoped to what the session may decide: a superadmin sees every
+// org's queue, everyone else sees their own orgs'. Bounded the same way the
+// API listing is: a page is not a place to render an unbounded table.
+func (s *Server) pendingApprovalRowsFor(sess uiSession) ([]store.CommandApproval, error) {
+	if sess.isSuper() {
+		return s.st.ListCommandApprovals("", "pending", 50)
+	}
+	rows := make([]store.CommandApproval, 0, 8)
+	for _, org := range sess.memberOrgs() {
+		orgRows, err := s.st.ListCommandApprovals(org, "pending", 50)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, orgRows...)
+	}
+	return rows, nil
 }
 
 // approvalsData is the panel's view model: the pending queue, the per-session

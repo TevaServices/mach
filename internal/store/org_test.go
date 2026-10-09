@@ -98,7 +98,7 @@ func TestAPIKeyInfoHasNoSecretFields(t *testing.T) {
 			t.Fatalf("APIKeyInfo exposes a secret-bearing field %q; the org membership view renders this struct", typ.Field(i).Name)
 		}
 	}
-	want := map[string]bool{"Name": true, "Scopes": true, "CreatedAt": true, "Revoked": true}
+	want := map[string]bool{"Name": true, "Org": true, "Scopes": true, "CreatedAt": true, "Revoked": true}
 	if typ.NumField() != len(want) {
 		t.Fatalf("APIKeyInfo has %d fields; update this test deliberately if that is intended", typ.NumField())
 	}
@@ -111,14 +111,14 @@ func TestAPIKeyInfoHasNoSecretFields(t *testing.T) {
 
 func TestListAPIKeys(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateAPIKey("deploy", "mach_"+RandToken(24), "enroll"); err != nil {
+	if err := st.CreateAPIKey("deploy", "mach_"+RandToken(24), "enroll", "bcross"); err != nil {
 		t.Fatalf("create key: %v", err)
 	}
-	if err := st.CreateAPIKey("ops", "mach_"+RandToken(24), "exec:*"); err != nil {
+	if err := st.CreateAPIKey("ops", "mach_"+RandToken(24), "exec:*", "bcross"); err != nil {
 		t.Fatalf("create key: %v", err)
 	}
 
-	keys, err := st.ListAPIKeys()
+	keys, err := st.ListAPIKeys("")
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -143,10 +143,10 @@ func TestListAPIKeys(t *testing.T) {
 
 	// The listing must not weaken the bearer-key path it sits beside.
 	secret := "mach_" + RandToken(24)
-	if err := st.CreateAPIKey("probe", secret, "readonly"); err != nil {
+	if err := st.CreateAPIKey("probe", secret, "readonly", "bcross"); err != nil {
 		t.Fatalf("create key: %v", err)
 	}
-	keys, _ = st.ListAPIKeys()
+	keys, _ = st.ListAPIKeys("")
 	for _, k := range keys {
 		if strings.Contains(k.Name, secret) || strings.Contains(k.Scopes, secret) {
 			t.Fatal("listing leaked the key secret")
@@ -160,7 +160,7 @@ func TestListAPIKeys(t *testing.T) {
 	if hashes != 3 {
 		t.Fatalf("expected 3 keyed rows to carry hashes, got %d", hashes)
 	}
-	if ok, _, _, err := st.APIKeyExists(secret); err != nil || !ok {
+	if ok, _, _, _, err := st.APIKeyExists(secret); err != nil || !ok {
 		t.Fatalf("the key still authenticates: ok=%v err=%v", ok, err)
 	}
 }

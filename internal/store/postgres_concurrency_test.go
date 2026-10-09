@@ -57,7 +57,7 @@ func TestPostgresConcurrentEnrollOfOneName(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			errs[i] = st.CreateMachine("pg-race", "pub", "h", "linux", "amd64", "v", "", false)
+			errs[i] = st.CreateMachine("pg-race", "pub", "h", "linux", "amd64", "v", "", false, "pg")
 		}(i)
 	}
 	wg.Wait()
@@ -95,7 +95,7 @@ func isDuplicateKey(err error) bool {
 // there must still be exactly one row.
 func TestPostgresConcurrentTakeoverOfOneRow(t *testing.T) {
 	st := postgresStore(t)
-	if err := st.CreateMachine("pg-take", "old", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("pg-take", "old", "h", "linux", "amd64", "v", "", false, "pg"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := st.RevokeMachine("pg-take"); err != nil {
@@ -144,7 +144,7 @@ func TestPostgresConcurrentTakeoverOfOneRow(t *testing.T) {
 // fails if anyone ever loosens it to a caller-side check.
 func TestPostgresTakeoverNeverDisplacesAnActiveMachine(t *testing.T) {
 	st := postgresStore(t)
-	if err := st.CreateMachine("pg-live", "live", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("pg-live", "live", "h", "linux", "amd64", "v", "", false, "pg"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	var wg sync.WaitGroup
@@ -177,14 +177,14 @@ func TestPostgresConcurrentAuditInserts(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := st.AuditInsert(time.Now().UTC().Format(time.RFC3339), "pg-a",
+			if err := st.AuditInsert(time.Now().UTC().Format(time.RFC3339), "pg", "pg-a",
 				"echo hi", "console:test", sql.NullInt64{Int64: 0, Valid: true}, "out", ""); err != nil {
 				t.Errorf("audit insert: %v", err)
 			}
 		}()
 	}
 	wg.Wait()
-	e, err := st.AuditList("pg-a", 50)
+	e, err := st.AuditList("pg", "pg-a", 50)
 	if err != nil || len(e) != 16 {
 		t.Fatalf("audit rows = %d (%v), want 16", len(e), err)
 	}

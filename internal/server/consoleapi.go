@@ -16,7 +16,12 @@ import (
 // authConsole requires a valid API key (Bearer) and rate-limits failures.
 // Only FAILED attempts count toward the limit — successful requests from a
 // busy CI box must never trip the limiter.
-func (s *Server) authConsole(next func(w http.ResponseWriter, r *http.Request, keyName, scopes string)) http.HandlerFunc {
+//
+// The key's org binding travels with the request into every handler: it is
+// the tenant the key belongs to, and every machine name the handler sees is
+// resolved within it. The binding lives in the api_keys row, so a key cannot
+// present an org it does not hold.
+func (s *Server) authConsole(next func(w http.ResponseWriter, r *http.Request, keyName, scopes, keyOrg string)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		const prefix = "Bearer "
@@ -29,7 +34,7 @@ func (s *Server) authConsole(next func(w http.ResponseWriter, r *http.Request, k
 			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many failed auth attempts"})
 			return
 		}
-		ok, name, scopes, err := s.st.APIKeyExists(auth[len(prefix):])
+		ok, name, scopes, keyOrg, err := s.st.APIKeyExists(auth[len(prefix):])
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 			return
@@ -39,7 +44,14 @@ func (s *Server) authConsole(next func(w http.ResponseWriter, r *http.Request, k
 			s.authFail(w, "invalid api key")
 			return
 		}
-		next(w, r, name, scopes)
+		if keyOrg == "" {
+			// A key minted before orgs were bindings, on a store the startup
+			// backfill never reached. It behaves as keys always did; the log
+			// line is so the operator can see the transitional state rather
+			// than inherit it silently.
+			s.logf("api key %q has no org binding (pre-tenancy key on a store the backfill has not run on) — treating as fleet-wide", name)
+		}
+		next(w, r, name, scopes, keyOrg)
 	}
 }
 
@@ -49,13 +61,17 @@ func (s *Server) authFail(w http.ResponseWriter, msg string) {
 
 // ---- GET /v1/machines (readonly, or exec keys — allowlist-filtered) ----
 
-func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
+func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request, keyName, scopes, keyOrg string) {
 	if !canRead(scopes) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key lacks machine-list scope"})
 		return
 	}
 	allowed, all := readScope(scopes)
-	machines, err := s.st.ListMachines()
+	// The listing is org-scoped in the store, not filtered here: a tenant
+	// key's fleet is its org's machines, full stop. Machines with no org
+	// (rows the backfill never resolved) belong to no tenant and are listed
+	// only to the unbound caller.
+	machines, err := s.st.ListMachinesByOrg(keyOrg)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
@@ -66,16 +82,17 @@ func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request, keyName,
 		if m.Revoked {
 			continue
 		}
-		if !all && !containsExact(allowed, m.Name) {
+		if !all && !containsExact(allowed, m.Name) && !containsExact(allowed, m.LocalName()) {
 			continue
 		}
 		// The E2E signal rides each machine, not the listing: the setting is
 		// per org, and a client holding a machine name can decide without
 		// having to work out which org it belongs to.
-		e2eState := s.e2eStateFor(m.Name)
+		e2eState := s.e2eStateForMachineRow(&m)
 		resp.Machines = append(resp.Machines, protocol.MachineInfo{
 			Name: m.Name, Hostname: m.Hostname, OS: m.OS, Arch: m.Arch,
 			Online: online[m.Name], AgentVer: m.AgentVer, CreatedAt: m.CreatedAt,
+			Org: m.Org, LocalName: m.LocalName(),
 			E2E: e2eState.Mode, E2EReason: e2eState.Reason,
 			Blocked: m.Blocked, Temporary: m.Temporary,
 		})
@@ -120,7 +137,7 @@ func readScope(scopes string) (allowed []string, all bool) {
 
 // ---- POST /v1/exec (exec scope; allowlist-checked per machine) ----
 
-func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
+func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, scopes, keyOrg string) {
 	var req protocol.ExecRequest
 	if err := readJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json"})
@@ -156,13 +173,24 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "sealed and e2e_pub must be provided together"})
 		return
 	}
-	if !keyCanExecOn(scopes, req.Machine) {
+	// Tenancy: the machine a tenant key names is resolved within its own org —
+	// a bare local name composes with the key's org, a canonical name is taken
+	// as typed. The composed name is what every later check and the dispatch
+	// use, so a tenant key cannot address another org's machine no matter how
+	// it spells the request.
+	machine := canonicalMachineName(keyOrg, req.Machine)
+	if !keyAllowsMachine(scopes, keyOrg, machine) {
 		// Recorded, because the record is the point: an exec-scoped key asking
 		// for a machine outside its allowlist is either a mistake worth seeing
 		// or a stolen key being used to find out what else it can reach, and
 		// this was the one refusal on the path that left no trace.
-		s.auditNotScoped(req.Machine, keyName)
+		s.auditNotScoped(machine, keyName, keyOrg)
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key is not scoped for machine " + req.Machine})
+		return
+	}
+	target, err := s.st.MachineByName(machine)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
 	}
 	// The display form is what every audit row for this request carries — the
@@ -188,9 +216,12 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 	// it off is how an operator restores that check over the one-shot path too
 	// (a sealed command has no text to match); it is not a way to switch the
 	// block list off.
-	if req.Sealed != "" && !s.e2eStateFor(req.Machine).Enabled {
-		state := s.e2eStateFor(req.Machine)
-		s.auditRow(req.Machine, auditSealedLabel, "console:"+keyName,
+	//
+	// The org the setting is read for is the machine row's own — a stored fact,
+	// not a prefix guess against a mutable org list.
+	if req.Sealed != "" && target != nil && !s.e2eStateForMachineRow(target).Enabled {
+		state := s.e2eStateForMachineRow(target)
+		s.auditRow(s.auditOrgFor(machine, keyOrg), machine, auditSealedLabel, "console:"+keyName,
 			sqlNullInt(execRefused), "", "sealed exec refused: E2E is off for this machine's org")
 		writeJSON(w, http.StatusForbidden, map[string]string{
 			"error": "sealed exec is disabled on this control plane: " + state.Reason})
@@ -219,6 +250,19 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 	// machine stands down for this one command (never for the machine's own
 	// policy). Sealed requests never set it — there is no plaintext there to
 	// judge or to approve; the mirror handles them on the machine.
+	// The exec-time secrets guard, plaintext paths only: an injection name
+	// must be registered to this machine's org before dispatch. A sealed
+	// request's names are inside the seal — the machine judges them there,
+	// like the fleet rules (see the comment below on why the policy check is
+	// skipped for sealed commands; the same reasoning applies verbatim).
+	if req.Sealed == "" && len(req.InjectEnv) > 0 {
+		injOrg := s.auditOrgFor(machine, keyOrg)
+		if reason := s.injectRefusal(injOrg, machine, req.InjectEnv); reason != "" {
+			s.auditRow(injOrg, machine, display, "console:"+keyName, sqlNullInt(execRefused), "", reason)
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": reason})
+			return
+		}
+	}
 	fleetApproved := false
 	if req.Sealed == "" {
 		if reason := s.execPolicyCheck(req.Command, req.Argv); reason != "" {
@@ -229,7 +273,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 			// nobody approves in time, or fall-through when an approved record
 			// covers this command.
 			var dispatch bool
-			dispatch, fleetApproved = s.execPolicyGate(w, &req, display, keyName, reason)
+			dispatch, fleetApproved = s.execPolicyGate(w, &req, display, keyName, keyOrg, reason)
 			if !dispatch {
 				return
 			}
@@ -244,8 +288,8 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 	// idle. This also replaces what used to be a 15s wait for the agent followed
 	// by "machine offline": a blocked machine is online, and saying so
 	// immediately is the truthful answer.
-	if ref := s.dispatchRefusal(req.Machine); ref != nil {
-		s.auditExec(&pendingExec{machine: req.Machine, command: display, source: "console:" + keyName},
+	if ref := s.dispatchRefusal(machine); ref != nil {
+		s.auditExec(&pendingExec{org: s.auditOrgFor(machine, keyOrg), machine: machine, command: display, source: "console:" + keyName},
 			execRefused, "", ref.msg)
 		writeJSON(w, ref.status, map[string]string{"error": ref.msg})
 		return
@@ -257,7 +301,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 		req.Timeout = 600
 	}
 
-	ac := s.br.WaitOnline(req.Machine, 15*time.Second)
+	ac := s.br.WaitOnline(machine, 15*time.Second)
 	if ac == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "machine offline or unknown: " + req.Machine})
 		return
@@ -269,8 +313,8 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 	// precisely the command they were trying to prevent. The streaming path
 	// re-checks per frame and never had this window; this is the same pattern
 	// on the path that did.
-	if ref := s.dispatchRefusal(req.Machine); ref != nil {
-		s.auditExec(&pendingExec{machine: req.Machine, command: display, source: "console:" + keyName},
+	if ref := s.dispatchRefusal(machine); ref != nil {
+		s.auditExec(&pendingExec{org: s.auditOrgFor(machine, keyOrg), machine: machine, command: display, source: "console:" + keyName},
 			execRefused, "", ref.msg)
 		writeJSON(w, ref.status, map[string]string{"error": ref.msg})
 		return
@@ -279,7 +323,8 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 	reqID := store.RandToken(8)
 	pe := &pendingExec{
 		ch:      make(chan execReply, 1),
-		machine: req.Machine,
+		org:     s.auditOrgFor(machine, keyOrg),
+		machine: machine,
 		command: display,
 		source:  "console:" + keyName,
 	}
@@ -324,7 +369,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 			if reply.SealedExit != nil {
 				auditExit = sqlNullInt(*reply.SealedExit)
 			}
-			s.auditRow(pe.machine, auditSealedLabel, pe.source, auditExit, "", "")
+			s.auditRow(pe.org, pe.machine, auditSealedLabel, pe.source, auditExit, "", "")
 			writeJSON(w, http.StatusOK, execReplyWire{ExitCode: reply.SealedExit, SealedB64: reply.Sealed})
 			return
 		}
@@ -358,16 +403,28 @@ const auditNotScopedLabel = "[refused: key not scoped for this machine]"
 // dispatch — by the time most of these run the command has been dispatched or
 // has already finished, and refusing then would invent a new failure mode
 // rather than recover the record — but the operator hears about it.
-func (s *Server) auditRow(machine, command, source string, exit sql.NullInt64, stdout, stderr string) {
-	if err := s.st.AuditInsert(nowRFC3339(), machine, command, source, exit, stdout, stderr); err != nil {
+// auditRow writes one audit row and reports a failure rather than discarding
+// it. "Every dispatched command is audited" is invariant 16, and a discarded
+// error made that claim unfalsifiable: a full disk or a locked database left
+// commands dispatching with no row and no complaint, so the process kept saying
+// it recorded things it did not record. The insert still does not block the
+// dispatch — by the time most of these run the command has been dispatched or
+// has already finished, and refusing then would invent a new failure mode
+// rather than recover the record — but the operator hears about it.
+//
+// org scopes the row to the machine's tenant, so an org-bound read filters in
+// the store. An org that cannot be resolved is stored empty rather than
+// guessed: an empty org is readable by no tenant, which fails closed.
+func (s *Server) auditRow(org, machine, command, source string, exit sql.NullInt64, stdout, stderr string) {
+	if err := s.st.AuditInsert(nowRFC3339(), org, machine, command, source, exit, stdout, stderr); err != nil {
 		log.Printf("server: AUDIT INSERT FAILED for machine %q (command %q): %v — the audit trail is "+
 			"no longer complete; every dispatched command is supposed to be recorded", machine, command, err)
 	}
 }
 
 // auditNotScoped records an attempt on a machine the key is not scoped for.
-func (s *Server) auditNotScoped(machine, keyName string) {
-	s.auditRow(machine, auditNotScopedLabel, "console:"+keyName, sqlNullInt(execRefused), "",
+func (s *Server) auditNotScoped(machine, keyName, keyOrg string) {
+	s.auditRow(s.auditOrgFor(machine, keyOrg), machine, auditNotScopedLabel, "console:"+keyName, sqlNullInt(execRefused), "",
 		"refused: this key is not scoped for machine "+machine)
 }
 
@@ -391,14 +448,14 @@ type e2ePubResponse struct {
 // handleE2EPub serves the target machine's X25519 public key so a console
 // can seal exec commands to it, plus what this control plane accepts. Scoped
 // like exec: a key that may run commands on the machine may fetch its E2E key.
-func (s *Server) handleE2EPub(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
-	name := r.PathValue("name")
+func (s *Server) handleE2EPub(w http.ResponseWriter, r *http.Request, keyName, scopes, keyOrg string) {
+	name := canonicalMachineName(keyOrg, r.PathValue("name"))
 	// Exec scope only, with no readonly carve-out. The key this hands out is the
 	// one used to seal commands, so a key that may not run commands has no use for
 	// it — and the control table's promise is that a read-only key sees the fleet
 	// and the audit trail "and nothing else". A readonly key can be refused here
 	// sooner and more legibly than at the exec it would attempt next.
-	if !keyCanExecOn(scopes, name) {
+	if !keyAllowsMachine(scopes, keyOrg, name) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key is not scoped for machine " + name})
 		return
 	}
@@ -407,7 +464,7 @@ func (s *Server) handleE2EPub(w http.ResponseWriter, r *http.Request, keyName, s
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown machine"})
 		return
 	}
-	resp := e2ePubResponse{E2EState: s.e2eStateFor(m.Name), Machine: m.Name}
+	resp := e2ePubResponse{E2EState: s.e2eStateForMachineRow(m), Machine: m.Name}
 	switch {
 	case !resp.Enabled:
 		// Nothing else to say: the reason is in E2EState.
@@ -441,13 +498,13 @@ type execReplyWire struct {
 }
 
 func (s *Server) auditExec(pe *pendingExec, exitCode int, stdout, stderr string) {
-	s.auditRow(pe.machine, pe.command, pe.source,
+	s.auditRow(pe.org, pe.machine, pe.command, pe.source,
 		sql.NullInt64{Int64: int64(exitCode), Valid: true}, stdout, stderr)
 }
 
 // ---- GET /v1/audit (readonly, or exec keys — allowlist-filtered) ----
 
-func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
+func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, keyName, scopes, keyOrg string) {
 	// Audit entries carry command output: restrict to readonly (full) or
 	// exec keys (allowlist keys see only their machines). Enroll keys get
 	// nothing — they are distributed into provisioning pipelines.
@@ -455,11 +512,18 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, keyName, sc
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key lacks audit scope"})
 		return
 	}
-	allowed, all := readScope(scopes)
+	_, all := readScope(scopes)
 	machine := r.URL.Query().Get("machine")
-	if !all && machine != "" && machine != "*" && !containsExact(allowed, machine) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key is not scoped for machine " + machine})
-		return
+	// Tenancy: the org filter is applied in the store — the same statement
+	// that would otherwise have returned another tenant's rows filters them
+	// out, so the boundary does not depend on this handler's loop. A tenant
+	// key's audit trail is its org's trail.
+	if machine != "" && machine != "*" {
+		machine = canonicalMachineName(keyOrg, machine)
+		if !all && !keyAllowsMachine(scopes, keyOrg, machine) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "key is not scoped for machine " + machine})
+			return
+		}
 	}
 	limit := 50
 	if v := r.URL.Query().Get("limit"); v != "" {
@@ -467,7 +531,7 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, keyName, sc
 			limit = n
 		}
 	}
-	entries, err := s.st.AuditList(machine, limit)
+	entries, err := s.st.AuditList(keyOrg, machine, limit)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
@@ -475,6 +539,7 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, keyName, sc
 	type auditRow struct {
 		TS         string `json:"ts"`
 		Machine    string `json:"machine"`
+		Org        string `json:"org,omitempty"`
 		Command    string `json:"command"`
 		Source     string `json:"source"`
 		ExitCode   *int64 `json:"exit_code"`
@@ -483,7 +548,7 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, keyName, sc
 	}
 	rows := make([]auditRow, 0, len(entries))
 	for _, e := range entries {
-		if !all && !containsExact(allowed, e.Machine) {
+		if !all && !keyAllowsMachine(scopes, keyOrg, e.Machine) {
 			continue
 		}
 		var ec *int64
@@ -491,14 +556,17 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, keyName, sc
 			v := e.ExitCode.Int64
 			ec = &v
 		}
-		rows = append(rows, auditRow{TS: e.TS, Machine: e.Machine, Command: e.Command, Source: e.Source, ExitCode: ec, StdoutSnip: e.StdoutSnip, StderrSnip: e.StderrSnip})
+		// The row carries the machine's canonical name — the identifier the
+		// whole dispatch path keys on, and unambiguous in a log — plus the
+		// org as its own field for tenant-scoped readers.
+		rows = append(rows, auditRow{TS: e.TS, Machine: e.Machine, Org: e.Org, Command: e.Command, Source: e.Source, ExitCode: ec, StdoutSnip: e.StdoutSnip, StderrSnip: e.StderrSnip})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"entries": rows})
 }
 
 // ---- POST /v1/admin/revoke (exec:* keys only) ----
 
-func (s *Server) handleRevokeMachine(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
+func (s *Server) handleRevokeMachine(w http.ResponseWriter, r *http.Request, keyName, scopes, keyOrg string) {
 	var req struct {
 		Machine    string `json:"machine"`
 		PurgeAudit bool   `json:"purge_audit"`
@@ -515,19 +583,24 @@ func (s *Server) handleRevokeMachine(w http.ResponseWriter, r *http.Request, key
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key lacks revoke scope"})
 		return
 	}
-	m, err := s.st.MachineByName(req.Machine)
-	if err != nil || m == nil {
+	// Tenancy: the machine is resolved inside the key's org. A machine of
+	// another org is answered "unknown machine" — the same response an
+	// absent name gets — so a scoped key cannot even learn that the row
+	// exists, let alone retire it.
+	machine := canonicalMachineName(keyOrg, req.Machine)
+	m, err := s.st.MachineByName(machine)
+	if err != nil || m == nil || (keyOrg != "" && m.Org != keyOrg) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown machine"})
 		return
 	}
-	if err := s.revokeMachine(req.Machine, req.PurgeAudit); err != nil {
+	if err := s.revokeMachine(machine, req.PurgeAudit); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
 	}
 	// %q, not %s: both values reach the log from outside, and a machine name
 	// or key name containing newlines could forge log lines.
-	s.logf("machine revoked: %q (by %q)", req.Machine, keyName)
-	writeJSON(w, http.StatusOK, map[string]string{"ok": "revoked", "machine": req.Machine})
+	s.logf("machine revoked: %q (by %q)", machine, keyName)
+	writeJSON(w, http.StatusOK, map[string]string{"ok": "revoked", "machine": machine})
 }
 
 // sqlNullInt is an audit exit status (or a NULL when there is none to report).

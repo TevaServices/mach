@@ -111,6 +111,12 @@ func runDaemon(stateDir string, ctl *sessionCtl) error {
 	if err := LoadLocalPolicy(); err != nil {
 		return err
 	}
+	// The secrets store is a path + the org from config, not the values
+	// themselves: they are re-read from secrets.json on every exec, so a
+	// second process adding a secret is picked up without a restart. A
+	// machine enrolled before this feature has no org in its config, and
+	// every secrets feature then refuses rather than guessing.
+	installSecrets(newFileSecretStore(stateDir, cfg.Org))
 	DropPrivileges()
 	return serveLoop(cfg, id, e2eKey, ctl)
 }
@@ -289,6 +295,11 @@ func dialAndServe(cfg *Config, id *Identity, e2eKey *E2EKeyPair, ctl *sessionCtl
 	}
 	log.Printf("agent: connected to %s as %q (control plane identity verified)", cfg.Server, cfg.Name)
 
+	// Announce the secret NAMES this machine holds, so the control plane
+	// knows what it can inject here without a round trip. Names only, ever;
+	// silent for a machine with no org (it refuses every secrets feature).
+	announceSecrets(conn, activeSecrets())
+
 	// A temporary session publishes this connection so an interrupt can retire
 	// the enrollment on it. Registered after the handshake, because the retire
 	// frame is only meaningful — and only accepted — on an authenticated
@@ -358,6 +369,16 @@ func dialAndServe(cfg *Config, id *Identity, e2eKey *E2EKeyPair, ctl *sessionCtl
 			if err := handlePolicyFrame(conn, env); err != nil {
 				log.Printf("agent: installing fleet policy failed: %v", err)
 			}
+		case "secret_push":
+			// A secret VALUE, sealed to this machine's E2E key. Opened,
+			// validated and stored here; the reply carries name and status
+			// only. Off the frame loop: it writes a file.
+			go handleSecretPush(conn, env, e2eKey, activeSecrets())
+		case "secret_list":
+			// Names only, ever — that is the whole contract.
+			handleSecretList(conn, env, activeSecrets())
+		case "secrets_announce_ack":
+			handleSecretsAnnounceAck(env)
 		case "pong":
 			// keepalive ack; the pong handler already refreshed deadlines
 		default:
@@ -384,6 +405,21 @@ func runCommandResult(cmdPayload []byte, sem chan struct{}) protocol.ExecResult 
 	}
 	if reason := checkCommand(cmd); reason != "" {
 		return protocol.ExecResult{Error: reason, ExitCode: 126}
+	}
+	// Secrets: build the output scrubber and resolve the requested injection
+	// BEFORE anything runs — both fail closed with the policy refusals' shape
+	// (exit 126, audited as a refusal). The scrubber covers every stored
+	// value, not just the injected ones: a command that cats the store file
+	// is exactly the output that needs scrubbing. The store is read on
+	// demand, so an entry added by a second process is picked up here.
+	store := activeSecrets()
+	scrub, scrRefusal := commandScrubber(store)
+	if scrRefusal != "" {
+		return protocol.ExecResult{Error: scrRefusal, ExitCode: 126}
+	}
+	envPairs, injRefusal := resolveInjection(store, cmd.InjectEnv)
+	if injRefusal != "" {
+		return protocol.ExecResult{Error: injRefusal, ExitCode: 126}
 	}
 	timeout := time.Duration(cmd.Timeout) * time.Second
 	if timeout <= 0 {
@@ -427,14 +463,16 @@ func runCommandResult(cmdPayload []byte, sem chan struct{}) protocol.ExecResult 
 	c.WaitDelay = 10 * time.Second
 	applyConfinement(c)
 	// Do not leak the agent's own environment (MACH_USER, MACH_POLICY, ...)
-	// into every command the control plane runs.
-	c.Env = filteredEnv()
+	// into every command the control plane runs; injected secret values are
+	// appended after, and win over anything already in the environment.
+	c.Env = appendEnvValues(filteredEnv(), envPairs)
 	runErr := c.Run()
 
-	// SetOutput, not a struct literal: the output is bytes, and only SetOutput
-	// knows to carry the exact ones when the text form would be lossy.
+	// Scrub BEFORE SetOutput, on the raw bytes: SetOutput encodes, and the
+	// base64 exact-bytes forms must carry the scrubbed bytes too, not hide
+	// the value in a field the scrubber never saw.
 	var res protocol.ExecResult
-	res.SetOutput(stdout.Bytes(), stderr.Bytes())
+	res.SetOutput(scrub.Scrub(stdout.Bytes()), scrub.Scrub(stderr.Bytes()))
 	switch {
 	case runErr == nil:
 		res.ExitCode = 0
@@ -453,12 +491,21 @@ func runCommandResult(cmdPayload []byte, sem chan struct{}) protocol.ExecResult 
 			res.ExitCode = 127
 		}
 	}
+	// Belt and braces: a Go error string can quote argv (not env values, but
+	// the scrubber is cheap and the error text leaves the machine).
+	res.Error = scrub.ScrubText(res.Error)
 	return res
 }
 
 func handleExec(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{}, ctl *sessionCtl) {
-	ctl.announce("exec: %q", describePayloadCommand(env.Payload))
+	ctl.announce("exec: %q", scrubTrace(activeSecrets(), describePayloadCommand(env.Payload)))
 	res := runCommandResult(env.Payload, sem)
+	// A refused-because-missing secret re-announces: the store may have
+	// changed since the last announce, and the control plane's name list
+	// should catch up before the next attempt.
+	if isSecretsRefusal(res) {
+		announceSecrets(conn, activeSecrets())
+	}
 	ctl.announce("exec: exit %d", res.ExitCode)
 	replyExec(conn, env.ReqID, res)
 }

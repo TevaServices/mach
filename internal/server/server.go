@@ -69,6 +69,14 @@ type Server struct {
 	apprMu      sync.Mutex
 	apprWaiters map[int64]*approvalWaiter
 
+	// Secrets relay waiters (internal/server/secrets.go): one in-flight
+	// sealed push or live names-list per ReqID, bound to the machine the
+	// frame was sent to. Same shape as pending above: the DB/agent is the
+	// authority, this is only the rendezvous, and waiters time themselves
+	// out.
+	pushMu        sync.Mutex
+	pendingPushes map[string]*pushWaiter
+
 	// global exec policy: server-side block list applied to every client
 	execPolicy execPolicy
 
@@ -127,18 +135,19 @@ func New(st *store.Store, br *broker.Broker, org, keyPath string) *Server {
 		org = "mach"
 	}
 	s := &Server{
-		st:          st,
-		br:          br,
-		org:         org,
-		pairingTTL:  10 * time.Minute,
-		upgrader:    websocket.Upgrader{ReadBufferSize: 32 * 1024, WriteBufferSize: 32 * 1024},
-		pending:     map[string]*pendingExec{},
-		apprWaiters: map[int64]*approvalWaiter{},
-		pairStarts:  newIPLimiter(5, 10*time.Minute),
-		authFails:   newIPLimiter(20, 10*time.Minute),
-		agentDials:  newIPLimiter(maxAgentDialFailures, 10*time.Minute),
-		pairLookups: newIPLimiter(600, 10*time.Minute),
-		cleanupStop: make(chan struct{}),
+		st:            st,
+		br:            br,
+		org:           org,
+		pairingTTL:    10 * time.Minute,
+		upgrader:      websocket.Upgrader{ReadBufferSize: 32 * 1024, WriteBufferSize: 32 * 1024},
+		pending:       map[string]*pendingExec{},
+		apprWaiters:   map[int64]*approvalWaiter{},
+		pendingPushes: map[string]*pushWaiter{},
+		pairStarts:    newIPLimiter(5, 10*time.Minute),
+		authFails:     newIPLimiter(20, 10*time.Minute),
+		agentDials:    newIPLimiter(maxAgentDialFailures, 10*time.Minute),
+		pairLookups:   newIPLimiter(600, 10*time.Minute),
+		cleanupStop:   make(chan struct{}),
 	}
 	if err := s.loadOrCreateServerKey(keyPath); err != nil {
 		// Refusing to start is deliberate: a server that silently rotates
@@ -293,6 +302,14 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/machines/{name}/e2epub", s.authConsole(s.handleE2EPub))
 	mux.HandleFunc("POST /v1/exec", s.authConsole(s.handleExec))
 	mux.HandleFunc("GET /v1/audit", s.authConsole(s.handleAudit))
+	// Secrets: names-only registry plus the sealed-push relay. Both are
+	// org-scoped at the key, like every other console surface.
+	mux.HandleFunc("POST /v1/secrets/push", s.authConsole(s.handleSecretPush))
+	mux.HandleFunc("GET /v1/secrets", s.authConsole(s.handleSecretsList))
+	// MCP v2 (Streamable HTTP): the model-facing surface over the same
+	// handlers. Bearer keys only, same limiter; the tools are thin adapters
+	// over the console API (internal/server/mcp.go).
+	mux.HandleFunc("POST /v2/mcp", s.handleMCP)
 
 	// Server management API: machine lifecycle (exec:* keys only). Three
 	// distinct axes — block is soft and reversible, revoke is the sticky
@@ -316,9 +333,7 @@ func (s *Server) Routes() http.Handler {
 	})
 	// Streaming console: live output relay. authConsole
 	// works for WS too (bearer header on the upgrade request).
-	mux.HandleFunc("GET /v1/console/stream", s.authConsole(func(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
-		s.handleConsoleStreamWS(w, r, keyName, scopes)
-	}))
+	mux.HandleFunc("GET /v1/console/stream", s.authConsole(s.handleConsoleStreamWS))
 	// Enrollment landing page: OS-detected agent downloads.
 	mux.HandleFunc("GET /{$}", s.handleEnrollRoot)
 	mux.HandleFunc("GET /download/{file}", s.handleAgentDownload)

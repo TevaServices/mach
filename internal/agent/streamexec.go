@@ -42,10 +42,31 @@ func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{
 			Type: "stream_end", ReqID: env.ReqID, Payload: mustJSONStream(e),
 		})
 	}
-	ctl.announce("console: %q", describeCommandText(start.Command, start.Argv))
+
+	// Secrets: the output scrubber is built from one store read before
+	// anything runs, and fails closed — a store that exists but cannot be
+	// read refuses the session rather than sending unscrubbed bytes.
+	store := activeSecrets()
+	scrub, scrRefusal := commandScrubber(store)
+	if scrRefusal != "" {
+		end(protocol.StreamEnd{ExitCode: 126, Error: scrRefusal})
+		return
+	}
+	ctl.announce("console: %q", scrub.ScrubText(describeCommandText(start.Command, start.Argv)))
 
 	if reason := checkCommand(protocol.ExecCommand{Command: start.Command, Argv: start.Argv, FleetApproved: start.FleetApproved}); reason != "" {
 		end(protocol.StreamEnd{ExitCode: 126, Error: reason})
+		return
+	}
+
+	// Injected secrets resolve here, before anything starts: a name the
+	// store cannot supply refuses the session (126, audited as a refusal,
+	// naming the missing NAME and never a value) and re-announces — the
+	// store may have changed since the last announce.
+	envPairs, injRefusal := resolveInjection(store, start.InjectEnv)
+	if injRefusal != "" {
+		announceSecrets(conn, store)
+		end(protocol.StreamEnd{ExitCode: 126, Error: injRefusal})
 		return
 	}
 
@@ -74,7 +95,9 @@ func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{
 		c = exec.CommandContext(ctx, sh.path, sh.args(start.Command)...)
 	}
 	applyConfinement(c)
-	c.Env = filteredEnv()
+	// Injected secrets are appended after the agent's own environment is
+	// filtered out, and win over anything already set.
+	c.Env = appendEnvValues(filteredEnv(), envPairs)
 	stdinPipe, _ := c.StdinPipe()
 	// Output pipes are ours, not os/exec's: StdoutPipe/StderrPipe hand the read
 	// end back with the promise that Wait closes it, which is exactly the loss
@@ -144,10 +167,15 @@ func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{
 		for {
 			n, rerr := r.Read(buf)
 			if n > 0 {
+				// Scrubbed before it is encoded, so the value cannot hide
+				// in the base64 form the frame carries. Best-effort: a
+				// value split across two chunks is not caught (each chunk
+				// is scrubbed independently) — see secrets.go.
+				out := scrub.Scrub(buf[:n])
 				_ = conn.WriteEnvelope(protocol.Envelope{
 					Type:    "stream_out",
 					ReqID:   env.ReqID,
-					Payload: mustJSONStream(protocol.StreamOut{Stream: stream, B64: stdBase64(buf[:n])}),
+					Payload: mustJSONStream(protocol.StreamOut{Stream: stream, B64: stdBase64(out)}),
 				})
 			}
 			if rerr != nil {
@@ -210,7 +238,7 @@ func handleStream(conn *protocol.WSConn, env protocol.Envelope, sem chan struct{
 			errText = fmt.Sprintf("%v", runErr)
 		}
 	}
-	errText = withDrainNote(errText, cut)
+	errText = scrub.ScrubText(withDrainNote(errText, cut))
 	_ = stdinPipe
 	end(protocol.StreamEnd{ExitCode: exitCode, Error: errText})
 }

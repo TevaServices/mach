@@ -85,7 +85,11 @@ const pairPageBody = `</style>
 <main class="pair">
 <h1>mach — approve machine</h1>
 {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
-{{if .Done}}
+{{if .AuthMsg}}
+<div class="panel">
+<p>{{.AuthMsg}}</p>
+</div>
+{{else if .Done}}
 <div class="panel">
 <p>✅ Machine approved and named <b>{{.Name}}</b>.</p>
 <p class="muted">The agent on that machine will finish enrollment within a few seconds.</p>
@@ -135,7 +139,13 @@ var pairTmpl = template.Must(template.New("pair").Parse(
 	pairPageHead + string(uiCSSBytes) + pairPageCSS + pairPageBody))
 
 type pairPageData struct {
-	Error    string
+	Error string
+	// AuthMsg, when set, replaces the form with a fixed sentence: enrollment
+	// pages are behind a signed-in session now, and a caller without one (or
+	// without a membership) is told what to do instead of being shown the
+	// machine's self-reported facts. The string is server-authored, never
+	// request text.
+	AuthMsg  string
 	Done     bool
 	Name     string
 	State    string
@@ -186,6 +196,34 @@ func (s *Server) pairPageHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	state := s.st.PairingState(p)
 
+	// Enrollment pages are behind a signed-in session WHEN THERE IS ONE TO
+	// HAVE: on a control plane with OIDC configured, the machine's org is
+	// assigned by the person approving it, from THEIR memberships, so an
+	// anonymous visitor is shown a fixed instruction instead of the
+	// machine's facts. A control plane with no identity provider configured
+	// has no sessions at all — there is no membership model to authorize
+	// with — and it keeps the legacy page: the operator picks the org, the
+	// challenge code gates every action, and the deployment's own
+	// administration (the CLI) is the authority that minted the orgs. What
+	// is never different: the code gate comes first on the POST path, and
+	// this authentication is a second gate on top of it, not a replacement.
+	sess, hasSess := s.uiSessionFrom(r)
+	authDenied := func(msg string) {
+		renderPair(w, pairPageData{AuthMsg: msg, Token: token})
+	}
+	var memberOrgs []string
+	if s.ui != nil {
+		if !hasSess {
+			authDenied("Sign in to the control plane UI first, then re-open this pairing link. Enrollment assigns the machine to your organization.")
+			return
+		}
+		memberOrgs = sess.memberOrgs()
+		if !sess.isSuper() && len(memberOrgs) == 0 {
+			authDenied("Your identity has no organization membership on this control plane, so it cannot approve enrollments. Ask a superadmin to add you.")
+			return
+		}
+	}
+
 	if r.Method == http.MethodPost {
 		// Defense in depth, not the authentication: the token in the path is
 		// the secret, and whoever holds it can post directly. This stops a
@@ -197,7 +235,7 @@ func (s *Server) pairPageHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "cross-site approval is not allowed — open the pairing link directly", http.StatusForbidden)
 			return
 		}
-		s.handlePairPost(w, r, p, state, token)
+		s.handlePairPost(w, r, p, state, token, sess, memberOrgs)
 		return
 	}
 
@@ -206,10 +244,26 @@ func (s *Server) pairPageHandler(w http.ResponseWriter, r *http.Request) {
 		renderPair(w, terminalPair(state, p.Name))
 	default:
 		org := s.suggestedOrg(r.URL.Query().Get("org"))
+		// With the membership model in force, a suggested org the approver
+		// does not belong to is dropped: the dropdown offers the approver's
+		// own orgs, and a suggestion outside them is not a default this page
+		// is willing to start from. Without it (no OIDC), the suggestion
+		// stands as it always did.
+		if sess.isSuper() {
+			// every org is the approver's
+		} else if len(memberOrgs) > 0 {
+			mine := map[string]bool{}
+			for _, o := range memberOrgs {
+				mine[o] = true
+			}
+			if !mine[org] {
+				org = ""
+			}
+		}
 		part := suggestedNamePart(r.URL.Query().Get("name"))
 		renderPair(w, pairPageData{
 			Hostname: p.Hostname, OS: p.OS, Arch: p.Arch, AgentVer: p.AgentVer,
-			Token: token, Orgs: s.ListOrgs(),
+			Token: token, Orgs: s.pairPageOrgs(sess, memberOrgs),
 			Org: org, NamePart: part,
 			// Only claimed when something actually arrived: a pairing link opened
 			// without the query string (a hand-typed URL, an older agent binary)
@@ -218,6 +272,22 @@ func (s *Server) pairPageHandler(w http.ResponseWriter, r *http.Request) {
 			Suggested: org != "" || part != "",
 		})
 	}
+}
+
+// pairPageOrgs is the org list the page's dropdown offers: the approver's own
+// orgs. A superadmin may assign any configured org. The org list was public
+// before tenancy (SECURITY-NOTES gap 26); it no longer is — an anonymous
+// visitor is not shown this page's form at all.
+func (s *Server) pairPageOrgs(sess uiSession, memberOrgs []string) []string {
+	if s.ui == nil {
+		// No membership model exists here; the dropdown is every configured
+		// org, as it always was on a deployment of this shape.
+		return s.ListOrgs()
+	}
+	if sess.isSuper() {
+		return s.ListOrgs()
+	}
+	return memberOrgs
 }
 
 // suggestedOrg returns the org the QR suggested, but only if this control plane
@@ -291,7 +361,7 @@ func (s *Server) requirePairingCode(w http.ResponseWriter, p *store.Pairing, ret
 	return false
 }
 
-func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store.Pairing, state, token string) {
+func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store.Pairing, state, token string, sess uiSession, memberOrgs []string) {
 	// token is the raw bearer token from the URL path — retry/error renders
 	// reuse it so the retry form posts back to the same working link.
 	if err := r.ParseForm(); err != nil {
@@ -349,6 +419,22 @@ func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store
 		renderPair(w, retry("Unknown org "+strconv.Quote(org)+" — pick one from the list."))
 		return
 	}
+	// Under the membership model, the org the machine joins is the
+	// approver's to choose — from their own memberships. A crafted form
+	// posting an org the session does not belong to is refused here, after
+	// the code gate, with a message about the caller's own powers (it says
+	// nothing about the org's existence). Without the model (no OIDC), the
+	// orgRegistered check above is the whole rule, as it always was.
+	if s.ui != nil && !sess.isSuper() {
+		mine := map[string]bool{}
+		for _, o := range memberOrgs {
+			mine[o] = true
+		}
+		if !mine[org] {
+			renderPair(w, retry("Choose one of your own organizations."))
+			return
+		}
+	}
 	if !store.ValidOrgName(org, name) {
 		renderPair(w, retry("Machine part must be 1-48 chars (letters/digits/hyphen). Final name: "+org+"-<machine>."))
 		return
@@ -371,7 +457,7 @@ func (s *Server) handlePairPost(w http.ResponseWriter, r *http.Request, p *store
 		return
 	}
 
-	ok, why, err := s.st.ApprovePairing(p.ID, code, name)
+	ok, why, err := s.st.ApprovePairing(p.ID, code, name, org)
 	if err != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return

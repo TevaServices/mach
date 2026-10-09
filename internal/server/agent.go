@@ -146,7 +146,7 @@ func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json"})
 		return
 	}
-	ok, _, scopes, err := s.st.APIKeyExists(strings.TrimSpace(req.APIKey))
+	ok, _, scopes, keyOrg, err := s.st.APIKeyExists(strings.TrimSpace(req.APIKey))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
@@ -169,13 +169,23 @@ func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	name := strings.TrimSpace(req.Name)
-	// Any *configured* org, not just the primary one. The pair page has always
-	// accepted every configured org; this path used to check MACH_ORG alone, so
-	// adding an org from the UI would have worked for QR enrollment and silently
-	// not for API-key enrollment. The naming invariant is unchanged: the name
-	// must still be <org>-<machine>.
-	if _, ok := s.resolveOrgForName(name); !ok {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name must be org-prefixed (<org>-<machine>, letters/digits/hyphen, machine part 1-48 chars) for a configured org"})
+	// Tenancy: an enroll key is bound to ONE org, and the machine it enrolls
+	// belongs to that org — the name must carry the key's own prefix. This is
+	// the redefinition of the old "any configured org" rule: before, the org
+	// was whatever the caller typed; now it is a property of the credential,
+	// which is what makes enrollment tenant-scoped rather than org-suggested.
+	// A key minted before bindings (org "") keeps the old rule, with the org
+	// taken from the name for the row.
+	org := keyOrg
+	if org == "" {
+		resolved, ok := s.resolveOrgForName(name)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name must be org-prefixed (<org>-<machine>, letters/digits/hyphen, machine part 1-48 chars) for a configured org"})
+			return
+		}
+		org = resolved
+	} else if !store.ValidOrgName(org, name) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "this enrollment key is bound to org \"" + org + "\" — the machine name must be " + org + "-<machine> (letters/digits/hyphen, machine part 1-48 chars)"})
 		return
 	}
 	if status, msg := s.enrollmentRefusal(name, req.PubKey); status != 0 {
@@ -185,21 +195,23 @@ func (s *Server) handleRegisterAPIKey(w http.ResponseWriter, r *http.Request) {
 	// Create, or take over a revoked or temporary row that is enrolling again.
 	// The flag travels with the enrollment, so a permanent enrollment clears a
 	// temporary row's flag: that is what "recorded as permanent" means here.
+	// A takeover keeps the row's stored org (the canonical name is unchanged,
+	// so its org is too); only a fresh insert writes the binding.
 	took, err := s.st.ReenrollMachine(name, req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer, pubE2E, req.Temporary)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
 	}
 	if !took {
-		if err := s.st.CreateMachine(name, req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer, pubE2E, req.Temporary); err != nil {
+		if err := s.st.CreateMachine(name, req.PubKey, req.Hostname, req.OS, req.Arch, req.AgentVer, pubE2E, req.Temporary, org); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 			return
 		}
-		s.logf("api-key enrollment: machine=%s host=%q temporary=%v", name, req.Hostname, req.Temporary)
+		s.logf("api-key enrollment: machine=%s host=%q temporary=%v org=%q", name, req.Hostname, req.Temporary, org)
 	} else {
 		s.logf("api-key re-enrollment: took over machine=%s host=%q temporary=%v", name, req.Hostname, req.Temporary)
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": name, "server_key": s.serverKeyHex})
+	writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": name, "org": org, "server_key": s.serverKeyHex})
 }
 
 // enrollmentRefusal is why an enrollment must be refused, or (0, "") to proceed.
@@ -366,7 +378,7 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	// JSON overhead; raise the frame cap accordingly.
 	ws.SetReadLimit(40 << 20)
 
-	ac := &broker.AgentConn{Name: machine.Name, Conn: conn, LastSeen: time.Now(), Hostname: hr.Hostname, OS: hr.OS, Arch: hr.Arch, AgentVer: hr.AgentVer}
+	ac := &broker.AgentConn{Name: machine.Name, Org: machine.Org, Conn: conn, LastSeen: time.Now(), Hostname: hr.Hostname, OS: hr.OS, Arch: hr.Arch, AgentVer: hr.AgentVer}
 	s.br.Add(ac)
 	defer s.br.Remove(ac)
 
@@ -424,6 +436,20 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 				s.br.SendToStream(env.ReqID, env)
 			} else {
 				s.logf("agent %q sent a stream frame for an unbound session", machine.Name)
+			}
+		case "secrets_announce":
+			// The machine's own names list: registry input, org-stamped from
+			// the row (internal/server/secrets.go).
+			s.handleSecretsAnnounce(machine.Name, env, conn)
+		case "secret_push_result":
+			var res protocol.SecretPushResult
+			if json.Unmarshal(env.Payload, &res) == nil {
+				s.completePushWaiter(env.ReqID, machine.Name, &res, nil)
+			}
+		case "secret_list_result":
+			var res protocol.SecretListResult
+			if json.Unmarshal(env.Payload, &res) == nil {
+				s.completePushWaiter(env.ReqID, machine.Name, nil, &res)
 			}
 		case "retire":
 			s.handleSelfRetire(machine.Name)
@@ -567,7 +593,7 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 		// Idempotent re-claim: this key is already enrolled. Reporting success
 		// rather than a conflict keeps a lost response from looking like a
 		// failure to an agent that is retrying.
-		writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": existing.Name, "server_key": s.serverKeyHex})
+		writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": existing.Name, "org": existing.Org, "server_key": s.serverKeyHex})
 		return
 	}
 	// A revoked machine may come back through a fresh enrollment — but only under
@@ -586,14 +612,15 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "pairing already claimed"})
 		return
 	}
-	s.logf("pair claimed: machine=%q", p.Name)
-	writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": p.Name, "server_key": s.serverKeyHex})
+	s.logf("pair claimed: machine=%q org=%q", p.Name, p.Org)
+	writeJSON(w, http.StatusOK, map[string]string{"ok": "enrolled", "machine": p.Name, "org": p.Org, "server_key": s.serverKeyHex})
 }
 
 // ---- exec completion (called from the agent pump above) ----
 
 type pendingExec struct {
 	ch      chan execReply
+	org     string // the machine's tenant, carried so the audit row records it
 	machine string
 	command string
 	source  string

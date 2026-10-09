@@ -16,6 +16,7 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -35,6 +36,7 @@ const (
 
 type CommandApproval struct {
 	ID          int64
+	Org         string
 	Machine     string
 	Command     string
 	Scope       string
@@ -45,13 +47,13 @@ type CommandApproval struct {
 	ExpiresAt   string
 }
 
-const approvalCols = `id, machine, command, scope, session, requested_by, created_at, status, expires_at`
+const approvalCols = `id, org, machine, command, scope, session, requested_by, created_at, status, expires_at`
 
 // scanApproval follows the store's scan contract: (nil, nil) means no row, so
 // callers answer "not found" rather than mistaking a miss for an error.
 func scanApproval(row interface{ Scan(...any) error }) (*CommandApproval, error) {
 	a := &CommandApproval{}
-	if err := row.Scan(&a.ID, &a.Machine, &a.Command, &a.Scope, &a.Session, &a.RequestedBy, &a.CreatedAt, &a.Status, &a.ExpiresAt); err != nil {
+	if err := row.Scan(&a.ID, &a.Org, &a.Machine, &a.Command, &a.Scope, &a.Session, &a.RequestedBy, &a.CreatedAt, &a.Status, &a.ExpiresAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -64,15 +66,17 @@ func scanApproval(row interface{ Scan(...any) error }) (*CommandApproval, error)
 // returns its id. Status starts 'pending' and expires_at stays empty: the
 // prompt window is a server-side timeout on the in-memory waiter, not a
 // timestamp — a pending row that was never decided simply never dispatches,
-// and CleanupCommandApprovals sweeps it.
-func (s *Store) CreateCommandApproval(machine, command, normKey, scope, requestedBy string) (int64, error) {
+// and CleanupCommandApprovals sweeps it. org is the target machine's tenant:
+// the approval is decidable only by principals of that org, so the row
+// records the boundary it lives inside.
+func (s *Store) CreateCommandApproval(org, machine, command, normKey, scope, requestedBy string) (int64, error) {
 	var id int64
 	// RETURNING, not LastInsertId: Postgres does not implement the latter, and
 	// the id is what the caller registers its waiter under.
 	err := s.queryRow(`INSERT INTO command_approvals
-		(machine, command, norm_key, scope, session, requested_by, created_at, status, expires_at)
-		VALUES (?,?,?,?,?,?,?,'pending','') RETURNING id`,
-		machine, command, normKey, scope, "", requestedBy, now()).Scan(&id)
+		(org, machine, command, norm_key, scope, session, requested_by, created_at, status, expires_at)
+		VALUES (?,?,?,?,?,?,?,?,'pending','') RETURNING id`,
+		org, machine, command, normKey, scope, "", requestedBy, now()).Scan(&id)
 	return id, err
 }
 
@@ -164,15 +168,24 @@ func (s *Store) ConsumeCommandApproval(id int64) (bool, error) {
 
 // ListCommandApprovals returns approvals newest first. status selects one
 // state ('pending', 'approved', 'denied', 'spent'); empty or 'all' means
-// every row. A 'spent' row is an approval that was granted and used by the
-// one dispatch it allowed — kept for the record, not for letting anything
-// through.
-func (s *Store) ListCommandApprovals(status string, limit int) ([]CommandApproval, error) {
+// every row. org scopes the read to one tenant's rows ("", the host CLI's
+// read, means every org). A 'spent' row is an approval that was granted and
+// used by the one dispatch it allowed — kept for the record, not for letting
+// anything through.
+func (s *Store) ListCommandApprovals(org, status string, limit int) ([]CommandApproval, error) {
 	q := `SELECT ` + approvalCols + ` FROM command_approvals`
+	var conds []string
 	var args []any
+	if org != "" {
+		conds = append(conds, `org=?`)
+		args = append(args, org)
+	}
 	if status != "" && status != "all" {
-		q += ` WHERE status=?`
+		conds = append(conds, `status=?`)
 		args = append(args, status)
+	}
+	if len(conds) > 0 {
+		q += ` WHERE ` + strings.Join(conds, ` AND `)
 	}
 	q += ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limit)
@@ -184,7 +197,7 @@ func (s *Store) ListCommandApprovals(status string, limit int) ([]CommandApprova
 	var out []CommandApproval
 	for rows.Next() {
 		var a CommandApproval
-		if err := rows.Scan(&a.ID, &a.Machine, &a.Command, &a.Scope, &a.Session, &a.RequestedBy, &a.CreatedAt, &a.Status, &a.ExpiresAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.Org, &a.Machine, &a.Command, &a.Scope, &a.Session, &a.RequestedBy, &a.CreatedAt, &a.Status, &a.ExpiresAt); err != nil {
 			return nil, err
 		}
 		out = append(out, a)

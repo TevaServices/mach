@@ -318,6 +318,52 @@ This is `mach`: remote CLI access to registered machines, outbound-only
     arrives from the control plane and must not be able to forge a console line;
     it is a trace, and nothing reads it back (invariant 7).
 
+24. **The org is the tenant boundary, and every principal carries it.**
+    Machines, API keys, audit rows, command approvals and pairings store the
+    org they belong to (migration `0004_tenancy`), written at enrollment or
+    approval time — never re-derived from the name's prefix against a mutable
+    org list. An API key is bound to one org: its scopes resolve inside it,
+    enrollment through it lands in it, and another org's machine is an
+    unknown machine to it (the same answer an absent name gets, so the
+    boundary cannot be probed). A tenant key addresses machines by local
+    name, composed with its own org (`canonicalMachineName`) — two orgs may
+    each own a machine called `web-1`, and neither ever sees the other.
+    Machine names stay globally unique canonical `<org>-<name>` strings: the
+    reenroll-takeover guard (invariant 10) and every dispatch path key on
+    them unchanged.
+25. **UI authorization is membership, layered on the issuer gate.** A
+    signed-in identity's powers come from `ui_members` rows resolved at
+    sign-in (superadmin / admin / operator / viewer); no rows means a
+    powerless sign-in. Org pages, machine actions and approval decisions are
+    gated on the session's own memberships, and org add/remove is
+    superadmin-only. The CLI remains the unauthenticated host-shell
+    bootstrap (`add-org`, `add-member`) because the UI cannot create its own
+    authority. Enrollment pages are behind a session when the UI exists —
+    the machine's org is assigned from the approver's memberships, and the
+    challenge code still gates approve and deny on top — while a deployment
+    with no OIDC keeps the legacy pair page (no sessions exist to demand;
+    the host is the authority that minted its orgs).
+26. **Secret names travel; values never do.** A secret's value lives only in
+    the target machine's own store (`<state>/secrets.json`, 0600); the
+    control plane holds a names-only registry (no value column to leak) and
+    relays pushes as opaque sealed blobs — refused outright when the org's
+    E2E is off, because that path is the one place a value crosses the wire.
+    Injection is names-only on the wire, resolved by the machine at exec
+    time, fail-closed on an unknown name (126-class, never an empty env),
+    and judged at the machine for sealed commands — the same
+    server-cannot-read-it split as the fleet policy. The agent scrubs the
+    union of all locally stored values from every outgoing byte; that
+    scrubbing is best-effort and documented as such, and an unreadable
+    secrets store refuses commands rather than shipping unscrubbed output.
+27. **The MCP endpoint is an adapter, never a second implementation.**
+    `/v2/mcp` (Streamable HTTP, bearer keys only in this cut) runs its three
+    tools (`machines_list`, `secrets_list`, `exec`) by invoking the real
+    console-API handlers in-process through a response recorder, so every
+    check a console request meets — org boundary, scope, per-org E2E, both
+    policy layers, the approval gate, audit — is met identically, by
+    construction. Adding a check to `handleExec` must never require adding
+    it to MCP.
+
 ## Environment variables (control plane)
 
 | Var | Purpose |
@@ -469,7 +515,7 @@ to run it, and for why the driver difference matters.
   same row), an operator grants it through the admin API, the approved command
   runs once (the mirror on the machine stands down for exactly that dispatch,
   never for the machine's own rules), and the spent grant stays in the record.
-  Green = 211 checks.
+  Green = 214 checks.
 - **The service-registration properties live in the shipped packaging
   artifacts** (`cmd/mach/packaging_test.go`), not in agent code: since the
   packages took over service registration (#44 removed `mach install`), the
@@ -590,6 +636,16 @@ to run it, and for why the driver difference matters.
 - **Audit in E2E mode** writes a `[E2E sealed command]` placeholder with
   exit code only. Needing command content in audit is a deliberate
   policy change to propose — not silently implement.
+- **Secrets frames are names-only by construction.** `secret_push` carries a
+  sealed blob (the value is inside `internal/e2e`'s envelope, opened with the
+  same path a sealed command takes); `secret_list_result` and
+  `secrets_announce` have no value FIELD. The registry table has no value
+  column. An audit label must not read as `keyword: value` — `secrets: push X`
+  redacted ITSELF via RedactScrubs; the label is `secret push X`.
+- **MCP tool results are the console API's answers.** `/v2/mcp` tools call
+  the real handlers through a recorder; a tool result that says "not run"
+  carries the handler's own status and sentence. Do not add tool-specific
+  authorization.
 - **Agent update re-exec** runs `self run` detached (Setsid on unix);
   if you touch update logic, verify the new process survives the old
   one exiting (e2e checks "post-update exec works" twice).

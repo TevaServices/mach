@@ -441,8 +441,17 @@ func validLabel(s string, min, max int) bool {
 // ---- machines ----
 
 type Machine struct {
-	ID        int64
-	Name      string
+	ID   int64
+	Name string
+	// Org is the tenant the machine belongs to, stored — not re-derived from
+	// the name's prefix at read time — because the configured org list is
+	// mutable configuration and a tenant boundary must not move when it does.
+	// Every write path sets it from the enrollment's own org (an API key's
+	// binding, or the org chosen on the pair page); the canonical name still
+	// carries "<org>-<machine>", and the two are required to agree.
+	// Empty means the row predates tenancy and was never backfilled: it
+	// belongs to no org and no tenant may address it.
+	Org       string
 	PubKey    string
 	Hostname  string
 	OS        string
@@ -465,10 +474,32 @@ type Machine struct {
 	Temporary bool
 }
 
-func (s *Store) CreateMachine(name, pubkey, hostname, os, arch, agentVer, pubE2E string, temporary bool) error {
-	_, err := s.exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at, pub_e2e, temporary)
-		VALUES (?,?,?,?,?,?,?,?,?)`, name, pubkey, hostname, os, arch, agentVer, now(), pubE2E, boolInt(temporary))
+// CreateMachine inserts a new enrollment. org is the machine's tenant, set
+// here — at the write — rather than derived later from the name's prefix:
+// "which org owns this machine" is a fact about the enrollment, and the
+// read-side must not have to guess it against a mutable org list.
+func (s *Store) CreateMachine(name, pubkey, hostname, os, arch, agentVer, pubE2E string, temporary bool, org string) error {
+	_, err := s.exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at, pub_e2e, temporary, org)
+		VALUES (?,?,?,?,?,?,?,?,?,?)`, name, pubkey, hostname, os, arch, agentVer, now(), pubE2E, boolInt(temporary), org)
 	return err
+}
+
+// LocalMachineName composes a machine's canonical name from its org and its
+// local name — the name a tenant addresses it by. Tenancy keeps the
+// canonical "<org>-<machine>" string as the storage key, so the composition
+// lives here in the store, next to ValidOrgName which constrains it.
+func LocalMachineName(org, localName string) string { return org + "-" + localName }
+
+// LocalName returns the machine's name within its org, or "" when the row
+// carries no resolvable org (a pre-tenancy row nobody backfilled).
+func (m Machine) LocalName() string {
+	if m.Org == "" {
+		return ""
+	}
+	if !strings.HasPrefix(m.Name, m.Org+"-") {
+		return ""
+	}
+	return strings.TrimPrefix(m.Name, m.Org+"-")
 }
 
 // boolInt spells a bool the way every boolean column here is stored (INTEGER,
@@ -480,12 +511,12 @@ func boolInt(v bool) int {
 	return 0
 }
 
-const machineCols = `id, name, pubkey, hostname, os, arch, agent_version, created_at, revoked, pub_e2e, blocked, temporary`
+const machineCols = `id, name, org, pubkey, hostname, os, arch, agent_version, created_at, revoked, pub_e2e, blocked, temporary`
 
 func scanMachine(row interface{ Scan(...any) error }) (*Machine, error) {
 	m := &Machine{}
 	var revoked, blocked, temporary int
-	err := row.Scan(&m.ID, &m.Name, &m.PubKey, &m.Hostname, &m.OS, &m.Arch, &m.AgentVer, &m.CreatedAt, &revoked, &m.PubE2E, &blocked, &temporary)
+	err := row.Scan(&m.ID, &m.Name, &m.Org, &m.PubKey, &m.Hostname, &m.OS, &m.Arch, &m.AgentVer, &m.CreatedAt, &revoked, &m.PubE2E, &blocked, &temporary)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -521,6 +552,39 @@ func (s *Store) ListMachines() ([]Machine, error) {
 		out = append(out, *m)
 	}
 	return out, rows.Err()
+}
+
+// ListMachinesByOrg returns one tenant's machines, ordered by name. org ""
+// lists every machine — the control plane's own CLI, which runs on the host
+// the operator already controls, and no other caller.
+func (s *Store) ListMachinesByOrg(org string) ([]Machine, error) {
+	if org == "" {
+		return s.ListMachines()
+	}
+	rows, err := s.query(`SELECT `+machineCols+` FROM machines WHERE org=? ORDER BY name`, org)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Machine
+	for rows.Next() {
+		m, err := scanMachine(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *m)
+	}
+	return out, rows.Err()
+}
+
+// CountMachinesInOrg counts one org's machines in SQL. The org-removal guard
+// ("an org with machines cannot be removed") lives here, beside the query
+// that answers it, rather than in a handler — a rule written in two places
+// drifts, and this rule decides whether a tenant's fleet loses its home.
+func (s *Store) CountMachinesInOrg(org string) (int, error) {
+	var n int
+	err := s.queryRow(`SELECT COUNT(*) FROM machines WHERE org=?`, org).Scan(&n)
+	return n, err
 }
 
 // UpdateMachineMeta refreshes runtime metadata reported at agent connect.
@@ -671,12 +735,16 @@ func (s *Store) DeleteMachine(name string) error {
 
 // ---- API keys ----
 
-// Scopes: "exec:*" = all machines; "exec:<name>,<name>" = allowlist;
+// Scopes: "exec:*" = all machines of the key's org; "exec:<name>,<name>" =
+// allowlist (local machine names within the key's org);
 // "readonly" = machines + audit only; "enroll" = API-key enrollment only.
-func (s *Store) CreateAPIKey(name, key, scopes string) error {
+// Every key carries an org binding: scopes are resolved within it, and a
+// key cannot reach another tenant's machines — that binding, not the scope
+// text, is what makes the boundary.
+func (s *Store) CreateAPIKey(name, key, scopes, org string) error {
 	salt := randHex(16)
-	_, err := s.exec(`INSERT INTO api_keys (name, salt, key_lookup, key_hash, scopes, created_at) VALUES (?,?,?,?,?,?)`,
-		name, salt, LookupHash(key), HashKey(key, salt), scopes, now())
+	_, err := s.exec(`INSERT INTO api_keys (name, salt, key_lookup, key_hash, scopes, created_at, org) VALUES (?,?,?,?,?,?,?)`,
+		name, salt, LookupHash(key), HashKey(key, salt), scopes, now(), org)
 	return err
 }
 
@@ -684,24 +752,29 @@ func (s *Store) CreateAPIKey(name, key, scopes string) error {
 // lookup hash is deterministic (see LookupHash); the stretched hash is then
 // compared in constant time, so a caller cannot learn from timing how close
 // a guess was.
-func (s *Store) APIKeyExists(key string) (ok bool, keyName, scopes string, err error) {
-	var name, salt, keyHash, scopesCol string
+//
+// The returned org is the key's tenant binding. An org-bound key is the
+// whole of a tenant's reach: every scope check resolves inside that org,
+// and a machine outside it is an unknown machine to this caller — same
+// answer as a name that does not exist anywhere.
+func (s *Store) APIKeyExists(key string) (ok bool, keyName, scopes, org string, err error) {
+	var name, salt, keyHash, scopesCol, orgCol string
 	var revoked int
-	err = s.queryRow(`SELECT name, salt, key_hash, scopes, revoked FROM api_keys WHERE key_lookup = ?`,
-		LookupHash(key)).Scan(&name, &salt, &keyHash, &scopesCol, &revoked)
+	err = s.queryRow(`SELECT name, salt, key_hash, scopes, revoked, org FROM api_keys WHERE key_lookup = ?`,
+		LookupHash(key)).Scan(&name, &salt, &keyHash, &scopesCol, &revoked, &orgCol)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, "", "", nil
+		return false, "", "", "", nil
 	}
 	if err != nil {
-		return false, "", "", err
+		return false, "", "", "", err
 	}
 	if revoked != 0 {
-		return false, "", "", nil
+		return false, "", "", "", nil
 	}
 	if subtle.ConstantTimeCompare([]byte(HashKey(key, salt)), []byte(keyHash)) != 1 {
-		return false, "", "", nil
+		return false, "", "", "", nil
 	}
-	return true, name, scopesCol, nil
+	return true, name, scopesCol, orgCol, nil
 }
 
 // APIKeyInfo is a key as an operator may see it: enough to recognise and reason
@@ -714,15 +787,24 @@ func (s *Store) APIKeyExists(key string) (ok bool, keyName, scopes string, err e
 // a promise not to fill them, is what keeps a future caller from leaking one.
 type APIKeyInfo struct {
 	Name      string
+	Org       string
 	Scopes    string
 	CreatedAt string
 	Revoked   bool
 }
 
 // ListAPIKeys returns every key's display metadata, ordered by name. It never
-// selects a hash column.
-func (s *Store) ListAPIKeys() ([]APIKeyInfo, error) {
-	rows, err := s.query(`SELECT name, scopes, created_at, revoked FROM api_keys ORDER BY name`)
+// selects a hash column. org filters to one tenant's keys; "" lists all,
+// for the host CLI only.
+func (s *Store) ListAPIKeys(org string) ([]APIKeyInfo, error) {
+	q := `SELECT name, org, scopes, created_at, revoked FROM api_keys`
+	var args []any
+	if org != "" {
+		q += ` WHERE org=?`
+		args = append(args, org)
+	}
+	q += ` ORDER BY name`
+	rows, err := s.query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -731,7 +813,7 @@ func (s *Store) ListAPIKeys() ([]APIKeyInfo, error) {
 	for rows.Next() {
 		var k APIKeyInfo
 		var revoked int
-		if err := rows.Scan(&k.Name, &k.Scopes, &k.CreatedAt, &revoked); err != nil {
+		if err := rows.Scan(&k.Name, &k.Org, &k.Scopes, &k.CreatedAt, &revoked); err != nil {
 			return nil, err
 		}
 		k.Revoked = revoked != 0
@@ -800,8 +882,25 @@ func (s *Store) CreateOrg(name, createdBy string) error {
 	return err
 }
 
+// DeleteOrg removes an org — its configuration row, its members' bindings,
+// and nothing else. It refuses when the org still has machines: an org is a
+// tenant, and removing a tenant whose fleet exists would leave machines that
+// belong to nobody (their org column would name a config row that is gone).
+// That guard used to live only in the web UI's remove-org handler, which
+// meant every other caller of this method — the CLI it never had, a future
+// admin API — skipped it silently. The rule has one home here.
 func (s *Store) DeleteOrg(name string) error {
-	_, err := s.exec(`DELETE FROM orgs WHERE name=?`, name)
+	n, err := s.CountMachinesInOrg(name)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return fmt.Errorf("org %q still has %d machine(s); delete or re-enroll them first", name, n)
+	}
+	if _, err := s.exec(`DELETE FROM ui_members WHERE org=?`, name); err != nil {
+		return err
+	}
+	_, err = s.exec(`DELETE FROM orgs WHERE name=?`, name)
 	return err
 }
 
@@ -847,13 +946,20 @@ func ValidOrgLabel(s string) bool { return validLabel(s, 2, 20) }
 // ---- pairings ----
 
 type Pairing struct {
-	ID        string
-	PubKey    string
-	Hostname  string
-	OS        string
-	Arch      string
-	AgentVer  string
-	Name      string
+	ID       string
+	PubKey   string
+	Hostname string
+	OS       string
+	Arch     string
+	AgentVer string
+	Name     string
+	// Org is the tenant the machine is being enrolled INTO, recorded when the
+	// pairing is approved. Before approval it is empty — the pairing is
+	// unassigned and no org knows it exists. Assignment happens in the same
+	// write as the approval, by the person who signed in to approve it, which
+	// is what makes "machine gets associated with that user's organization"
+	// a property of the data model rather than a hope about who clicks.
+	Org       string
 	State     string
 	CreatedAt string
 	ExpiresAt string
@@ -861,12 +967,12 @@ type Pairing struct {
 	Attempts  int
 }
 
-const pairingCols = `id, pubkey, hostname, os, arch, agent_version, name, state, created_at, expires_at, consumed, code_attempts`
+const pairingCols = `id, pubkey, hostname, os, arch, agent_version, name, org, state, created_at, expires_at, consumed, code_attempts`
 
 func scanPairing(row interface{ Scan(...any) error }) (*Pairing, error) {
 	p := &Pairing{}
 	var consumed int
-	err := row.Scan(&p.ID, &p.PubKey, &p.Hostname, &p.OS, &p.Arch, &p.AgentVer, &p.Name, &p.State,
+	err := row.Scan(&p.ID, &p.PubKey, &p.Hostname, &p.OS, &p.Arch, &p.AgentVer, &p.Name, &p.Org, &p.State,
 		&p.CreatedAt, &p.ExpiresAt, &consumed, &p.Attempts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -984,7 +1090,12 @@ func (s *Store) VerifyPairingCode(pairID, code string) (bool, string, error) {
 	return true, "", nil
 }
 
-func (s *Store) ApprovePairing(pairID, code, name string) (bool, string, error) {
+// ApprovePairing transitions a pending pairing to approved, recording both
+// the machine's final canonical name and the org it is enrolled into — the
+// approver's own assignment. The org travels with the approval into
+// ConsumePairing, which writes it onto the machine row; nothing downstream
+// re-derives it.
+func (s *Store) ApprovePairing(pairID, code, name, org string) (bool, string, error) {
 	var codeHash, codeSalt, state string
 	err := s.queryRow(`SELECT code_hash, code_salt, state FROM pairings WHERE id = ?`, pairID).Scan(&codeHash, &codeSalt, &state)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1001,7 +1112,7 @@ func (s *Store) ApprovePairing(pairID, code, name string) (bool, string, error) 
 	}
 	// Guard on state: a concurrent DenyPairing must win over this approve —
 	// never resurrect a denied pairing.
-	res, err := s.exec(`UPDATE pairings SET state='approved', name=? WHERE id=? AND state='pending'`, name, pairID)
+	res, err := s.exec(`UPDATE pairings SET state='approved', name=?, org=? WHERE id=? AND state='pending'`, name, org, pairID)
 	if err != nil {
 		return false, "", err
 	}
@@ -1055,8 +1166,8 @@ func (s *Store) ConsumePairing(p *Pairing, pubE2E string, temporary bool) (bool,
 		return false, err
 	}
 	if !took {
-		if _, err := tx.exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at, pub_e2e, temporary)
-			VALUES (?,?,?,?,?,?,?,?,?)`, p.Name, p.PubKey, p.Hostname, p.OS, p.Arch, p.AgentVer, now(), pubE2E, boolInt(temporary)); err != nil {
+		if _, err := tx.exec(`INSERT INTO machines (name, pubkey, hostname, os, arch, agent_version, created_at, pub_e2e, temporary, org)
+			VALUES (?,?,?,?,?,?,?,?,?,?)`, p.Name, p.PubKey, p.Hostname, p.OS, p.Arch, p.AgentVer, now(), pubE2E, boolInt(temporary), p.Org); err != nil {
 			// consumed=1 rolls back with the transaction: the pairing survives
 			// and the agent surfaces the error (usually a name conflict).
 			return false, err
@@ -1094,6 +1205,7 @@ func (s *Store) CleanupExpiredPairings(maxAge time.Duration) (int64, error) {
 type AuditEntry struct {
 	ID         int64
 	TS         string
+	Org        string
 	Machine    string
 	Command    string
 	Source     string
@@ -1223,19 +1335,37 @@ func (s *Store) Settings() (map[string]string, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) AuditInsert(ts, machine, command, source string, exitCode sql.NullInt64, stdout, stderr string) error {
-	_, err := s.exec(`INSERT INTO audit (ts, machine, command, source, exit_code, stdout_snip, stderr_snip)
-		VALUES (?,?,?,?,?,?,?)`, ts, machine, snippet(RedactScrubs(command), 4096), source, exitCode,
+// AuditInsert records one row. org is the machine's tenant, captured here so
+// an org-scoped read can filter in the store instead of trusting every
+// caller to apply the boundary itself. A command is audited under the org it
+// ran in, even if the machine's org changes later — the record of what ran
+// on a machine is history, not a projection of today's config.
+func (s *Store) AuditInsert(ts, org, machine, command, source string, exitCode sql.NullInt64, stdout, stderr string) error {
+	_, err := s.exec(`INSERT INTO audit (ts, org, machine, command, source, exit_code, stdout_snip, stderr_snip)
+		VALUES (?,?,?,?,?,?,?,?)`, ts, org, machine, snippet(RedactScrubs(command), 4096), source, exitCode,
 		snippet(RedactScrubs(stdout), 4096), snippet(RedactScrubs(stderr), 4096))
 	return err
 }
 
-func (s *Store) AuditList(machine string, limit int) ([]AuditEntry, error) {
-	q := `SELECT id, ts, machine, command, source, exit_code, stdout_snip, stderr_snip FROM audit`
+// AuditList reads audit rows. org scopes the read: a tenant key's list is
+// filtered here, in the same statement that would have returned the rows —
+// not filtered afterward in a handler that could be bypassed. org "" is the
+// unfiltered read, for the host CLI only. machine narrows to one machine
+// ("*" or "" = all).
+func (s *Store) AuditList(org, machine string, limit int) ([]AuditEntry, error) {
+	q := `SELECT id, ts, org, machine, command, source, exit_code, stdout_snip, stderr_snip FROM audit`
+	var conds []string
 	var args []any
+	if org != "" {
+		conds = append(conds, `org = ?`)
+		args = append(args, org)
+	}
 	if machine != "" && machine != "*" {
-		q += ` WHERE machine = ?`
+		conds = append(conds, `machine = ?`)
 		args = append(args, machine)
+	}
+	if len(conds) > 0 {
+		q += ` WHERE ` + strings.Join(conds, ` AND `)
 	}
 	q += ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limit)
@@ -1247,7 +1377,7 @@ func (s *Store) AuditList(machine string, limit int) ([]AuditEntry, error) {
 	var out []AuditEntry
 	for rows.Next() {
 		var e AuditEntry
-		if err := rows.Scan(&e.ID, &e.TS, &e.Machine, &e.Command, &e.Source, &e.ExitCode, &e.StdoutSnip, &e.StderrSnip); err != nil {
+		if err := rows.Scan(&e.ID, &e.TS, &e.Org, &e.Machine, &e.Command, &e.Source, &e.ExitCode, &e.StdoutSnip, &e.StderrSnip); err != nil {
 			return nil, err
 		}
 		out = append(out, e)

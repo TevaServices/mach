@@ -178,6 +178,13 @@ type ExecRequest struct {
 	// E2EPub is the console's ephemeral X25519 public key (hex) the agent
 	// seals the result back to. Present only when Sealed is set.
 	E2EPub string `json:"e2e_pub,omitempty"`
+	// InjectEnv names the machine's local secrets to resolve into the
+	// command's environment. Names only — the values live on the target and
+	// never cross any wire. A sealed request's names travel INSIDE the seal,
+	// so the control plane's registry check does not see them; the machine
+	// judges them, exactly as it judges the sealed command text against the
+	// mirrored fleet rules.
+	InjectEnv []string `json:"inject_env,omitempty"`
 }
 
 type MachinesResponse struct {
@@ -185,6 +192,10 @@ type MachinesResponse struct {
 }
 
 type MachineInfo struct {
+	// Name is the machine's canonical name: the globally-unique
+	// "<org>-<machine>" string the store and the whole dispatch path key on.
+	// It stays the wire's identifier so older clients keep working unchanged;
+	// tenant-facing clients that hold an org-bound key prefer LocalName.
 	Name      string `json:"name"`
 	Hostname  string `json:"hostname,omitempty"`
 	OS        string `json:"os,omitempty"`
@@ -193,6 +204,15 @@ type MachineInfo struct {
 	AgentVer  string `json:"agent_version,omitempty"`
 	LastSeen  string `json:"last_seen,omitempty"`
 	CreatedAt string `json:"created_at"`
+
+	// Org is the tenant the machine belongs to, and LocalName is the machine's
+	// name within that org (Name minus the "<org>-" prefix). Both are additive
+	// tenancy fields: a key scoped to one org only ever sees machines of that
+	// org, and every surface a tenant reads shows LocalName — two orgs may each
+	// own a machine called "web-1", and neither ever sees the other's.
+	// LocalName is omitted when the org could not be resolved for the row.
+	Org       string `json:"org,omitempty"`
+	LocalName string `json:"local_name,omitempty"`
 
 	// E2E is the control plane's answer to "will you accept a sealed command
 	// for this machine?" ("on" / "off"), from the setting for the machine's
@@ -288,6 +308,13 @@ type ExecCommand struct {
 	// command never carries this field — the control plane cannot read one, so
 	// it could never have judged, and approved, its text.
 	FleetApproved bool `json:"fleet_approved,omitempty"`
+
+	// InjectEnv names environment variables the machine's agent resolves from
+	// its own local secrets store at exec time. NAMES ONLY: values never
+	// cross any wire — the agent holds them on the target machine and
+	// scrubs them out of everything it sends back. An unknown name refuses
+	// the command rather than running it with a missing secret.
+	InjectEnv []string `json:"inject_env,omitempty"`
 }
 
 // SealedExecCommand is the E2E variant of ExecCommand relayed to the
@@ -313,6 +340,10 @@ type StreamStart struct {
 	Command       string   `json:"command,omitempty"`
 	Argv          []string `json:"argv,omitempty"`
 	FleetApproved bool     `json:"fleet_approved,omitempty"`
+
+	// InjectEnv is the same secret-injection contract as ExecCommand's:
+	// names only, resolved from the machine's own store at session start.
+	InjectEnv []string `json:"inject_env,omitempty"`
 }
 
 // ExitApprovalPending is the exit status a stream_end terminal record carries

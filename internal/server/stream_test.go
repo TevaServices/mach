@@ -58,7 +58,7 @@ func newStreamHarness(t *testing.T) *streamHarness {
 		t.Fatalf("keygen: %v", err)
 	}
 	pubHex := hex.EncodeToString(pub)
-	if err := st.CreateMachine(mach, pubHex, "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine(mach, pubHex, "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed machine: %v", err)
 	}
 
@@ -240,7 +240,7 @@ func TestConsoleSessionsAreBoundedPerKey(t *testing.T) {
 	// A second key, with its own name: the bound is indexed by the key's name,
 	// which is also what the audit row records.
 	other := "mach_" + store.RandToken(24)
-	if err := h.st.CreateAPIKey("other", other, "exec:*"); err != nil {
+	if err := h.st.CreateAPIKey("other", other, "exec:*", ""); err != nil {
 		t.Fatalf("create second key: %v", err)
 	}
 
@@ -354,7 +354,7 @@ func TestFleetPolicyBlocksStreamedCommand(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 	// And the attempt is in the record, not silently dropped.
-	entries, err := h.st.AuditList(h.mach, 10)
+	entries, err := h.st.AuditList("", h.mach, 10)
 	if err != nil {
 		t.Fatalf("audit list: %v", err)
 	}
@@ -405,7 +405,7 @@ func TestConsoleCannotClaimFleetApproved(t *testing.T) {
 		t.Fatalf("a claimed flag dispatched the command to the agent: %+v", f)
 	case <-time.After(200 * time.Millisecond):
 	}
-	entries, err := h.st.AuditList(h.mach, 10)
+	entries, err := h.st.AuditList("", h.mach, 10)
 	if err != nil {
 		t.Fatalf("audit list: %v", err)
 	}
@@ -439,7 +439,7 @@ func TestSealedExecRefusedWhenE2EIsOff(t *testing.T) {
 		t.Errorf("refusal = %q, want it to say the setting is off and how to change it", body)
 	}
 	// The attempt is in the record, and it never reached the machine.
-	entries, err := h.st.AuditList(h.mach, 10)
+	entries, err := h.st.AuditList("", h.mach, 10)
 	if err != nil {
 		t.Fatalf("audit list: %v", err)
 	}
@@ -515,7 +515,7 @@ func TestE2EPubCarriesTheControlSignal(t *testing.T) {
 	// With a key registered, the key is what comes back.
 	const key64 = "9f2b1c4d5e6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e"
 	withKey := "bcross-stream-keyed"
-	if err := h.st.CreateMachine(withKey, "pub-keyed", "h", "linux", "amd64", "v", key64, false); err != nil {
+	if err := h.st.CreateMachine(withKey, "pub-keyed", "h", "linux", "amd64", "v", key64, false, "bcross"); err != nil {
 		t.Fatalf("seed keyed machine: %v", err)
 	}
 	code2, body2 := bearerJSON(t, h.s.Routes(), "GET", "/v1/machines/"+withKey+"/e2epub", key, "")
@@ -579,7 +579,7 @@ func TestE2EIsPerOrg(t *testing.T) {
 	key := adminKey(t, h.s, "exec:*")
 
 	const acme = "acme-web-01"
-	if err := h.st.CreateMachine(acme, "pub-acme", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := h.st.CreateMachine(acme, "pub-acme", "h", "linux", "amd64", "v", "", false, "acme"); err != nil {
 		t.Fatalf("seed acme machine: %v", err)
 	}
 	enabled := func(machine string) bool { return h.s.e2eStateFor(machine).Enabled }
@@ -645,7 +645,7 @@ func TestE2EUnknownOrgFallsBackToTheDefault(t *testing.T) {
 
 	// An org that is not configured on this server.
 	const orphan = "unconfigured-01"
-	if err := h.st.CreateMachine(orphan, "pub-orphan", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := h.st.CreateMachine(orphan, "pub-orphan", "h", "linux", "amd64", "v", "", false, "unconfigured"); err != nil {
 		t.Fatalf("seed orphan machine: %v", err)
 	}
 	// bcross (the configured org) is turned off; the orphan must not inherit it.
@@ -745,7 +745,7 @@ func TestStreamedCommandIsAudited(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		entries, err := h.st.AuditList(h.mach, 10)
+		entries, err := h.st.AuditList("", h.mach, 10)
 		if err != nil {
 			t.Fatalf("audit list: %v", err)
 		}
@@ -951,7 +951,7 @@ func TestSecondCommandInOneSessionIsRefused(t *testing.T) {
 	// specifically rather than for "any row at all".
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		entries, err := h.st.AuditList(h.mach, 10)
+		entries, err := h.st.AuditList("", h.mach, 10)
 		if err != nil {
 			t.Fatalf("audit list: %v", err)
 		}

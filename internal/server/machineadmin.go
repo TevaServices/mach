@@ -201,7 +201,7 @@ func (s *Server) blockMachine(name string, blocked bool) error {
 // ---- console API: POST /v1/admin/block, POST /v1/admin/delete ----
 
 // handleBlockMachine sets or clears a machine's soft block.
-func (s *Server) handleBlockMachine(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
+func (s *Server) handleBlockMachine(w http.ResponseWriter, r *http.Request, keyName, scopes, keyOrg string) {
 	var req struct {
 		Machine string `json:"machine"`
 		// A pointer so an omitted field is a 400 rather than silently meaning
@@ -220,7 +220,20 @@ func (s *Server) handleBlockMachine(w http.ResponseWriter, r *http.Request, keyN
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "machine and blocked are required"})
 		return
 	}
-	if err := s.blockMachine(req.Machine, *req.Blocked); err != nil {
+	// Tenancy: the target is resolved inside the key's org, and a machine of
+	// another org is answered exactly like an absent one — a scoped key
+	// cannot learn another tenant's machines exist, let alone freeze them.
+	machine := canonicalMachineName(keyOrg, req.Machine)
+	m, err := s.st.MachineByName(machine)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
+		return
+	}
+	if m == nil || (keyOrg != "" && m.Org != keyOrg) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown machine"})
+		return
+	}
+	if err := s.blockMachine(machine, *req.Blocked); err != nil {
 		if errors.Is(err, errNoSuchMachine) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown machine"})
 			return
@@ -230,9 +243,9 @@ func (s *Server) handleBlockMachine(w http.ResponseWriter, r *http.Request, keyN
 	}
 	// %q: both values reach the log from outside, and a name containing newlines
 	// could otherwise forge log lines.
-	s.logf("machine %s: %q (by %q)", blockVerb(*req.Blocked), req.Machine, keyName)
+	s.logf("machine %s: %q (by %q)", blockVerb(*req.Blocked), machine, keyName)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": blockVerb(*req.Blocked), "machine": req.Machine, "blocked": *req.Blocked,
+		"ok": blockVerb(*req.Blocked), "machine": machine, "blocked": *req.Blocked,
 	})
 }
 
@@ -244,7 +257,7 @@ func blockVerb(blocked bool) string {
 }
 
 // handleDeleteMachine removes a machine and its key, freeing the name.
-func (s *Server) handleDeleteMachine(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
+func (s *Server) handleDeleteMachine(w http.ResponseWriter, r *http.Request, keyName, scopes, keyOrg string) {
 	var req struct {
 		Machine string `json:"machine"`
 	}
@@ -260,21 +273,24 @@ func (s *Server) handleDeleteMachine(w http.ResponseWriter, r *http.Request, key
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "machine is required"})
 		return
 	}
-	m, err := s.st.MachineByName(req.Machine)
+	// Tenancy: resolved inside the key's org, and a machine of another org is
+	// an unknown machine — see handleBlockMachine.
+	machine := canonicalMachineName(keyOrg, req.Machine)
+	m, err := s.st.MachineByName(machine)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
 	}
-	if m == nil {
+	if m == nil || (keyOrg != "" && m.Org != keyOrg) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown machine"})
 		return
 	}
-	if err := s.deleteMachine(req.Machine); err != nil {
+	if err := s.deleteMachine(machine); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
 	}
-	s.logf("machine deleted: %q (by %q) — name and key are free to re-enroll", req.Machine, keyName)
-	writeJSON(w, http.StatusOK, map[string]string{"ok": "deleted", "machine": req.Machine})
+	s.logf("machine deleted: %q (by %q) — name and key are free to re-enroll", machine, keyName)
+	writeJSON(w, http.StatusOK, map[string]string{"ok": "deleted", "machine": machine})
 }
 
 // fleetRow is one machine as the web UI renders it. Revoked machines are
@@ -312,6 +328,39 @@ func (s *Server) fleetRows() ([]fleetRow, error) {
 	online := s.br.OnlineNames()
 	rows := make([]fleetRow, 0, len(machines))
 	for _, m := range machines {
+		rows = append(rows, fleetRow{
+			Name: m.Name, Hostname: m.Hostname, OS: m.OS, Arch: m.Arch,
+			AgentVer:  m.AgentVer,
+			AgentSkew: m.AgentVer != "" && m.AgentVer != version.Version,
+			Online:    online[m.Name],
+			Blocked:   m.Blocked, Revoked: m.Revoked, Temporary: m.Temporary,
+		})
+	}
+	return rows, nil
+}
+
+// fleetRowsFor is the fleet listing a SESSION may see: a superadmin sees
+// every org, everyone else sees only the orgs they are a member of. The
+// filter runs on the stored org column, so it is the same fact enrollment
+// wrote — not a prefix guess that configuration could move.
+func (s *Server) fleetRowsFor(sess uiSession) ([]fleetRow, error) {
+	if sess.isSuper() {
+		return s.fleetRows()
+	}
+	machines, err := s.st.ListMachines()
+	if err != nil {
+		return nil, err
+	}
+	member := map[string]bool{}
+	for _, o := range sess.memberOrgs() {
+		member[o] = true
+	}
+	online := s.br.OnlineNames()
+	rows := make([]fleetRow, 0, len(machines))
+	for _, m := range machines {
+		if !member[m.Org] {
+			continue
+		}
 		rows = append(rows, fleetRow{
 			Name: m.Name, Hostname: m.Hostname, OS: m.OS, Arch: m.Arch,
 			AgentVer:  m.AgentVer,

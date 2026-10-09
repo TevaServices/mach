@@ -123,7 +123,7 @@ func TestFreshDatabaseMigratesToHead(t *testing.T) {
 		}
 	}
 	// The migrated schema has to work, not just exist.
-	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "host", "linux", "arm64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("create machine: %v", err)
 	}
 	if m, err := st.MachineByName("bcross-a"); err != nil || m == nil || m.Name != "bcross-a" {
@@ -190,7 +190,7 @@ func TestAdoptionOfPreMigrationDatabase(t *testing.T) {
 		t.Fatalf("data did not survive adoption: %v %+v", err, m)
 	}
 	// And the store still writes.
-	if err := st.CreateMachine("bcross-new", "pub-new", "host", "linux", "arm64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-new", "pub-new", "host", "linux", "arm64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("create after adoption: %v", err)
 	}
 }

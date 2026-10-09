@@ -190,6 +190,12 @@ type uiSession struct {
 	Ident   oidcauth.Identity
 	CSRF    string
 	Expires time.Time
+	// Members is the identity's org bindings, resolved once at sign-in and
+	// carried for the session's life. This is what the UI authorizes with:
+	// OIDC establishes who someone is; this list says which tenants they may
+	// act within and how much. A membership added after sign-in takes effect
+	// at the next sign-in — a 12-hour bound, not a forever one.
+	Members []store.Member
 }
 
 // sessionDigest derives the map key for a session token. A distinct prefix from
@@ -212,8 +218,9 @@ func newUISessionStore() *uiSessionStore { return &uiSessionStore{m: map[string]
 
 // create mints a session and returns the raw token for the cookie. ok is false
 // when the store is full of live sessions, so the caller refuses the login
-// rather than evicting someone else's.
-func (s *uiSessionStore) create(id oidcauth.Identity) (token string, sess uiSession, ok bool) {
+// rather than evicting someone else's. members is the identity's org bindings,
+// resolved by the caller at sign-in — the session carries them from then on.
+func (s *uiSessionStore) create(id oidcauth.Identity, members []store.Member) (token string, sess uiSession, ok bool) {
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -222,7 +229,7 @@ func (s *uiSessionStore) create(id oidcauth.Identity) (token string, sess uiSess
 		return "", uiSession{}, false
 	}
 	token = store.RandToken(32)
-	sess = uiSession{Ident: id, CSRF: store.RandToken(32), Expires: now.Add(uiSessionTTL)}
+	sess = uiSession{Ident: id, CSRF: store.RandToken(32), Expires: now.Add(uiSessionTTL), Members: members}
 	s.m[sessionDigest(token)] = sess
 	return token, sess, true
 }

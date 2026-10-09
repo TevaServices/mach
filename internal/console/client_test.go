@@ -116,7 +116,7 @@ func TestOutputCannotForgeControlFacts(t *testing.T) {
 
 	var code int
 	stdout, stderr := capture(t, func() {
-		code = streamConsole(base, "key", "org-test-01", "echo hi")
+		code = streamConsole(base, "key", "org-test-01", "echo hi", nil)
 	})
 
 	if code != 7 {
@@ -145,7 +145,7 @@ func TestExecStreamCarriesTheCommandAsData(t *testing.T) {
 	base := relay.start(t)
 
 	capture(t, func() {
-		streamConsole(base, "key", "org-test-01", "echo 'a b'; rm -rf /tmp/x")
+		streamConsole(base, "key", "org-test-01", "echo 'a b'; rm -rf /tmp/x", nil)
 	})
 
 	if len(relay.requests) != 1 {
@@ -174,7 +174,7 @@ func TestLostStreamIsNotSuccessAndIsNotReplayed(t *testing.T) {
 
 	var code int
 	stdout, stderr := capture(t, func() {
-		code = streamConsole(base, "key", "org-test-01", "sleep 1; echo done")
+		code = streamConsole(base, "key", "org-test-01", "sleep 1; echo done", nil)
 	})
 
 	if code == 0 {
@@ -201,7 +201,7 @@ func TestUnreachableRelayIsRetryable(t *testing.T) {
 
 	var code int
 	_, stderr := capture(t, func() {
-		code = streamConsole(srv.URL, "key", "org-test-01", "echo hi")
+		code = streamConsole(srv.URL, "key", "org-test-01", "echo hi", nil)
 	})
 	if code != streamDialFailed {
 		t.Errorf("code = %d, want %d", code, streamDialFailed)
@@ -400,7 +400,7 @@ func TestExecSealsWhenTheServerAcceptsIt(t *testing.T) {
 	f := newFakeExecServer(t, true, true)
 	var code int
 	stdout, stderr := capture(t, func() {
-		code = f.client().Exec("org-test-01", "echo sealed-marker", 0, false, E2EObey)
+		code = f.client().Exec("org-test-01", "echo sealed-marker", nil, 0, false, E2EObey)
 	})
 	if code != 0 {
 		t.Fatalf("code = %d, want 0 (%s)", code, stderr)
@@ -430,7 +430,7 @@ func TestExecObeysTheServerWhenE2EIsOff(t *testing.T) {
 	f := newFakeExecServer(t, false, true)
 	var code int
 	stdout, stderr := capture(t, func() {
-		code = f.client().Exec("org-test-01", "echo plain-marker", 0, false, E2EObey)
+		code = f.client().Exec("org-test-01", "echo plain-marker", nil, 0, false, E2EObey)
 	})
 	if code != 0 {
 		t.Fatalf("code = %d, want 0 (%s)", code, stderr)
@@ -457,7 +457,7 @@ func TestExecWarnsWhenTheMachineHasNoKey(t *testing.T) {
 	f := newFakeExecServer(t, true, false)
 	var code int
 	_, stderr := capture(t, func() {
-		code = f.client().Exec("org-test-01", "echo hi", 0, false, E2EObey)
+		code = f.client().Exec("org-test-01", "echo hi", nil, 0, false, E2EObey)
 	})
 	if code != 0 {
 		t.Fatalf("code = %d, want 0", code)
@@ -479,7 +479,7 @@ func TestExecWarnsWhenTheE2ESignalCannotBeRead(t *testing.T) {
 	f.pubStatus = http.StatusInternalServerError
 	var code int
 	stdout, stderr := capture(t, func() {
-		code = f.client().Exec("org-test-01", "echo marker", 0, false, E2EObey)
+		code = f.client().Exec("org-test-01", "echo marker", nil, 0, false, E2EObey)
 	})
 	if code != 0 {
 		t.Fatalf("code = %d, want 0 (%s)", code, stderr)
@@ -514,7 +514,7 @@ func TestExecRequireExitsWithAMessageWhenServerRefuses(t *testing.T) {
 	f := newFakeExecServer(t, false, true)
 	var code int
 	stdout, stderr := capture(t, func() {
-		code = f.client().Exec("org-test-01", "echo secret", 0, false, E2ERequire)
+		code = f.client().Exec("org-test-01", "echo secret", nil, 0, false, E2ERequire)
 	})
 	if code == 0 {
 		t.Fatal("--e2e reported success without sealing anything")
@@ -535,7 +535,7 @@ func TestExecRequireFailsWhenTheMachineHasNoKey(t *testing.T) {
 	f := newFakeExecServer(t, true, false)
 	var code int
 	_, stderr := capture(t, func() {
-		code = f.client().Exec("org-test-01", "echo hi", 0, false, E2ERequire)
+		code = f.client().Exec("org-test-01", "echo hi", nil, 0, false, E2ERequire)
 	})
 	if code == 0 {
 		t.Fatal("--e2e reported success for a machine that cannot be sealed to")
@@ -554,7 +554,7 @@ func TestExecForbidNeverSealsAndDoesNotAsk(t *testing.T) {
 	f := newFakeExecServer(t, true, true)
 	var code int
 	stdout, _ := capture(t, func() {
-		code = f.client().Exec("org-test-01", "echo readable", 0, false, E2EForbid)
+		code = f.client().Exec("org-test-01", "echo readable", nil, 0, false, E2EForbid)
 	})
 	if code != 0 {
 		t.Fatalf("code = %d, want 0", code)
@@ -583,7 +583,7 @@ func TestExecRetriesPlaintextWhenSealingIsRefusedMidFlight(t *testing.T) {
 	f.refuseSealed = true
 	var code int
 	stdout, stderr := capture(t, func() {
-		code = f.client().Exec("org-test-01", "echo retry-marker", 0, false, E2EObey)
+		code = f.client().Exec("org-test-01", "echo retry-marker", nil, 0, false, E2EObey)
 	})
 	if code != 0 {
 		t.Fatalf("code = %d, want 0 (%s)", code, stderr)
@@ -610,7 +610,7 @@ func TestExecRetriesPlaintextWhenSealingIsRefusedMidFlight(t *testing.T) {
 	f2.key = f.key
 	var code2 int
 	_, stderr2 := capture(t, func() {
-		code2 = f2.client().Exec("org-test-01", "echo retry-marker", 0, false, E2ERequire)
+		code2 = f2.client().Exec("org-test-01", "echo retry-marker", nil, 0, false, E2ERequire)
 	})
 	if code2 == 0 || !strings.Contains(stderr2, "cannot seal") {
 		t.Errorf("--e2e after a refusal: code=%d stderr=%q, want a failure with a message", code2, stderr2)
@@ -639,7 +639,7 @@ func TestFirstUsePinsTheKeyAndSaysSo(t *testing.T) {
 
 	var code int
 	stdout, stderr := capture(t, func() {
-		code = f.client().Exec("org-test-01", "echo sealed-marker", 0, false, E2EObey)
+		code = f.client().Exec("org-test-01", "echo sealed-marker", nil, 0, false, E2EObey)
 	})
 	if code != 0 || !strings.Contains(stdout, "sealed:echo sealed-marker") {
 		t.Fatalf("code = %d stdout = %q stderr = %q", code, stdout, stderr)
@@ -676,7 +676,7 @@ func TestFirstUsePinsTheKeyAndSaysSo(t *testing.T) {
 	// The second command seals without comment: the pin is established, and a
 	// notice on every command would be noise that trains people to ignore it.
 	_, stderr = capture(t, func() {
-		f.client().Exec("org-test-01", "echo again", 0, false, E2EObey)
+		f.client().Exec("org-test-01", "echo again", nil, 0, false, E2EObey)
 	})
 	if stderr != "" {
 		t.Errorf("stderr = %q, want no notice once the key is pinned", stderr)
@@ -691,7 +691,7 @@ func TestChangedKeyRefusesToSeal(t *testing.T) {
 	f := newFakeExecServer(t, true, true)
 
 	// First use pins.
-	capture(t, func() { f.client().Exec("org-test-01", "echo first", 0, false, E2EObey) })
+	capture(t, func() { f.client().Exec("org-test-01", "echo first", nil, 0, false, E2EObey) })
 
 	// The control plane now advertises a different key for the same machine.
 	other, err := e2e.GenerateKeyPair()
@@ -703,7 +703,7 @@ func TestChangedKeyRefusesToSeal(t *testing.T) {
 	for _, mode := range []E2EMode{E2EObey, E2ERequire} {
 		var code int
 		stdout, stderr := capture(t, func() {
-			code = f.client().Exec("org-test-01", "echo secret", 0, false, mode)
+			code = f.client().Exec("org-test-01", "echo secret", nil, 0, false, mode)
 		})
 		if code == 0 {
 			t.Fatalf("mode %d: reported success with a changed key", mode)
@@ -734,7 +734,7 @@ func TestChangedKeyRefusesToSeal(t *testing.T) {
 func TestTrustAcceptsAChangedKey(t *testing.T) {
 	pinState(t)
 	f := newFakeExecServer(t, true, true)
-	capture(t, func() { f.client().Exec("org-test-01", "echo first", 0, false, E2EObey) })
+	capture(t, func() { f.client().Exec("org-test-01", "echo first", nil, 0, false, E2EObey) })
 
 	other, _ := e2e.GenerateKeyPair()
 	f.key = other
@@ -759,7 +759,7 @@ func TestTrustAcceptsAChangedKey(t *testing.T) {
 	// receives with it, so a round trip is the proof.
 	var code int
 	stdout, stderr := capture(t, func() {
-		code = c.Exec("org-test-01", "echo after-trust", 0, false, E2EObey)
+		code = c.Exec("org-test-01", "echo after-trust", nil, 0, false, E2EObey)
 	})
 	if code != 0 || !strings.Contains(stdout, "sealed:echo after-trust") {
 		t.Fatalf("after trust: code = %d stdout = %q stderr = %q", code, stdout, stderr)
@@ -772,7 +772,7 @@ func TestTrustAcceptsAChangedKey(t *testing.T) {
 func TestForgetDropsThePin(t *testing.T) {
 	pinState(t)
 	f := newFakeExecServer(t, true, true)
-	capture(t, func() { f.client().Exec("org-test-01", "echo first", 0, false, E2EObey) })
+	capture(t, func() { f.client().Exec("org-test-01", "echo first", nil, 0, false, E2EObey) })
 	c := f.client()
 
 	capture(t, func() {
@@ -791,7 +791,7 @@ func TestForgetDropsThePin(t *testing.T) {
 	f.key = other
 	var code int
 	_, stderr := capture(t, func() {
-		code = f.client().Exec("org-test-01", "echo re-pinned", 0, false, E2EObey)
+		code = f.client().Exec("org-test-01", "echo re-pinned", nil, 0, false, E2EObey)
 	})
 	if code != 0 {
 		t.Fatalf("after forget: code = %d stderr = %q", code, stderr)
@@ -813,7 +813,7 @@ func TestNoE2ELeavesThePinStoreAlone(t *testing.T) {
 
 	var code int
 	stdout, stderr := capture(t, func() {
-		code = f.client().Exec("org-test-01", "echo plain", 0, false, E2EForbid)
+		code = f.client().Exec("org-test-01", "echo plain", nil, 0, false, E2EForbid)
 	})
 	if code != 0 || !strings.Contains(stdout, "plain") {
 		t.Fatalf("code = %d stdout = %q stderr = %q", code, stdout, stderr)
@@ -844,7 +844,7 @@ func TestUnreadablePinFileIsAnError(t *testing.T) {
 
 	var code int
 	stdout, stderr := capture(t, func() {
-		code = f.client().Exec("org-test-01", "echo hi", 0, false, E2EObey)
+		code = f.client().Exec("org-test-01", "echo hi", nil, 0, false, E2EObey)
 	})
 	if code == 0 {
 		t.Fatal("a corrupt pin file did not stop sealing")
@@ -878,7 +878,7 @@ func TestExecDoesNotRetryWhenTheSealedReplyIsLost(t *testing.T) {
 
 	var code int
 	stdout, stderr := capture(t, func() {
-		code = f.client().Exec("org-test-01", "echo must-not-run-twice", 0, false, E2EObey)
+		code = f.client().Exec("org-test-01", "echo must-not-run-twice", nil, 0, false, E2EObey)
 	})
 	if code == 0 {
 		t.Errorf("code = 0, want a failure: the reply was lost, not refused")
@@ -904,7 +904,7 @@ func TestExecDoesNotRetryWhenTheSealedReplyIsLost(t *testing.T) {
 	f2.key, f2.sealedStatus = f.key, http.StatusGatewayTimeout
 	var code2 int
 	_, stderr2 := capture(t, func() {
-		code2 = f2.client().Exec("org-test-01", "echo must-not-run-twice", 0, false, E2ERequire)
+		code2 = f2.client().Exec("org-test-01", "echo must-not-run-twice", nil, 0, false, E2ERequire)
 	})
 	if code2 == 0 {
 		t.Errorf("--e2e code = 0, want a failure")
@@ -973,7 +973,7 @@ func TestUnreadableExitRecordIsNotSuccess(t *testing.T) {
 
 	var code int
 	stdout, stderr := capture(t, func() {
-		code = streamConsole(base, "key", "org-test-01", "echo hi")
+		code = streamConsole(base, "key", "org-test-01", "echo hi", nil)
 	})
 	if code != streamLost {
 		t.Fatalf("code = %d, want %d: an unreadable exit record was read as a status", code, streamLost)
@@ -992,7 +992,7 @@ func TestUnreadableExitRecordIsNotSuccess(t *testing.T) {
 		_ = conn.WriteEnvelope(protocol.Envelope{Type: "stream_end", Payload: payload})
 	}}
 	var code2 int
-	capture(t, func() { code2 = streamConsole(ok.start(t), "key", "org-test-01", "exit 7") })
+	capture(t, func() { code2 = streamConsole(ok.start(t), "key", "org-test-01", "exit 7", nil) })
 	if code2 != 7 {
 		t.Fatalf("a normal exit record reported %d, want 7", code2)
 	}

@@ -162,7 +162,7 @@ func (s *Server) uiFail(w http.ResponseWriter, r *http.Request, status int, msg 
 // ---- pages ----
 
 func (s *Server) handleUIFleet(w http.ResponseWriter, r *http.Request, sess uiSession) {
-	rows, err := s.fleetRows()
+	rows, err := s.fleetRowsFor(sess)
 	if err != nil {
 		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 		return
@@ -178,7 +178,7 @@ func (s *Server) handleUIFleet(w http.ResponseWriter, r *http.Request, sess uiSe
 // container would take the Delete confirmation panel with it, which is exactly
 // how a half-typed machine name used to disappear mid-confirmation.
 func (s *Server) handleUIMachines(w http.ResponseWriter, r *http.Request, sess uiSession) {
-	rows, err := s.fleetRows()
+	rows, err := s.fleetRowsFor(sess)
 	if err != nil {
 		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 		return
@@ -218,7 +218,7 @@ func (s *Server) handleUIOrgMember(w http.ResponseWriter, r *http.Request, sess 
 		http.NotFound(w, r)
 		return
 	}
-	data, err := s.orgMembership(org)
+	data, err := s.orgMembership(org, sess)
 	if err != nil {
 		s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 		return
@@ -239,6 +239,9 @@ func (s *Server) handleUIUnblock(w http.ResponseWriter, r *http.Request, sess ui
 
 func (s *Server) uiSetBlock(w http.ResponseWriter, r *http.Request, sess uiSession, blocked bool) {
 	name := r.PostFormValue("machine")
+	if !s.uiMayTouchMachine(w, r, sess, name) {
+		return
+	}
 	if err := s.blockMachine(name, blocked); err != nil {
 		status, msg := http.StatusInternalServerError, "The database could not be read. Nothing was changed."
 		if errors.Is(err, errNoSuchMachine) {
@@ -263,6 +266,9 @@ func (s *Server) handleUIRevoke(w http.ResponseWriter, r *http.Request, sess uiS
 		s.uiFail(w, r, http.StatusNotFound, "No machine by that name.")
 		return
 	}
+	if !s.uiMayTouchMachineRow(w, r, sess, m) {
+		return
+	}
 	// No purge_audit from the UI: erasing another machine's command history stays
 	// an explicit CLI act, exactly as it is for delete.
 	if err := s.revokeMachine(name, false); err != nil {
@@ -279,6 +285,9 @@ func (s *Server) handleUIDelete(w http.ResponseWriter, r *http.Request, sess uiS
 	m, err := s.st.MachineByName(name)
 	if err != nil || m == nil {
 		s.uiFail(w, r, http.StatusNotFound, "No machine by that name.")
+		return
+	}
+	if !s.uiMayTouchMachineRow(w, r, sess, m) {
 		return
 	}
 
@@ -331,7 +340,7 @@ func (s *Server) handleUIDelete(w http.ResponseWriter, r *http.Request, sess uiS
 // cannot say different things.
 func (s *Server) refreshOrRedirect(w http.ResponseWriter, r *http.Request, sess uiSession, noticeCode string) {
 	if r.Header.Get("HX-Request") != "" {
-		rows, err := s.fleetRows()
+		rows, err := s.fleetRowsFor(sess)
 		if err != nil {
 			s.uiFail(w, r, http.StatusInternalServerError, "The database could not be read. Nothing was changed.")
 			return
@@ -359,8 +368,14 @@ func (s *Server) auditUIAction(machine, action string, ident oidcauth.Identity, 
 	}
 	// Auditing is best-effort: an operator's action already took effect, and
 	// failing the request because the trail could not be written would leave the
-	// UI reporting an error for something that did happen.
-	if err := s.st.AuditInsert(nowRFC3339(), machine, action, src, sqlNullInt(0), "", detail); err != nil {
+	// UI reporting an error for something that did happen. The org is resolved
+	// from the machine row when it can be: the row names the tenant the action
+	// was taken on, and the audit trail should say so.
+	org := ""
+	if m, err := s.st.MachineByName(machine); err == nil && m != nil {
+		org = m.Org
+	}
+	if err := s.st.AuditInsert(nowRFC3339(), org, machine, action, src, sqlNullInt(0), "", detail); err != nil {
 		s.logf("ui: audit write failed for %s on %q: %v", action, machine, err)
 	}
 }
@@ -472,14 +487,37 @@ func (s *Server) handleUICallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, _, ok := s.ui.sessions.create(ident)
+	// Authorization is resolved once, here: the identity's membership rows are
+	// what this session may act on. A sign-in with no rows creates a session
+	// that can do nothing — visible, but powerless — which is the fail-closed
+	// direction; the operator sees their name and no controls, and the remedy
+	// is a membership row, not a configuration change.
+	members, merr := s.st.MembersByEmail(ident.Email)
+	if merr != nil {
+		s.logf("ui: could not read memberships for %q: %v", ident.Email, merr)
+		s.renderSignInMessage(w, http.StatusInternalServerError, "Sign-in unavailable",
+			"The membership store could not be read. Nothing about this fleet was changed.")
+		return
+	}
+	if len(members) == 0 {
+		s.logf("ui: sign-in refused: %q has no membership on this control plane", ident.Email)
+		s.renderSignInMessage(w, http.StatusForbidden, "Signed in, but not a member",
+			"This identity has no membership on this control plane. Ask a superadmin to add you with `mach-server add-member`.")
+		return
+	}
+	token, _, ok := s.ui.sessions.create(ident, members)
 	if !ok {
 		s.renderSignInMessage(w, http.StatusServiceUnavailable, "Sign-in unavailable",
 			"Too many operators are signed in. Try again shortly.")
 		return
 	}
+	// Path is "/" not "/ui", deliberately: the pair page and the enrollment
+	// page live OUTSIDE /ui and now require this session (enrollment is
+	// assigned from the approver's memberships). The cookie is HttpOnly,
+	// SameSite=Lax and Secure on https, so the wider path buys the enrollment
+	// flow without widening who can read it — it is one origin either way.
 	http.SetCookie(w, &http.Cookie{
-		Name: uiSessionCookie, Value: token, Path: "/ui", HttpOnly: true,
+		Name: uiSessionCookie, Value: token, Path: "/", HttpOnly: true,
 		Secure: s.ui.cookieSecure, SameSite: http.SameSiteLaxMode,
 		MaxAge: int(uiSessionTTL.Seconds()),
 	})
@@ -492,7 +530,7 @@ func (s *Server) handleUILogout(w http.ResponseWriter, r *http.Request, sess uiS
 		s.ui.sessions.delete(c.Value)
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name: uiSessionCookie, Value: "", Path: "/ui", HttpOnly: true,
+		Name: uiSessionCookie, Value: "", Path: "/", HttpOnly: true,
 		Secure: s.ui.cookieSecure, SameSite: http.SameSiteLaxMode, MaxAge: -1,
 	})
 	s.logf("ui: signed out: sub=%q", sess.Ident.Subject)

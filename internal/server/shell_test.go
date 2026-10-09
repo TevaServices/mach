@@ -43,7 +43,7 @@ func TestUIPagesHaveExactlyOneH1(t *testing.T) {
 	if err := st.CreateOrg("acme", "op-1"); err != nil {
 		t.Fatalf("seed org: %v", err)
 	}
-	if err := st.CreateMachine("acme-web", "pub", "host", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("acme-web", "pub", "host", "linux", "amd64", "v", "", false, "acme"); err != nil {
 		t.Fatalf("seed machine: %v", err)
 	}
 
@@ -84,7 +84,7 @@ func TestUIPagesHaveLandmarksAndASkipLink(t *testing.T) {
 	s, st, p := newUITestServer(t)
 	h := s.Routes()
 	session, _ := uiSignIn(t, s, p)
-	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -156,7 +156,7 @@ func TestUINoticeRegionsAreLiveRegions(t *testing.T) {
 	s, st, p := newUITestServer(t)
 	h := s.Routes()
 	session, _ := uiSignIn(t, s, p)
-	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -190,7 +190,7 @@ func TestUITablesHaveScopedHeadersAndCaptions(t *testing.T) {
 	if err := st.CreateOrg("acme", "op-1"); err != nil {
 		t.Fatalf("seed org: %v", err)
 	}
-	if err := st.CreateMachine("acme-web", "pub", "host", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("acme-web", "pub", "host", "linux", "amd64", "v", "", false, "acme"); err != nil {
 		t.Fatalf("seed machine: %v", err)
 	}
 

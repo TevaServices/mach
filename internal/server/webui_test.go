@@ -71,6 +71,14 @@ func newUITestServer(t *testing.T) (*Server, *store.Store, *fakeProvider) {
 	s, st := newAuthTestServer(t)
 	p := &fakeProvider{ident: oidcauth.Identity{Subject: "op-1", Email: "op@example.com", EmailVerified: true}}
 	s.enableUI(p, "http://127.0.0.1:8099/ui/callback", false)
+
+	// Tenancy: UI authorization is membership rows layered on top of OIDC, and
+	// a sign-in with no rows is refused. The fake identity here stands for the
+	// operator every test in this file has always assumed — one who may act on
+	// the whole control plane — so seed the superadmin row that says so.
+	if err := st.AddMember("", p.ident.Email, p.ident.Subject, store.RoleSuperadmin, "test"); err != nil {
+		t.Fatalf("seed superadmin member: %v", err)
+	}
 	return s, st, p
 }
 
@@ -222,7 +230,7 @@ func TestUIFleetBootstrapsApprovalsPanel(t *testing.T) {
 // admin API, so without this test nothing would notice the panel 200-ing empty.
 func TestUIApprovalsFragmentRendersPendingRow(t *testing.T) {
 	s, st, p := newUITestServer(t)
-	if _, err := st.CreateCommandApproval("org1-m1", "docker system prune -af", "docker system prune -af", "exec:*", "console"); err != nil {
+	if _, err := st.CreateCommandApproval("org1", "org1-m1", "docker system prune -af", "docker system prune -af", "exec:*", "console"); err != nil {
 		t.Fatalf("seed pending approval: %v", err)
 	}
 	session, _ := uiSignIn(t, s, p)
@@ -262,7 +270,7 @@ func TestUIApprovalsFragmentRendersPendingRow(t *testing.T) {
 // even though the decision landed server-side.
 func TestUIApprovalsActionResponseTargetsTheFormTarget(t *testing.T) {
 	s, st, p := newUITestServer(t)
-	id, err := st.CreateCommandApproval("org1-m1", "docker system prune -af", "docker system prune -af", "exec:*", "console")
+	id, err := st.CreateCommandApproval("org1", "org1-m1", "docker system prune -af", "docker system prune -af", "exec:*", "console")
 	if err != nil {
 		t.Fatalf("seed pending approval: %v", err)
 	}
@@ -385,7 +393,7 @@ func TestUICallbackDoesNotEchoProviderText(t *testing.T) {
 // refusal must leave the machine alone.
 func TestUIPostRequiresCSRF(t *testing.T) {
 	s, st, p := newUITestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	h := s.Routes()
@@ -414,7 +422,7 @@ func TestUIPostRequiresCSRF(t *testing.T) {
 // A cross-site form post is refused before anything else runs.
 func TestUIPostRefusesCrossSite(t *testing.T) {
 	s, st, p := newUITestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	h := s.Routes()
@@ -463,7 +471,7 @@ func TestUIPageCarriesTheSessionCSRF(t *testing.T) {
 // back for an htmx request.
 func TestUIBlockUnblockRoundTrip(t *testing.T) {
 	s, st, p := newUITestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	h := s.Routes()
@@ -480,7 +488,7 @@ func TestUIBlockUnblockRoundTrip(t *testing.T) {
 		t.Fatal("block did not take effect")
 	}
 	// The action is in the audit trail, attributed to the operator's subject.
-	entries, err := st.AuditList("bcross-a", 10)
+	entries, err := st.AuditList("", "bcross-a", 10)
 	if err != nil || len(entries) == 0 {
 		t.Fatalf("block was not audited: %v %d", err, len(entries))
 	}
@@ -500,7 +508,7 @@ func TestUIBlockUnblockRoundTrip(t *testing.T) {
 // A non-htmx post gets a redirect rather than a bare fragment.
 func TestUIPostWithoutHtmxRedirects(t *testing.T) {
 	s, st, p := newUITestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	h := s.Routes()
@@ -517,7 +525,7 @@ func TestUIPostWithoutHtmxRedirects(t *testing.T) {
 // Delete is the sharpest action available and needs the name typed.
 func TestUIDeleteRequiresTypedName(t *testing.T) {
 	s, st, p := newUITestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	h := s.Routes()
@@ -553,7 +561,7 @@ func TestUIDeleteRequiresTypedName(t *testing.T) {
 		t.Fatal("the machine survived a confirmed delete")
 	}
 	// And the deletion is attributable: audit rows outlive the machine row.
-	entries, err := st.AuditList("bcross-a", 10)
+	entries, err := st.AuditList("", "bcross-a", 10)
 	if err != nil || len(entries) == 0 {
 		t.Fatalf("delete was not audited: %v %d", err, len(entries))
 	}
@@ -567,7 +575,7 @@ func TestUIDeleteRequiresTypedName(t *testing.T) {
 // unreachable from the UI.
 func TestUIFleetIncludesRevokedMachines(t *testing.T) {
 	s, st, _ := newUITestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := st.RevokeMachine("bcross-a"); err != nil {
@@ -617,7 +625,7 @@ func TestUIOrgLifecycle(t *testing.T) {
 	}
 
 	// Removal is refused while machines exist under the prefix.
-	if err := st.CreateMachine("acme-1", "pub-1", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("acme-1", "pub-1", "h", "linux", "amd64", "v", "", false, "acme"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if code, _, _ := uiPOST(t, h, session, csrf, "/ui/orgs/remove", "org=acme", true); code != http.StatusConflict {
@@ -695,31 +703,36 @@ func TestOrgResolutionPrefersTheLongestPrefix(t *testing.T) {
 	}
 }
 
-// Membership groups keys honestly: scopes is a free string, so a key is not "in"
-// an org — it either names that org's machines or it reaches every org.
+// Membership groups keys honestly: a key's org binding is a stored fact on the
+// key row, so an org's membership lists exactly the keys bound to it. A
+// fleet-wide key (no binding) belongs to no org's list, and a key bound to
+// another org cannot appear as this org's.
 func TestUIOrgMembershipSplitsKeys(t *testing.T) {
 	s, st, _ := newUITestServer(t)
-	if err := st.CreateMachine("acme-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("acme-a", "pub-a", "h", "linux", "amd64", "v", "", false, "acme"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := st.CreateMachine("other-b", "pub-b", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("other-b", "pub-b", "h", "linux", "amd64", "v", "", false, "other"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := st.CreateAPIKey("scoped", "mach_"+store.RandToken(24), "exec:acme-a"); err != nil {
+	if err := st.CreateAPIKey("scoped", "mach_"+store.RandToken(24), "exec:acme-a", "acme"); err != nil {
 		t.Fatalf("key: %v", err)
 	}
-	if err := st.CreateAPIKey("fleet", "mach_"+store.RandToken(24), "exec:*"); err != nil {
+	if err := st.CreateAPIKey("fleet", "mach_"+store.RandToken(24), "exec:*", ""); err != nil {
 		t.Fatalf("key: %v", err)
 	}
-	if err := st.CreateAPIKey("watcher", "mach_"+store.RandToken(24), "readonly"); err != nil {
+	if err := st.CreateAPIKey("watcher", "mach_"+store.RandToken(24), "readonly", ""); err != nil {
 		t.Fatalf("key: %v", err)
 	}
 	// A key scoped to a different org must not appear as this org's.
-	if err := st.CreateAPIKey("elsewhere", "mach_"+store.RandToken(24), "exec:other-b"); err != nil {
+	if err := st.CreateAPIKey("elsewhere", "mach_"+store.RandToken(24), "exec:other-b", "other"); err != nil {
 		t.Fatalf("key: %v", err)
 	}
 
-	data, err := s.orgMembership("acme")
+	// The session only feeds the remove-org form's gate here; superadmin is the
+	// role every test in this file has always signed in as.
+	sess := uiSession{Members: []store.Member{{Role: store.RoleSuperadmin}}}
+	data, err := s.orgMembership("acme", sess)
 	if err != nil {
 		t.Fatalf("orgMembership: %v", err)
 	}
@@ -727,21 +740,21 @@ func TestUIOrgMembershipSplitsKeys(t *testing.T) {
 		t.Fatalf("membership machines wrong: %+v", data.Machines)
 	}
 	if len(data.ScopedKeys) != 1 || data.ScopedKeys[0].Name != "scoped" {
-		t.Fatalf("scoped keys wrong: %+v", data.ScopedKeys)
+		t.Fatalf("org's keys wrong: %+v", data.ScopedKeys)
 	}
-	// exec:* and readonly reach every org, so they are listed as fleet-wide
-	// rather than counted as members of this one.
+
+	// From the other org's side: elsewhere is other's key, and none of acme's
+	// bindings — nor the unbound fleet-wide keys — leak into it.
+	other, err := s.orgMembership("other", sess)
+	if err != nil {
+		t.Fatalf("orgMembership(other): %v", err)
+	}
 	got := map[string]bool{}
-	for _, k := range data.FleetKeys {
+	for _, k := range other.ScopedKeys {
 		got[k.Name] = true
 	}
-	if !got["fleet"] || !got["watcher"] {
-		t.Fatalf("fleet-wide keys missing: %+v", data.FleetKeys)
-	}
-	for _, k := range append(append([]store.APIKeyInfo{}, data.ScopedKeys...), data.FleetKeys...) {
-		if k.Name == "elsewhere" {
-			t.Fatal("a key scoped to another org was listed as this org's")
-		}
+	if !got["elsewhere"] || got["scoped"] || got["fleet"] || got["watcher"] {
+		t.Fatalf("other org's keys wrong: %+v", other.ScopedKeys)
 	}
 }
 
@@ -815,7 +828,7 @@ func TestUIFleetMarksAVersionSkew(t *testing.T) {
 		{"bcross-old", "0.0.1-old"},
 		{"bcross-silent", ""},
 	} {
-		if err := st.CreateMachine(m.name, "pub-"+m.name, "h-"+m.name, "linux", "amd64", m.ver, "", false); err != nil {
+		if err := st.CreateMachine(m.name, "pub-"+m.name, "h-"+m.name, "linux", "amd64", m.ver, "", false, "bcross"); err != nil {
 			t.Fatalf("seeding %s: %v", m.name, err)
 		}
 	}
@@ -899,7 +912,7 @@ func staticContentType(t *testing.T, h http.Handler, path string) string {
 // below the page can see.
 func TestUIFleetPollTargetLeavesTheConfirmPanelAlone(t *testing.T) {
 	s, st, _ := newUITestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 

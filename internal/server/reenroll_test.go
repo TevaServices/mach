@@ -93,7 +93,7 @@ func dialAgentHello(t *testing.T, srvURL, mach, pubHex string, priv ed25519.Priv
 func TestReEnrollmentRevivesARevokedMachine(t *testing.T) {
 	s, st := newAuthTestServer(t)
 	oldPub, _ := newKeyHex(t)
-	if err := st.CreateMachine("bcross-web", oldPub, "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-web", oldPub, "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := st.RevokeMachine("bcross-web"); err != nil {
@@ -134,7 +134,7 @@ func TestRevivedMachineCanConnectAgain(t *testing.T) {
 
 	mach := "bcross-web"
 	oldPub, oldPriv := newKeyHex(t)
-	if err := st.CreateMachine(mach, oldPub, "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine(mach, oldPub, "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := st.RevokeMachine(mach); err != nil {
@@ -183,11 +183,11 @@ func TestAgentDialCannotEnumerateNames(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	knownPub, _ := newKeyHex(t)
-	if err := st.CreateMachine("bcross-live", knownPub, "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-live", knownPub, "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed known machine: %v", err)
 	}
 	revokedPub, _ := newKeyHex(t)
-	if err := st.CreateMachine("bcross-revoked", revokedPub, "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-revoked", revokedPub, "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed revoked machine: %v", err)
 	}
 	if err := st.RevokeMachine("bcross-revoked"); err != nil {
@@ -242,7 +242,7 @@ func TestAgentDialIsRateLimitedPerSource(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	knownPub, knownPriv := newKeyHex(t)
-	if err := st.CreateMachine("bcross-live", knownPub, "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-live", knownPub, "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -281,7 +281,7 @@ func TestAgentDialIsRateLimitedPerSource(t *testing.T) {
 func TestReEnrollmentDoesNotDisplaceAnActiveMachine(t *testing.T) {
 	s, st := newAuthTestServer(t)
 	livePub, _ := newKeyHex(t)
-	if err := st.CreateMachine("bcross-web", livePub, "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-web", livePub, "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	key := adminKey(t, s, "enroll")
@@ -318,7 +318,7 @@ func TestReEnrollmentDoesNotDisplaceAnActiveMachine(t *testing.T) {
 func TestReEnrollmentUnderAnotherNameIsRefused(t *testing.T) {
 	s, st := newAuthTestServer(t)
 	pub, _ := newKeyHex(t)
-	if err := st.CreateMachine("bcross-web", pub, "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-web", pub, "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := st.RevokeMachine("bcross-web"); err != nil {
@@ -345,7 +345,7 @@ func TestReEnrollmentUnderAnotherNameIsRefused(t *testing.T) {
 func TestRevokedKeyCanStartAPairing(t *testing.T) {
 	s, st := newAuthTestServer(t)
 	pub, _ := newKeyHex(t)
-	if err := st.CreateMachine("bcross-web", pub, "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-web", pub, "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := st.RevokeMachine("bcross-web"); err != nil {
@@ -366,7 +366,7 @@ func TestRevokedKeyCanStartAPairing(t *testing.T) {
 	// An ACTIVELY enrolled key is still refused, so the pairing path cannot be
 	// used to displace a working agent either.
 	activePub, _ := newKeyHex(t)
-	if err := st.CreateMachine("bcross-live", activePub, "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-live", activePub, "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	code, _ = bearerJSON(t, s.Routes(), "POST", "/v1/pair/start", "",
@@ -485,7 +485,7 @@ func TestTemporaryAgentRetiresItself(t *testing.T) {
 
 	mach := "bcross-tmp"
 	pub, priv := newKeyHex(t)
-	if err := st.CreateMachine(mach, pub, "h", "linux", "amd64", "v", "", true); err != nil {
+	if err := st.CreateMachine(mach, pub, "h", "linux", "amd64", "v", "", true, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	ws := dialAgent(t, srv.URL, mach, pub, priv)
@@ -524,7 +524,7 @@ func TestPermanentAgentCannotRetireItself(t *testing.T) {
 
 	mach := "bcross-fixed"
 	pub, priv := newKeyHex(t)
-	if err := st.CreateMachine(mach, pub, "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine(mach, pub, "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	ws := dialAgent(t, srv.URL, mach, pub, priv)

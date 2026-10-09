@@ -13,6 +13,13 @@ type Config struct {
 	Server    string `json:"server"`
 	Name      string `json:"name"`
 	ServerKey string `json:"server_key,omitempty"` // hex ed25519 pubkey, pinned at enrollment
+	// Org is the tenant this machine was enrolled under, as the control
+	// plane reported it in the enrollment response. It is what secrets are
+	// org-tagged against, and it is never derived from the machine name's
+	// prefix: a machine enrolled before this field existed has an empty Org
+	// and refuses every secrets feature with "re-enroll to learn your
+	// machine's org".
+	Org string `json:"org,omitempty"`
 }
 
 func configPath(stateDir string) string { return filepath.Join(stateDir, "config.json") }

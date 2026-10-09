@@ -74,6 +74,10 @@ const maxStreamSessionsPerKey = 32
 
 type streamRelay struct {
 	machine string
+	// org is the tenant the machine belongs to, resolved when the session
+	// opened, so every audit row this session writes is scoped without
+	// re-resolving the machine per command.
+	org string
 	// key is the API key that opened this session, for the per-key session
 	// bound. It is the key's name, never its secret.
 	key string
@@ -108,9 +112,10 @@ type streamRelay struct {
 	errOut  []byte
 }
 
-func newStreamRelay(machine, key string, console *protocol.WSConn) *streamRelay {
+func newStreamRelay(org, machine, key string, console *protocol.WSConn) *streamRelay {
 	return &streamRelay{
 		machine:   machine,
+		org:       org,
 		key:       key,
 		console:   console,
 		toConsole: make(chan protocol.Envelope, 64),
@@ -338,16 +343,19 @@ const streamAuditGrace = 2 * time.Second
 
 // handleConsoleStreamWS is the console's streaming endpoint (machine in the
 // query string, same bearer auth as exec).
-func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, keyName, scopes string) {
-	machine := r.URL.Query().Get("machine")
+func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, keyName, scopes, keyOrg string) {
+	// Tenancy: the machine is resolved inside the key's org before anything
+	// else — a tenant session can only ever be bound to its own org's
+	// machine, because the composed name cannot name another org's row.
+	machine := canonicalMachineName(keyOrg, r.URL.Query().Get("machine"))
 	// Exec scope, and only exec scope: a readonly key reads the fleet and the
 	// audit log, it does not run commands. Accepting "readonly" here would make
 	// the scope meaningless — streaming is command execution.
-	if !keyCanExecOn(scopes, machine) {
+	if !keyAllowsMachine(scopes, keyOrg, machine) {
 		// Recorded like the one-shot path's refusal (see auditNotScoped): an
 		// exec-scoped key asking for a machine outside its allowlist is the
 		// signal a stolen key leaves, and this endpoint is command execution.
-		s.auditNotScoped(machine, keyName)
+		s.auditNotScoped(machine, keyName, keyOrg)
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "key is not scoped for machine " + machine})
 		return
 	}
@@ -403,7 +411,13 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 	// cap on the path that bypassed it.
 	consoleConn.SetReadLimit(protocol.MaxConsoleFrameBytes)
 
-	relay := newStreamRelay(machine, keyName, consoleConn)
+	// The session's org comes from the machine row — a stored fact — falling
+	// back to the key's binding when the row cannot be read.
+	sessionOrg := keyOrg
+	if mrow, merr := s.st.MachineByName(machine); merr == nil && mrow != nil && mrow.Org != "" {
+		sessionOrg = mrow.Org
+	}
+	relay := newStreamRelay(sessionOrg, machine, keyName, consoleConn)
 	registerStream(sessionID, relay)
 	reserved = false
 	defer func() {
@@ -429,7 +443,7 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 					stderr += "\n"
 				}
 				stderr += "[mach: stream closed before the command reported an exit status]"
-				s.auditRow(machine, command, source, sqlNullInt(-1), stdout, stderr)
+				s.auditRow(relay.org, machine, command, source, sqlNullInt(-1), stdout, stderr)
 			}
 		}
 	}()
@@ -497,7 +511,7 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 					}
 					stderr += "[mach: " + end.Error + "]"
 				}
-				s.auditRow(machine, command, source, sqlNullInt(end.ExitCode), stdout, stderr)
+				s.auditRow(relay.org, machine, command, source, sqlNullInt(end.ExitCode), stdout, stderr)
 				// The row is IN. The session's teardown (and its own
 				// fate-unknown fallback) can stop waiting for this command.
 				relay.markAudited()
@@ -560,7 +574,7 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 				// An approved record dispatches as an exception to the mirrored
 				// ruleset; nothing approved, the attempt is audited and the
 				// command ends with ExitApprovalPending.
-				dispatch, fleetApproved := s.streamExecPolicyGate(consoleConn, machine, display, "console:"+keyName, &start, reason)
+				dispatch, fleetApproved := s.streamExecPolicyGate(consoleConn, relay.org, machine, display, "console:"+keyName, &start, reason)
 				if fleetApproved {
 					start.FleetApproved = true
 				}
@@ -568,11 +582,21 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 					continue
 				}
 			}
+			// The exec-time secrets guard: the relay reads the command by
+			// design, so injection names are judged here before anything is
+			// dispatched — the same point the fleet policy sits at.
+			if len(start.InjectEnv) > 0 {
+				if reason := s.injectRefusal(relay.org, machine, start.InjectEnv); reason != "" {
+					s.auditRow(relay.org, machine, display, "console:"+keyName, sqlNullInt(execRefused), "", reason)
+					s.streamRefuse(consoleConn, machine, reason)
+					continue
+				}
+			}
 			// The operator's soft block, re-checked per command: the check at
 			// connect only covers the moment the session opened, and a block set
 			// while it is idle must stop the next command too.
 			if ref := s.dispatchRefusal(machine); ref != nil {
-				s.auditRow(machine, display, "console:"+keyName, sqlNullInt(execRefused), "", ref.msg)
+				s.auditRow(relay.org, machine, display, "console:"+keyName, sqlNullInt(execRefused), "", ref.msg)
 				s.streamRefuse(consoleConn, machine, ref.msg)
 				continue
 			}
@@ -581,7 +605,7 @@ func (s *Server) handleConsoleStreamWS(w http.ResponseWriter, r *http.Request, k
 				// no way to attribute a second one's output or exit status. Refused
 				// and audited like any other declined dispatch, so the attempt is
 				// visible rather than silently run.
-				s.auditRow(machine, display, "console:"+keyName,
+				s.auditRow(relay.org, machine, display, "console:"+keyName,
 					sqlNullInt(execRefused), "", "refused: a command is already running in this session")
 				s.streamRefuse(consoleConn, machine,
 					"a command is already running in this session — wait for it to finish, or open another `mach console`")

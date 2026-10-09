@@ -230,6 +230,7 @@ approved:
 		OK        string `json:"ok"`
 		Machine   string `json:"machine"`
 		ServerKey string `json:"server_key"`
+		Org       string `json:"org"`
 	}](server, "/v1/pair/claim", protocol.PairClaimRequest{
 		PubKey: id.PubHex, PubE2E: e2eKey.PublicKeyHex(), Token: start.Token, Temporary: temporary,
 		Auth: "v1 " + base64.StdEncoding.EncodeToString(claimSig),
@@ -237,7 +238,7 @@ approved:
 	if err != nil {
 		return nil, fmt.Errorf("pair claim: %w", err)
 	}
-	cfg := &Config{Server: server, Name: claim.Machine, ServerKey: claim.ServerKey}
+	cfg := &Config{Server: server, Name: claim.Machine, ServerKey: claim.ServerKey, Org: claim.Org}
 	fmt.Printf("Enrolled as machine %q (server key pinned).\n", cfg.Name)
 	return cfg, nil
 }
@@ -270,6 +271,7 @@ func registerAPIKeyCore(server, apiKey, name, org string, id *Identity, e2eKey *
 		OK        string `json:"ok"`
 		Machine   string `json:"machine"`
 		ServerKey string `json:"server_key"`
+		Org       string `json:"org"`
 	}](server, "/v1/register/apikey", protocol.RegisterAPIKeyReq{
 		APIKey: apiKey, PubKey: id.PubHex, PubE2E: e2eKey.PublicKeyHex(), Name: name,
 		Hostname: hostname(), OS: runtime.GOOS, Arch: runtime.GOARCH, AgentVer: version.Version,
@@ -278,7 +280,7 @@ func registerAPIKeyCore(server, apiKey, name, org string, id *Identity, e2eKey *
 	if err != nil {
 		return nil, err
 	}
-	cfg := &Config{Server: server, Name: resp.Machine, ServerKey: resp.ServerKey}
+	cfg := &Config{Server: server, Name: resp.Machine, ServerKey: resp.ServerKey, Org: resp.Org}
 	fmt.Printf("Enrolled as machine %q via API key.\n", cfg.Name)
 	return cfg, nil
 }

@@ -142,8 +142,12 @@ from the broker; nothing protects content from the machine's own operator.
 | Pair-start rate limit (5 per IP / 10 min) and auth-failure rate limit (20 / 10 min), which every bearer surface now uses — including `/v1/register/apikey` and `/v1/agent/ws` (failed dials only, so a fleet behind one address spends nothing by connecting) | server.go, consoleapi.go, agent.go |
 | **The pair claim proves possession of the key it claims**: the agent signs the pairing token with its identity key (`protocol.ClaimMessage`), so a caller holding the token and the machine's *public* key cannot claim the pairing first and choose the row's `pub_e2e` or `temporary` | server/agent.go handlePairClaim/verifyClaimAuth, agent/register.go |
 | Org-prefixed machine names, conflicts error, and every submitted name validated regardless of what the QR suggested. The pair page pre-fills the org and a hostname-derived machine name **as editable defaults under a line saying the agent supplied them** (the `org` and `name` query parameters on the pair link); a suggested value is shown only if it satisfies `store.ValidMachinePart` (the store's own rule, not a second one) and is re-validated on submit, and nothing acts on it | store.ValidOrgName/ValidMachinePart, server/orgs.go, pairpages.go suggestedOrg/suggestedNamePart, agent/register.go suggestMachinePart |
-| Scoped API keys (enroll / readonly / exec:* / exec:m1\|m2), server-generated 192-bit secrets, stretched salted hashes | controlplane.AddAPIKey, store |
-| Read-only keys see the whole fleet and the whole audit trail, and nothing else | server/consoleapi.go canRead/readScope |
+| Scoped API keys (enroll / readonly / exec:* / exec:m1\|m2), server-generated 192-bit secrets, stretched salted hashes — **and every key is bound to one org**: its scopes resolve within that tenant, enrollment under any other prefix is refused, and another org's machine is an unknown machine to it | controlplane.AddAPIKey, store, server/tenancy.go |
+| Read-only keys see their org's fleet and their org's audit trail, and nothing else | server/consoleapi.go canRead/readScope, store.AuditList |
+| **UI membership**: a signed-in identity's powers come from membership rows (org + role), resolved at sign-in; no rows = a powerless sign-in; org-scoped pages, actions and approvals are gated on the session's own memberships | server/uiauth.go, uihandlers.go, orgadmin.go |
+| **Enrollment is authenticated and org-assigning**: the pair page requires a signed-in session and offers only the approver's own orgs; the challenge code still gates approve and deny; the org list is no longer public | server/pairpages.go, enrollpage.go |
+| **The org is stored, not derived**: machines, keys, audit rows, approvals and pairings carry the org written at enrollment/approval time; the startup backfill stamps pre-tenancy rows from the name prefixes (and binds pre-tenancy keys to the primary org), logging what it could not resolve | migrations/0004_tenancy.sql, store/backfill.go |
+| Org removal refuses while the org still has machines — the guard lives in the store, so every caller gets it | store.DeleteOrg |
 | **Fleet-wide command block list** (`MACH_EXEC_POLICY` / `MACH_EXEC_POLICY_FILE`), enforced for every key, scope and machine before dispatch — on `mach exec` **and** on the streaming console | server/policy.go, consoleapi.go handleExec, stream.go handleConsoleStreamWS |
 | **The same rules mirrored onto every machine** (pushed at connect, and on every change) and evaluated where a sealed command is decrypted, so the block list applies to E2E commands too; the agent acknowledges the ruleset version it holds | server/policy.go pushFleetPolicy, agent/policy.go fleetPolicy |
 | **E2E as a per-org server setting** (`mach-server e2e on\|off\|inherit --org X`, stored in `settings`; `MACH_E2E` pins every org), with the control signal clients obey or refuse on | server/e2eflag.go, consoleapi.go handleExec/handleE2EPub |
@@ -577,13 +581,14 @@ the winget manifest's InstallerSha256), verified by the consuming tool.
     confinement is a process group and a SIGKILL, not rlimits; see the
     `internal/agent/confine.go` package comment.
 
-26. **The org list is public.** The enrollment page prints every configured org
-    to an anonymous visitor, and the pair page offers them in a dropdown. That
-    is deliberate — the operator has to pick one, and an agent cannot enroll
-    without being told which prefix it is under — but it is half of the
-    name-space: the other half is the machine part, which is now the only thing
-    an unauthenticated caller cannot get (see the pair page and the agent socket
-    above). Do not treat an org name as a secret.
+26. **(Closed for UI deployments.)** With OIDC configured, the org list is no
+    longer public: the enrollment page shows a signed-in member their own
+    orgs, and the pair page offers only the approver's memberships. A
+    deployment with **no** OIDC has no membership model to filter with, and
+    keeps the public list deliberately — the same shape the CLI assumes,
+    where the host is the boundary. What remains true everywhere: an org
+    name is still not a *secret* — a superadmin sees them all, and machine
+    names carry the prefix on the wire.
 27. **The bounded stores can be filled.** Two in-memory stores refuse rather
     than grow: the UI's in-flight sign-in states (a distributed source that
     fills it blocks *other* operators' sign-ins until the entries age out, up
@@ -602,6 +607,12 @@ the winget manifest's InstallerSha256), verified by the consuming tool.
 
 - [ ] Control plane behind TLS reverse proxy; `MACH_TRUST_PROXY=1`.
 - [ ] `MACH_ORG` set to your org; `MACH_ORGS` lists every approvable org.
+- [ ] Tenancy bootstrapped from the host CLI: `mach-server add-org` for each
+      tenant, then `mach-server add-member [--org X] <email> <role>` for the
+      first superadmin and each org's admins. The UI grants nothing to an
+      identity without a membership row, so the first member cannot self-serve.
+- [ ] API keys minted per org (`add-api-key --org X`): a key's scopes resolve
+      inside its org, and enrollment through it lands in that org.
 - [ ] `MACH_EXEC_POLICY` (or `_FILE`) set to the fleet-wide block list, and
       each agent's own `MACH_POLICY` set for what that machine must never run.
 - [ ] Decide the E2E setting per org (`mach-server e2e`), with the trade in

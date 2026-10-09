@@ -583,11 +583,11 @@ const memberSource = `{{define "orgmember"}}
 </div>
 {{end}}
 
-<h2>Keys scoped to this org's machines ({{len .ScopedKeys}})</h2>
+<h2>API keys of this org ({{len .ScopedKeys}})</h2>
 {{if not .ScopedKeys}}<p class="muted">None.</p>{{else}}
-<div class="table-scroll" role="region" aria-label="Keys scoped to this org" tabindex="0">
+<div class="table-scroll" role="region" aria-label="Keys bound to this org" tabindex="0">
 <table>
-<caption class="sr-only">API keys whose exec allowlist names a machine in this org</caption>
+<caption class="sr-only">API keys bound to this org</caption>
 <thead><tr><th scope="col">Key</th><th scope="col">Scopes</th><th scope="col">Created</th></tr></thead><tbody>
 {{range .ScopedKeys}}<tr><td><code>{{.Name}}</code></td><td><code>{{.Scopes}}</code></td>
 <td>{{.CreatedAt}}</td></tr>{{end}}
@@ -595,21 +595,7 @@ const memberSource = `{{define "orgmember"}}
 </div>
 {{end}}
 
-<h2>Fleet-wide keys ({{len .FleetKeys}})</h2>
-<p class="muted">Not scoped to an org — an <code>exec:*</code>, <code>readonly</code>
-or <code>enroll</code> key reaches every org, so they are listed separately.</p>
-{{if not .FleetKeys}}<p class="muted">None.</p>{{else}}
-<div class="table-scroll" role="region" aria-label="Fleet-wide keys" tabindex="0">
-<table>
-<caption class="sr-only">API keys that reach every org</caption>
-<thead><tr><th scope="col">Key</th><th scope="col">Scopes</th><th scope="col">Created</th></tr></thead><tbody>
-{{range .FleetKeys}}<tr><td><code>{{.Name}}</code></td><td><code>{{.Scopes}}</code></td>
-<td>{{.CreatedAt}}</td></tr>{{end}}
-</tbody></table>
-</div>
-{{end}}
-
-{{if not .Pinned}}
+{{if and (not .Pinned) .CanRemove}}
 <h2>Remove this org</h2>
 <p class="muted">New machines can no longer enroll under the
 <code>{{.Org}}</code>- prefix; existing machines keep working. An org that still

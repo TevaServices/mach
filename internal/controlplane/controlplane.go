@@ -94,6 +94,20 @@ func Serve() {
 		log.Fatalf("mach-server: open store: %v", err)
 	}
 	defer st.Close()
+	// Tenancy backfill, before anything serves: machines enrolled before orgs
+	// were stored get their org stamped from the name prefixes (the same
+	// resolution enrollment always used), and keys minted before bindings get
+	// the primary org. Idempotent — a restart with nothing to do costs one
+	// indexed query — and what it could not resolve is logged, not guessed.
+	orgs := Orgs()
+	if dbOrgs, derr := st.ListOrgsDB(); derr == nil {
+		for _, o := range dbOrgs {
+			orgs = append(orgs, o.Name)
+		}
+	} else {
+		log.Printf("mach-server: could not read stored orgs for backfill: %v", derr)
+	}
+	st.BackfillTenancy(Org(), orgs)
 	// Resolved before anything binds: a DSN with no MACH_SERVER_KEY must fail
 	// here, at startup, rather than creating a directory named after the
 	// database password and a key that will not survive a restart.
@@ -139,10 +153,10 @@ func Serve() {
 // printing the arguments instead made it wrong whenever they were normalized —
 // `add-api-key AuditKey admin` reported "admin" while the row held the exec:*
 // that "admin" is an alias for, under the lowercased name the store keeps.
-func AddAPIKey(name, scopes string) (key, storedName, storedScopes string, err error) {
+func AddAPIKey(name, scopes, org string) (key, storedName, storedScopes, storedOrg string, err error) {
 	st, err := openStore()
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	defer st.Close()
 	switch strings.TrimSpace(scopes) {
@@ -155,12 +169,12 @@ func AddAPIKey(name, scopes string) (key, storedName, storedScopes string, err e
 	default:
 		// allowlist form: exec:m1|m2|m3 (per-machine)
 		if !strings.HasPrefix(scopes, "exec:") {
-			return "", "", "", fmt.Errorf("scopes must be one of: enroll | readonly | exec:* | exec:<m1>|<m2>")
+			return "", "", "", "", fmt.Errorf("scopes must be one of: enroll | readonly | exec:* | exec:<m1>|<m2>")
 		}
 		// An empty allowlist would create a key that can never exec; that
 		// is always a mistake (usually a truncated machine list).
 		if strings.TrimSpace(strings.TrimPrefix(scopes, "exec:")) == "" {
-			return "", "", "", fmt.Errorf("exec: allowlist is empty — list machines (exec:<m1>|<m2>) or use exec:*")
+			return "", "", "", "", fmt.Errorf("exec: allowlist is empty — list machines (exec:<m1>|<m2>) or use exec:*")
 		}
 		// A literal `*` *among* machine names is refused rather than stored.
 		// `exec:web|*` is always a typo for `exec:*`: no machine is named `*`,
@@ -171,17 +185,110 @@ func AddAPIKey(name, scopes string) (key, storedName, storedScopes string, err e
 		if allow := strings.TrimSpace(strings.TrimPrefix(scopes, "exec:")); allow != "*" {
 			for _, m := range strings.Split(allow, "|") {
 				if strings.TrimSpace(m) == "*" {
-					return "", "", "", fmt.Errorf("`*` is not a machine name — use exec:* for every machine, or list real names (exec:<m1>|<m2>)")
+					return "", "", "", "", fmt.Errorf("`*` is not a machine name — use exec:* for every machine, or list real names (exec:<m1>|<m2>)")
 				}
 			}
 		}
 	}
+	// Tenancy: a key belongs to one org — the tenant it can see and act
+	// within. An omitted --org binds to the primary org, which is what every
+	// key minted before tenancy was backfilled to; the printed line records
+	// the binding either way, so the operator sees what was stored rather
+	// than guessing from what was typed.
+	org = strings.ToLower(strings.TrimSpace(org))
+	if org == "" {
+		org = strings.ToLower(Org())
+	}
+	if !store.ValidOrgLabel(org) {
+		return "", "", "", "", fmt.Errorf("%q is not a valid org label", org)
+	}
 	storedName = strings.ToLower(strings.TrimSpace(name))
 	key = "mach_" + store.RandToken(24) // 192-bit server-generated secret
-	if err := st.CreateAPIKey(storedName, key, scopes); err != nil {
-		return "", "", "", err
+	if err := st.CreateAPIKey(storedName, key, scopes, org); err != nil {
+		return "", "", "", "", err
 	}
-	return key, storedName, scopes, nil
+	return key, storedName, scopes, org, nil
+}
+
+// AddOrg creates a tenant. The CLI is where org creation lives because the
+// UI's authorization is per-org by definition — someone has to exist outside
+// every org to create the first one, and that someone is the operator on the
+// control-plane host. Names are lowercased like every other org consumer.
+func AddOrg(name string) error {
+	org := strings.ToLower(strings.TrimSpace(name))
+	if !store.ValidOrgLabel(org) {
+		return fmt.Errorf("%q is not a valid org label (2-20 chars: letters, digits, hyphen)", org)
+	}
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	if err := st.CreateOrg(org, "cli"); err != nil {
+		if errors.Is(err, store.ErrOrgExists) {
+			return fmt.Errorf("org %q already exists", org)
+		}
+		return err
+	}
+	fmt.Printf("org %q created — machines may enroll as %s-<machine>, members can now be added with add-member\n", org, org)
+	return nil
+}
+
+// AddMember records a UI identity's binding to one org (or, with the
+// superadmin role, to all of them). The first member of a fresh control
+// plane must be created here: the UI grants nothing to an identity without
+// a membership row, so nobody can self-serve their way in.
+func AddMember(org, email, role string) error {
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	if err := st.AddMember(org, email, "", role, "cli"); err != nil {
+		return err
+	}
+	if role == store.RoleSuperadmin {
+		fmt.Printf("member %q is a superadmin: may manage orgs and act within every org\n", email)
+	} else {
+		fmt.Printf("member %q added to org %q as %q\n", email, org, role)
+	}
+	return nil
+}
+
+// RemoveMember deletes one membership binding. An unknown binding is an
+// error, not a silent success — same rule as revoke-api-key.
+func RemoveMember(org, email string) error {
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	if err := st.RemoveMember(org, email); err != nil {
+		return err
+	}
+	fmt.Printf("member %q removed from org %q\n", email, org)
+	return nil
+}
+
+// ListMembers prints membership rows, optionally scoped to one org.
+func ListMembers(org string) error {
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	members, err := st.ListMembers(strings.ToLower(strings.TrimSpace(org)))
+	if err != nil {
+		return err
+	}
+	if len(members) == 0 {
+		fmt.Println("no members")
+		return nil
+	}
+	for _, m := range members {
+		fmt.Printf("%s\t%s\t%s\n", m.Org, m.Role, m.Email)
+	}
+	return nil
 }
 
 // RevokeAPIKey marks a stored API key revoked so it stops authenticating.

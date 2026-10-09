@@ -20,7 +20,7 @@ func execReq(t *testing.T, s *Server, key, body string) (int, string) {
 func adminKey(t *testing.T, s *Server, scopes string) string {
 	t.Helper()
 	key := "mach_" + store.RandToken(24)
-	if err := s.st.CreateAPIKey("k", key, scopes); err != nil {
+	if err := s.st.CreateAPIKey("k", key, scopes, ""); err != nil {
 		t.Fatalf("create key: %v", err)
 	}
 	return key
@@ -35,13 +35,13 @@ func TestReadonlyKeySeesEverythingButRunsNothing(t *testing.T) {
 	h := s.Routes()
 	for _, name := range []string{"bcross-a", "bcross-b"} {
 		// No E2E key: this machine is exercised over the plaintext path.
-		if err := st.CreateMachine(name, "pub-"+name, "h", "linux", "amd64", "v", "", false); err != nil {
+		if err := st.CreateMachine(name, "pub-"+name, "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 			t.Fatalf("seed %s: %v", name, err)
 		}
-		_ = st.AuditInsert("2026-01-01T00:00:00Z", name, "echo hi", "console:x", sql.NullInt64{Int64: 0, Valid: true}, "hi", "")
+		_ = st.AuditInsert("2026-01-01T00:00:00Z", "bcross", name, "echo hi", "console:x", sql.NullInt64{Int64: 0, Valid: true}, "hi", "")
 	}
 	key := "mach_" + store.RandToken(24)
-	if err := st.CreateAPIKey("ro", key, "readonly"); err != nil {
+	if err := st.CreateAPIKey("ro", key, "readonly", ""); err != nil {
 		t.Fatalf("create key: %v", err)
 	}
 
@@ -88,7 +88,7 @@ func TestReadonlyKeySeesEverythingButRunsNothing(t *testing.T) {
 func TestScopedKeyDoesNotReachACaseVariant(t *testing.T) {
 	s, st := newAuthTestServer(t)
 	for _, name := range []string{"bcross-web", "bcross-Web"} {
-		if err := st.CreateMachine(name, "pub-"+name, "h", "linux", "amd64", "v", "", false); err != nil {
+		if err := st.CreateMachine(name, "pub-"+name, "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 			t.Fatalf("seed %s: %v", name, err)
 		}
 	}
@@ -132,7 +132,7 @@ func TestScopedKeyDoesNotReachACaseVariant(t *testing.T) {
 // that the predicate said otherwise, and nothing exercised it.)
 func TestE2EPubRequiresExecScope(t *testing.T) {
 	s, st := newAuthTestServer(t)
-	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "e2epub-a", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub-a", "h", "linux", "amd64", "v", "e2epub-a", false, "bcross"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	ro := adminKey(t, s, "readonly")

@@ -77,21 +77,21 @@ func TestNewChallengeCodeEntropyAndFormat(t *testing.T) {
 
 func TestAPIKeyScopes(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateAPIKey("console", "mach_abc", "exec:*"); err != nil {
+	if err := st.CreateAPIKey("console", "mach_abc", "exec:*", "bcross"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := st.CreateAPIKey("enroll", "mach_def", "enroll"); err != nil {
+	if err := st.CreateAPIKey("enroll", "mach_def", "enroll", "bcross"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	ok, name, scopes, err := st.APIKeyExists("mach_abc")
+	ok, name, scopes, _, err := st.APIKeyExists("mach_abc")
 	if err != nil || !ok || name != "console" || scopes != "exec:*" {
 		t.Fatalf("ok=%v name=%q scopes=%q err=%v", ok, name, scopes, err)
 	}
-	ok, _, scopes, err = st.APIKeyExists("mach_def")
+	ok, _, scopes, _, err = st.APIKeyExists("mach_def")
 	if err != nil || !ok || scopes != "enroll" {
 		t.Fatalf("enroll key: ok=%v scopes=%q err=%v", ok, scopes, err)
 	}
-	if ok, _, _, _ := st.APIKeyExists("mach_wrong"); ok {
+	if ok, _, _, _, _ := st.APIKeyExists("mach_wrong"); ok {
 		t.Fatal("wrong key accepted")
 	}
 }
@@ -130,12 +130,12 @@ func TestPairingApproveFlow(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	// Wrong code does not approve.
-	ok, why, err := st.ApprovePairing(id, "AAAA-AAAA-AAAA", "bcross-x")
+	ok, why, err := st.ApprovePairing(id, "AAAA-AAAA-AAAA", "bcross-x", "bcross")
 	if ok || why != "bad-code" {
 		t.Fatalf("wrong code: ok=%v why=%q err=%v", ok, why, err)
 	}
 	// Correct code approves (client normalizes dashes already).
-	ok, why, err = st.ApprovePairing(id, code, "bcross-x")
+	ok, why, err = st.ApprovePairing(id, code, "bcross-x", "bcross")
 	if err != nil || !ok || why != "" {
 		t.Fatalf("approve: ok=%v why=%q err=%v", ok, why, err)
 	}
@@ -281,10 +281,10 @@ func TestAuditRedactionCoversRealSecretShapes(t *testing.T) {
 
 func TestAuditInsertList(t *testing.T) {
 	st := testStore(t)
-	if err := st.AuditInsert(now(), "bcross-a", "echo hi", "console:k", sql.NullInt64{Int64: 0, Valid: true}, "hi\n", ""); err != nil {
+	if err := st.AuditInsert(now(), "bcross", "bcross-a", "echo hi", "console:k", sql.NullInt64{Int64: 0, Valid: true}, "hi\n", ""); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	entries, err := st.AuditList("bcross-a", 10)
+	entries, err := st.AuditList("bcross", "bcross-a", 10)
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("list: %v len=%d", err, len(entries))
 	}
@@ -295,7 +295,7 @@ func TestAuditInsertList(t *testing.T) {
 
 func TestMachineRevocation(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateMachine("bcross-a", "pub", "host", "linux", "arm64", "v", "", false); err != nil {
+	if err := st.CreateMachine("bcross-a", "pub", "host", "linux", "arm64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if err := st.RevokeMachine("bcross-a"); err != nil {
@@ -335,14 +335,14 @@ func TestConsumePairingFailureDoesNotBurnToken(t *testing.T) {
 	st := testStore(t)
 	// A machine with the target name already exists: the claim insert will
 	// fail on UNIQUE. The pairing must survive un-consumed and inspectable.
-	if err := st.CreateMachine("bcross-x", "other-pub", "", "", "", "", "", false); err != nil {
+	if err := st.CreateMachine("bcross-x", "other-pub", "", "", "", "", "", false, "bcross"); err != nil {
 		t.Fatalf("seed machine: %v", err)
 	}
 	id, token, code, err := st.CreatePairing("pubkey-hex", "host", "", "", "", time.Minute)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if ok, why, err := st.ApprovePairing(id, code, "bcross-x"); err != nil || !ok || why != "" {
+	if ok, why, err := st.ApprovePairing(id, code, "bcross-x", "bcross"); err != nil || !ok || why != "" {
 		t.Fatalf("approve: ok=%v why=%q err=%v", ok, why, err)
 	}
 	p := mustPairingByToken(t, st, token)
@@ -368,7 +368,7 @@ func TestApproveAfterDenyCannotResurrect(t *testing.T) {
 	if changed, err := st.DenyPairing(id); err != nil || !changed {
 		t.Fatalf("deny: changed=%v err=%v", changed, err)
 	}
-	ok, why, err := st.ApprovePairing(id, code, "bcross-x")
+	ok, why, err := st.ApprovePairing(id, code, "bcross-x", "bcross")
 	// Either the pre-check sees "denied", or the guard catches the race and
 	// reports "not-pending" — either way a denied pairing must not resurrect.
 	if ok || err != nil || (why != "denied" && why != "not-pending") {
@@ -392,7 +392,7 @@ func TestApprovedPairingCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if ok, why, err := st.ApprovePairing(id, code, "bcross-old"); err != nil || !ok {
+	if ok, why, err := st.ApprovePairing(id, code, "bcross-old", "bcross"); err != nil || !ok {
 		t.Fatalf("approve: %v %q %v", ok, why, err)
 	}
 	past := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
@@ -409,11 +409,11 @@ func TestApprovedPairingCleanup(t *testing.T) {
 
 func TestAuditCommandRedacted(t *testing.T) {
 	st := testStore(t)
-	if err := st.AuditInsert(now(), "bcross-a", `curl -H 'Authorization: Bearer tok123'`, "console:k",
+	if err := st.AuditInsert(now(), "bcross", "bcross-a", `curl -H 'Authorization: Bearer tok123'`, "console:k",
 		sql.NullInt64{Int64: 0, Valid: true}, "", ""); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	entries, err := st.AuditList("bcross-a", 10)
+	entries, err := st.AuditList("bcross", "bcross-a", 10)
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("list: %v len=%d", err, len(entries))
 	}
@@ -594,7 +594,7 @@ func TestPostgresStoreEndToEnd(t *testing.T) {
 
 	// An auto-assigned primary key (BIGSERIAL, not INTEGER PRIMARY KEY).
 	name := "pgtest-" + RandToken(4)
-	if err := st.CreateMachine(name, "pub-"+name, "h", "linux", "amd64", "v", "", false); err != nil {
+	if err := st.CreateMachine(name, "pub-"+name, "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
 		t.Fatalf("create machine: %v", err)
 	}
 	if m, err := st.MachineByName(name); err != nil || m == nil {
@@ -602,10 +602,10 @@ func TestPostgresStoreEndToEnd(t *testing.T) {
 	}
 	// A parameterized lookup on the indexed path.
 	key := "mach_" + RandToken(24)
-	if err := st.CreateAPIKey("k", key, "exec:*"); err != nil {
+	if err := st.CreateAPIKey("k", key, "exec:*", "bcross"); err != nil {
 		t.Fatalf("create key: %v", err)
 	}
-	ok, gotName, scopes, err := st.APIKeyExists(key)
+	ok, gotName, scopes, _, err := st.APIKeyExists(key)
 	if err != nil || !ok || gotName != "k" || scopes != "exec:*" {
 		t.Fatalf("APIKeyExists = %v %q %q %v", ok, gotName, scopes, err)
 	}
@@ -622,16 +622,16 @@ func TestPostgresStoreEndToEnd(t *testing.T) {
 	if err != nil || p == nil {
 		t.Fatalf("pairing by token: %v %+v", err, p)
 	}
-	if ok, reason, err := st.ApprovePairing(p.ID, code, name+"-2"); err != nil || !ok {
+	if ok, reason, err := st.ApprovePairing(p.ID, code, name+"-2", "bcross"); err != nil || !ok {
 		t.Fatalf("approve: ok=%v reason=%q err=%v", ok, reason, err)
 	}
 	if st.PairingState(p) != "approved" {
 		t.Fatalf("state = %q, want approved", st.PairingState(p))
 	}
-	if err := st.AuditInsert(now(), name, "echo hi", "console:test", sql.NullInt64{}, "hi", ""); err != nil {
+	if err := st.AuditInsert(now(), "bcross", name, "echo hi", "console:test", sql.NullInt64{}, "hi", ""); err != nil {
 		t.Fatalf("audit insert: %v", err)
 	}
-	entries, err := st.AuditList(name, 10)
+	entries, err := st.AuditList("bcross", name, 10)
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("audit list = %+v %v", entries, err)
 	}
@@ -643,7 +643,7 @@ func TestPostgresStoreEndToEnd(t *testing.T) {
 	}
 	// Deleting a machine keeps its audit trail: who ran what is a record about
 	// the fleet, not a property of the machine row.
-	if entries, err := st.AuditList(name, 10); err != nil || len(entries) != 1 {
+	if entries, err := st.AuditList("bcross", name, 10); err != nil || len(entries) != 1 {
 		t.Errorf("audit trail after delete = %+v %v", entries, err)
 	}
 }
