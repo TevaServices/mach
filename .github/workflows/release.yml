@@ -702,7 +702,7 @@ jobs:
             echo "SKIP=1" >> "$GITHUB_ENV"
           fi
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         if: env.SKIP != '1'
         with:
           go-version-file: go.mod
