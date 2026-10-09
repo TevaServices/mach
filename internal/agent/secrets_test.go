@@ -78,28 +78,33 @@ func TestSecretsStoreFileModesAndAtomicWrite(t *testing.T) {
 	if err := s.put("DB_PASSWORD", "s3cr3tvalue", "orgA"); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	storePath := filepath.Join(dir, "secrets.json")
-	st, err := os.Stat(storePath)
-	if err != nil {
-		t.Fatalf("store file missing: %v", err)
-	}
-	if st.Mode().Perm() != 0o600 {
-		t.Errorf("secrets.json mode = %o, want 600", st.Mode().Perm())
-	}
-	// A loose file is tightened on the next open, the way agent.key and the
-	// e2e pin file are.
-	if err := os.Chmod(storePath, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := s.resolve("DB_PASSWORD"); err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	st, err = os.Stat(storePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st.Mode().Perm() != 0o600 {
-		t.Errorf("loose secrets.json not tightened: mode = %o", st.Mode().Perm())
+	// The 0600 tightening is a POSIX property (Go's chmod is a no-op on
+	// Windows, where the file is protected by the profile's ACLs); the same
+	// skip the store's own mode test takes.
+	if runtime.GOOS != "windows" {
+		storePath := filepath.Join(dir, "secrets.json")
+		st, err := os.Stat(storePath)
+		if err != nil {
+			t.Fatalf("store file missing: %v", err)
+		}
+		if st.Mode().Perm() != 0o600 {
+			t.Errorf("secrets.json mode = %o, want 600", st.Mode().Perm())
+		}
+		// A loose file is tightened on the next open, the way agent.key and
+		// the e2e pin file are.
+		if err := os.Chmod(storePath, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.resolve("DB_PASSWORD"); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		st, err = os.Stat(storePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Mode().Perm() != 0o600 {
+			t.Errorf("loose secrets.json not tightened: mode = %o", st.Mode().Perm())
+		}
 	}
 	// Atomic write: no temp file left behind.
 	entries, err := os.ReadDir(dir)

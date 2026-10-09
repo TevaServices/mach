@@ -6,6 +6,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -101,7 +102,10 @@ func TestSecretsCommandAddListRemove(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store file missing: %v", err)
 	}
-	if st.Mode().Perm() != 0o600 {
+	// 0600 is a POSIX property (chmod is a no-op on Windows; the file is
+	// protected by the profile's ACLs there) — the same skip the agent's
+	// store mode test takes.
+	if runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 		t.Errorf("secrets.json mode = %o, want 600", st.Mode().Perm())
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, "secrets.json"))
