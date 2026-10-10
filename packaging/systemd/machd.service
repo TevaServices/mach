@@ -2,7 +2,9 @@
 #
 # This file replaces the unit that `mach install` used to generate at
 # runtime (removed in #44): the package installs it verbatim and the
-# package manager owns the lifecycle (postinst enables it; prerm stops it).
+# package manager owns the lifecycle (postinst enables it; prerm stops it;
+# on upgrade the package scripts restart the agent if and only if it was
+# serving before the upgrade's stop — see the packaging scripts).
 #
 # The supervision semantics below are a correctness property, carried over
 # unchanged from the generated unit: Restart=on-failure, never always —

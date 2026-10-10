@@ -9,6 +9,13 @@ set -e
 
 if [ "$1" = "remove" ] || [ "$1" = "upgrade" ]; then
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        # Record whether the agent was serving before this stop: the postinst
+        # on upgrade restarts exactly what was running. A deliberately
+        # stopped agent (revoked machine, operator stop) leaves no marker and
+        # stays stopped.
+        if systemctl is-active --quiet machd.service 2>/dev/null; then
+            : > /run/machd.was-running
+        fi
         systemctl stop machd.service || true
     fi
 fi

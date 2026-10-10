@@ -121,14 +121,26 @@ func TestShippedSystemdUnitExecStartIsQuoted(t *testing.T) {
 // deb postinst: create the account, enable — never start. machd on an
 // unenrolled state dir must not be started by the package (crash-loop;
 // enrollment is a person at the machine).
-func TestDebPostinstEnablesButNeverStarts(t *testing.T) {
+func TestDebPostinstEnablesAndRestartsOnlyWhatWasRunning(t *testing.T) {
 	s := readPackagingCode(t, "packaging/nfpm/deb/postinst")
 	mustContain(t, s, "deb postinst",
 		"adduser --system",
 		"/var/lib/mach",
 		"systemctl enable machd.service",
+		// The upgrade restart is gated on the prerm's was-running marker:
+		// a serving agent comes back, a deliberately stopped one (revoked
+		// machine, operator stop) stays stopped. First installs never
+		// start (unenrolled machd crash-loops; enrollment is a person at
+		// the machine, #41).
+		"/run/machd.was-running",
 	)
+	mustContain(t, s, "deb postinst", "systemctl restart machd.service")
 	mustNotContain(t, s, "deb postinst", "systemctl start", "enable --now")
+	if restart := strings.Index(s, "systemctl restart machd.service"); restart >= 0 {
+		if marker := strings.Index(s, "/run/machd.was-running"); marker < 0 || marker > restart {
+			t.Fatalf("deb postinst: restart is not gated on the was-running marker")
+		}
+	}
 }
 
 // deb postrm: state survives a plain remove (re-install keeps the machine's
@@ -179,9 +191,15 @@ func TestDebPostrmKeepsStateOnRemoveRemovesOnPurge(t *testing.T) {
 func TestRpmScriptletsLifecycle(t *testing.T) {
 	pre := readPackaging(t, "packaging/nfpm/rpm/pre.sh")
 	mustContain(t, pre, "rpm pre", "useradd --system")
+	// %pre records whether the agent is serving: %post restarts exactly
+	// that on upgrade (rpm never stops the unit on upgrade, so this is
+	// also what swaps the old binary for the new one).
+	mustContain(t, pre, "rpm pre", "/run/machd.was-running")
 
 	post := readPackagingCode(t, "packaging/nfpm/rpm/post.sh")
 	mustContain(t, post, "rpm post", "systemctl enable machd.service")
+	mustContain(t, post, "rpm post", "/run/machd.was-running")
+	mustContain(t, post, "rpm post", "systemctl restart machd.service")
 	mustNotContain(t, post, "rpm post", "systemctl start")
 
 	preun := readPackaging(t, "packaging/nfpm/rpm/preun.sh")
@@ -216,6 +234,13 @@ func TestApkShipsOpenRCWithoutUnconditionalRestart(t *testing.T) {
 
 	post := readPackagingCode(t, "packaging/nfpm/apk/post-install.sh")
 	mustContain(t, post, "apk post-install", "rc-update add machd")
+	// Upgrade restarts an ENROLLED machine — the pre-deinstall stopped it,
+	// and the enrollment marker (config.json) is the only state that
+	// survives the stop. But the restart must stay INSIDE that gate: an
+	// unconditional rc-service start would respawn a retired machine's
+	// agent, and exit 0 must mean stop (invariant 22).
+	mustContain(t, post, "apk post-install", "[ -f /var/lib/mach/config.json ]")
+	mustContain(t, post, "apk post-install", "rc-service machd restart")
 	mustNotContain(t, post, "apk post-install", "rc-service machd start")
 }
 
