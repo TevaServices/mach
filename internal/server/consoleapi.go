@@ -383,7 +383,14 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 			Timeout:   req.Timeout,
 		})
 	} else {
-		cmdPayload, _ = json.Marshal(protocol.ExecCommand{Command: req.Command, Argv: req.Argv, Timeout: req.Timeout, FleetApproved: fleetApproved})
+		// Plaintext: the command text is already visible to the control
+		// plane, so the inject NAMES ride beside it — they are in the
+		// request and have already passed the injectRefusal gate above.
+		// The agent resolves them against its local store and scrubs every
+		// output byte. Dropping the names here silently ran every plaintext
+		// exec (the MCP exec tool's only path) with empty variables while
+		// the sealed path injected fine.
+		cmdPayload, _ = json.Marshal(protocol.ExecCommand{Command: req.Command, Argv: req.Argv, InjectEnv: req.InjectEnv, Timeout: req.Timeout, FleetApproved: fleetApproved})
 	}
 	if err := ac.Conn.WriteEnvelope(protocol.Envelope{Type: "exec", ReqID: reqID, Payload: cmdPayload}); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent connection lost"})
