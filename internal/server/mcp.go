@@ -375,7 +375,7 @@ func mcpTools() []map[string]any {
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"machine": map[string]any{"type": "string"},
+					"machine": map[string]any{"type": "string", "description": "machine name exactly as machines_list shows it (the Name column) — never an invented variant; an unknown or offline name is refused with the enrolled list"},
 					"command": map[string]any{"type": "string", "description": "shell mode"},
 					"argv":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "no-shell mode: execve'd directly, nothing parses it"},
 					"inject":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "secret env-var NAMES to resolve on the machine"},

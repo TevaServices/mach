@@ -137,6 +137,41 @@ func readScope(scopes string) (allowed []string, all bool) {
 
 // ---- POST /v1/exec (exec scope; allowlist-checked per machine) ----
 
+// unknownMachineHint names the machines the caller's own org has enrolled,
+// with their live state, appended to an "offline or unknown" refusal. An
+// LLM caller that guessed a name (observed 2026-10-09: an invented
+// "teven-teva-ent-docker01" for teva's "teva-ent-docker01") can self-correct
+// in one round trip instead of calling machines_list blind. Tenancy holds:
+// the list is the key's org only — the same set machines_list shows — so a
+// cross-org guess learns nothing it could not already list.
+func (s *Server) unknownMachineHint(keyOrg string) string {
+	machines, err := s.st.ListMachinesByOrg(keyOrg)
+	if err != nil || len(machines) == 0 {
+		return ""
+	}
+	online := s.br.OnlineNames()
+	const max = 12
+	names := make([]string, 0, len(machines))
+	for _, m := range machines {
+		if m.Revoked {
+			continue // what machines_list shows: a revoked enrollment is not a machine
+		}
+		if len(names) == max {
+			names = append(names, "…")
+			break
+		}
+		state := "offline"
+		if online[m.Name] {
+			state = "online"
+		}
+		names = append(names, m.Name+" ("+state+")")
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	return " — machines enrolled in this org: " + strings.Join(names, ", ")
+}
+
 func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, scopes, keyOrg string) {
 	var req protocol.ExecRequest
 	if err := readJSON(r, &req); err != nil {
@@ -303,7 +338,8 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, keyName, sco
 
 	ac := s.br.WaitOnline(machine, 15*time.Second)
 	if ac == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "machine offline or unknown: " + req.Machine})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "machine offline or unknown: " + req.Machine + s.unknownMachineHint(keyOrg)})
 		return
 	}
 	// Re-checked after the wait, because that wait is up to fifteen seconds and
