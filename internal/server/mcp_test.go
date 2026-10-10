@@ -119,6 +119,39 @@ func TestMCPMachinesListIsOrgScoped(t *testing.T) {
 	}
 }
 
+// An unknown machine name in the key's OWN org comes back with the enrolled
+// list appended, so a caller that guessed a name (observed 2026-10-09: an
+// invented org-qualified variant) can self-correct from the refusal alone —
+// and a cross-org guess names nothing outside the key's org.
+func TestMCPExecUnknownMachineNamesTheEnrolled(t *testing.T) {
+	s := newTestServer(t)
+	st := testServerStore(t, s)
+	if err := st.CreateMachine("real-web", "pub-a", "h", "linux", "amd64", "v", "", false, "bcross"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := st.CreateMachine("xy-web", "pub-b", "h", "linux", "amd64", "v", "", false, "xy"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	_ = st.CreateAPIKey("ops", "mach_mcp", "exec:*", "bcross")
+	h := s.Routes()
+
+	_, resp := mcpCall(t, h, "mach_mcp", "tools/call",
+		`,"params":{"name":"exec","arguments":{"machine":"guess-web","command":"echo hi"}}`)
+	if resp.Error != nil {
+		t.Fatalf("exec call errored at the protocol level: %v", resp.Error)
+	}
+	content := resp.Result.(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(content, "offline or unknown: guess-web") {
+		t.Fatalf("unknown-machine exec answered %q, want the plain refusal", content)
+	}
+	if !strings.Contains(content, "real-web") {
+		t.Fatalf("refusal does not name the enrolled machine: %q", content)
+	}
+	if strings.Contains(content, "xy-web") {
+		t.Fatalf("refusal leaked another org's machine: %q", content)
+	}
+}
+
 // exec through MCP is exec through the console API: a cross-org machine is
 // an unknown machine, and the pipeline's refusals come back as tool results
 // rather than as new refusal machinery.
