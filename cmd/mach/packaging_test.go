@@ -121,24 +121,28 @@ func TestShippedSystemdUnitExecStartIsQuoted(t *testing.T) {
 // deb postinst: create the account, enable — never start. machd on an
 // unenrolled state dir must not be started by the package (crash-loop;
 // enrollment is a person at the machine).
-func TestDebPostinstEnablesAndRestartsOnlyWhatWasRunning(t *testing.T) {
+func TestDebPostinstEnablesAndRestartsUnlessRetired(t *testing.T) {
 	s := readPackagingCode(t, "packaging/nfpm/deb/postinst")
 	mustContain(t, s, "deb postinst",
 		"adduser --system",
 		"/var/lib/mach",
 		"systemctl enable machd.service",
-		// The upgrade restart is gated on the prerm's was-running marker:
-		// a serving agent comes back, a deliberately stopped one (revoked
-		// machine, operator stop) stays stopped. First installs never
+		// The upgrade restart is gated on the enrollment marker AND the
+		// unit's own last exit: a serving agent stopped by the prerm (or by
+		// an operator, or a crashed one) comes back; a retired machine's
+		// agent exited 0 and must stay stopped (exit 0 means stop — the
+		// supervisor never restarts a clean exit). First installs never
 		// start (unenrolled machd crash-loops; enrollment is a person at
 		// the machine, #41).
-		"/run/machd.was-running",
+		"/var/lib/mach/config.json",
+		"ExecMainStatus",
 	)
 	mustContain(t, s, "deb postinst", "systemctl restart machd.service")
-	mustNotContain(t, s, "deb postinst", "systemctl start", "enable --now")
+	mustNotContain(t, s, "deb postinst", "systemctl start", "enable --now", "/run/machd.was-running")
 	if restart := strings.Index(s, "systemctl restart machd.service"); restart >= 0 {
-		if marker := strings.Index(s, "/run/machd.was-running"); marker < 0 || marker > restart {
-			t.Fatalf("deb postinst: restart is not gated on the was-running marker")
+		gate := strings.Index(s, "ExecMainStatus")
+		if gate < 0 || gate > restart {
+			t.Fatalf("deb postinst: restart is not gated on the unit's last exit status")
 		}
 	}
 }
@@ -191,16 +195,17 @@ func TestDebPostrmKeepsStateOnRemoveRemovesOnPurge(t *testing.T) {
 func TestRpmScriptletsLifecycle(t *testing.T) {
 	pre := readPackaging(t, "packaging/nfpm/rpm/pre.sh")
 	mustContain(t, pre, "rpm pre", "useradd --system")
-	// %pre records whether the agent is serving: %post restarts exactly
-	// that on upgrade (rpm never stops the unit on upgrade, so this is
-	// also what swaps the old binary for the new one).
-	mustContain(t, pre, "rpm pre", "/run/machd.was-running")
 
 	post := readPackagingCode(t, "packaging/nfpm/rpm/post.sh")
 	mustContain(t, post, "rpm post", "systemctl enable machd.service")
-	mustContain(t, post, "rpm post", "/run/machd.was-running")
+	// %post's restart is what swaps the binary on upgrade (rpm never stops
+	// the unit on upgrade): gated on the enrollment marker and the unit's
+	// last exit, exactly like the deb postinst — a retired machine's agent
+	// (clean exit 0) stays stopped.
+	mustContain(t, post, "rpm post", "/var/lib/mach/config.json")
+	mustContain(t, post, "rpm post", "ExecMainStatus")
 	mustContain(t, post, "rpm post", "systemctl restart machd.service")
-	mustNotContain(t, post, "rpm post", "systemctl start")
+	mustNotContain(t, post, "rpm post", "systemctl start", "/run/machd.was-running")
 
 	preun := readPackaging(t, "packaging/nfpm/rpm/preun.sh")
 	mustContain(t, preun, "rpm preun", "-eq 0") // upgrade (arg 1) vs erase (arg 0)

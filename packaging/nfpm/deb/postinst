@@ -8,12 +8,10 @@
 # enrollment (`sudo -u mach mach register ...`), `sudo systemctl start machd`
 # starts the agent.
 #
-# An UPGRADE brings the agent back: the prerm stopped it, and it recorded
-# whether the agent was serving before that stop (/run/machd.was-running).
-# Restarting exactly what was running keeps an upgrade from reading as an
-# outage — and keeps it from resurrecting a deliberately stopped agent (a
-# revoked machine's agent exits 0 and must stay stopped; the suite pins
-# that the supervisor never restarts a clean exit).
+# An UPGRADE brings the agent back unless it retired itself: the unit's own
+# ExecMainStatus tells the postinst what the prerm's stop left behind (130 =
+# a serving agent; 0 = a retired one that must stay stopped). See the block
+# below the service registration.
 
 set -e
 
@@ -34,9 +32,26 @@ install -d -o mach -g mach -m 0700 /var/lib/mach
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     systemctl daemon-reload
     systemctl enable machd.service
-    if [ -f /run/machd.was-running ]; then
-        rm -f /run/machd.was-running
-        systemctl restart machd.service
+    # An upgrade brings the agent back unless it retired itself: a serving
+    # agent stopped by this upgrade's prerm exits 130 (unit inactive, last
+    # exit 130), a revoked machine's agent exits 0 and must stay stopped —
+    # exit 0 means stop, and the suite pins that the supervisor never
+    # restarts a clean exit. The unit's own ExecMainStatus carries that
+    # fact, so no state has to cross between the old prerm and the new
+    # postinst (the prerm that runs during an upgrade is the OLD package's,
+    # which predates whatever handshake the new scripts agree on). An
+    # operator's deliberate stop therefore also comes back on upgrade —
+    # stated plainly rather than hidden in a marker the old prerm could
+    # not write. First installs never start: no config.json means not yet
+    # enrolled, and an unenrolled machd would crash-loop; enrollment is a
+    # person scanning a QR at the machine (#41 workflow). config.json is
+    # the enrollment marker (agent/config.go).
+    if [ -f /var/lib/mach/config.json ]; then
+        st=$(systemctl is-active machd.service 2>/dev/null || true)
+        ex=$(systemctl show machd.service -p ExecMainStatus --value 2>/dev/null || true)
+        if [ "$st" != "inactive" ] || [ "$ex" != "0" ]; then
+            systemctl restart machd.service
+        fi
     fi
 fi
 
