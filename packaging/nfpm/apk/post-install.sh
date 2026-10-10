@@ -18,6 +18,6 @@
 install -d -o mach -g mach -m 0700 /var/lib/mach
 rc-update add machd default 2>/dev/null || true
 if [ -f /var/lib/mach/config.json ]; then
-    rc-service machd restart 2>/dev/null || rc-service machd start 2>/dev/null || :
+    rc-service machd restart 2>/dev/null || :
 fi
 exit 0
