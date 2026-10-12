@@ -16,8 +16,26 @@ MACH_TEST_ORG = "bcross"
 description = "Verify toolchain and download Go modules"
 run = "go mod download"
 
+# The browser-side seal (cmd/_uiseal) is built wherever the control plane is
+# built — not committed and not compared against a committed copy. Its input
+# hash decides, and scripts/wasm-ensure.sh is the ONE home for that list, for
+# the build flags and for the GOTOOLCHAIN pin (which must move together with
+# the vendored static/wasm_exec.js — both from one toolchain). Every task here
+# that compiles Go depends on wasm:ensure, so a fresh clone or a changed
+# internal/e2e gets the artifact rebuilt, and only when its inputs changed;
+# CI caches the artifact keyed on the same hash and the Docker image runs the
+# same script in its build stage.
+[tasks.wasm]
+description = "Force-rebuild the browser seal (internal/e2e for js/wasm) into the gitignored asset"
+run = "scripts/wasm-ensure.sh --force"
+
+[tasks."wasm:ensure"]
+description = "Ensure the browser-seal artifact exists, rebuilding only when its inputs changed"
+run = "scripts/wasm-ensure.sh"
+
 [tasks.build]
 description = "Build mach and mach-server into bin/ (stamp a release with MACH_VERSION=0.3.0)"
+depends = ["wasm:ensure"]
 run = '''
 mkdir -p bin
 # Unset means no -X at all, never an empty one: an empty stamp would make every
@@ -50,6 +68,7 @@ ls bin/cross
 
 [tasks.test]
 description = "Run unit tests (all packages, race + cover)"
+depends = ["wasm:ensure"]
 run = '''
 # -race is a cgo test: the race runtime links C, and on Linux the toolchain
 # refuses to start it under CGO_ENABLED=0 rather than silently un-checking.
@@ -76,12 +95,13 @@ echo "gofmt: clean"
 '''
 
 [tasks.lint]
-description = "gofmt check plus go vet across the tree (read-only: never rewrites files)"
-depends = ["fmt-check"]
+description = "browser-seal artifact check + gofmt check + go vet across the tree"
+depends = ["fmt-check", "wasm:ensure"]
 run = "go vet ./..."
 
 [tasks.e2e]
 description = "End-to-end test: spins up control plane + agents on 127.0.0.1 (script builds its own binaries)"
+depends = ["wasm:ensure"]
 run = "bash scripts/e2e.sh"
 
 # Local packaging check (no publishing): validates .goreleaser.yaml and

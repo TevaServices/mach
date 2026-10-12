@@ -18,7 +18,7 @@ import (
 	"encoding/hex"
 )
 
-//go:embed static/htmx.min.js static/app.js static/ui.css
+//go:embed static/htmx.min.js static/app.js static/ui.css static/secrets.js static/wasm_exec.js static/mach-seal.wasm
 var staticFiles embed.FS
 
 // mustAsset reads an embedded asset, panicking if it is missing.
@@ -56,13 +56,18 @@ var uiCSSBytes = mustAsset("static/ui.css")
 // behaviour would not reach an operator who had visited before — and the symptom
 // would be the old behaviour, silently, with nothing in any log.
 //
-// Hashing all three (not just the file that changed) is deliberate: one version
+// Hashing all of them (not just the file that changed) is deliberate: one version
 // for the whole asset set means they cannot be deployed half-old, and a browser
 // holding a stale ui.css against fresh markup is the failure this exists to
-// prevent.
+// prevent. The wasm is in the same set: a browser mid-session must never hold
+// last deploy's sealing code against this deploy's handler, whose request shape
+// it has to match.
 var assetVersion = func() string {
 	h := sha256.New()
-	for _, name := range []string{"static/htmx.min.js", "static/app.js", "static/ui.css"} {
+	for _, name := range []string{
+		"static/htmx.min.js", "static/app.js", "static/ui.css",
+		"static/secrets.js", "static/wasm_exec.js", "static/mach-seal.wasm",
+	} {
 		h.Write(mustAsset(name))
 	}
 	return hex.EncodeToString(h.Sum(nil)[:4])

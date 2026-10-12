@@ -45,6 +45,16 @@ ARG MACH_VERSION=
 RUN <<EOF
 set -e
 export CGO_ENABLED=0
+# The browser-seal wasm is a built artifact, not committed source: it must
+# exist before mach-server compiles, because internal/server embeds it.
+# The same scripts/wasm-ensure.sh that mise and CI use decides whether to
+# build (its input hash skips the rebuild when nothing seal-relevant
+# changed) and carries the GOTOOLCHAIN pin — the version the vendored
+# static/wasm_exec.js came from, so the wasm and its runtime script cannot
+# drift apart across toolchains. A stale artifact copied in from a dirty
+# workspace is overwritten; a fresh one whose hash matches is kept, which
+# is correct: same inputs, same pinned toolchain, same bytes.
+sh scripts/wasm-ensure.sh
 export GOOS="$TARGETOS" GOARCH="$TARGETARCH"
 LDFLAGS="-s -w"
 if [ -n "$MACH_VERSION" ]; then

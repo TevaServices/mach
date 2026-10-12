@@ -456,6 +456,91 @@ func TestSecretPushOutcome(t *testing.T) {
 	})
 }
 
+// TestSecretDeleteOutcome pins the agent half of the secret_delete frame: a
+// name-only operation whose reply is as value-free as the request. OK is the
+// loose one — removed or never held — and only an actual removal announces,
+// so the registry stays in step with the machine without inventing names.
+func TestSecretDeleteOutcome(t *testing.T) {
+	t.Run("held name removed and announced", func(t *testing.T) {
+		s := newFileSecretStore(t.TempDir(), "orgA")
+		if err := s.put("API_KEY", "s3cr3tvalue", "orgA"); err != nil {
+			t.Fatal(err)
+		}
+		payload, _ := json.Marshal(protocol.SecretDeleteRequest{Name: "API_KEY"})
+		res, removed := secretDeleteOutcome(s, payload)
+		if !res.OK || res.Name != "API_KEY" || res.Error != "" {
+			t.Fatalf("result = %+v", res)
+		}
+		if !removed {
+			t.Error("a real removal did not announce")
+		}
+		if names, _ := s.names(); len(names) != 0 {
+			t.Errorf("the entry survived: %v", names)
+		}
+	})
+
+	t.Run("absent name is success without announce", func(t *testing.T) {
+		s := newFileSecretStore(t.TempDir(), "orgA")
+		payload, _ := json.Marshal(protocol.SecretDeleteRequest{Name: "NEVER_PUSHED"})
+		res, removed := secretDeleteOutcome(s, payload)
+		if !res.OK || res.Error != "" || removed {
+			t.Fatalf("absent-name delete = %+v removed=%v, want ok without announce", res, removed)
+		}
+	})
+
+	t.Run("invalid name refused before the store is touched", func(t *testing.T) {
+		s := newFileSecretStore(t.TempDir(), "orgA")
+		if err := s.put("API_KEY", "s3cr3tvalue", "orgA"); err != nil {
+			t.Fatal(err)
+		}
+		payload, _ := json.Marshal(protocol.SecretDeleteRequest{Name: "mach_bad"})
+		res, removed := secretDeleteOutcome(s, payload)
+		if res.OK || removed || res.Error == "" {
+			t.Fatalf("invalid-name delete = %+v removed=%v", res, removed)
+		}
+		if names, _ := s.names(); len(names) != 1 {
+			t.Errorf("the store changed on a refused delete: %v", names)
+		}
+	})
+
+	t.Run("a malformed payload is refused", func(t *testing.T) {
+		s := newFileSecretStore(t.TempDir(), "orgA")
+		res, _ := secretDeleteOutcome(s, []byte("{"))
+		if res.OK || res.Error == "" {
+			t.Fatalf("garbage payload = %+v", res)
+		}
+	})
+
+	t.Run("an unreadable store fail closed", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "secrets.json"), []byte("{broken"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s := newFileSecretStore(dir, "orgA")
+		payload, _ := json.Marshal(protocol.SecretDeleteRequest{Name: "API_KEY"})
+		res, removed := secretDeleteOutcome(s, payload)
+		if res.OK || removed || res.Error == "" {
+			t.Fatalf("unreadable-store delete = %+v removed=%v", res, removed)
+		}
+	})
+
+	t.Run("memory store removes its own entries", func(t *testing.T) {
+		s := newMemSecretStore("orgA")
+		if err := s.add("API_KEY", "s3cr3tvalue"); err != nil {
+			t.Fatal(err)
+		}
+		payload, _ := json.Marshal(protocol.SecretDeleteRequest{Name: "API_KEY"})
+		res, removed := secretDeleteOutcome(s, payload)
+		if !res.OK || !removed {
+			t.Fatalf("memory delete = %+v removed=%v", res, removed)
+		}
+		payload, _ = json.Marshal(protocol.SecretDeleteRequest{Name: "NEVER_HELD"})
+		if res, removed := secretDeleteOutcome(s, payload); !res.OK || removed {
+			t.Fatalf("memory absent delete = %+v removed=%v", res, removed)
+		}
+	})
+}
+
 func TestSecretListResultAndAnnounce(t *testing.T) {
 	dir := t.TempDir()
 	s := newFileSecretStore(dir, "orgA")

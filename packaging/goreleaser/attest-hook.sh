@@ -33,6 +33,11 @@ MARKER="$DIST/.mach-server-$VER.attest-tool"
 
 if [ ! -x "$MARKER" ]; then
     mkdir -p "$DIST"
+    # mach-server embeds the browser-seal wasm, a gitignored build artifact:
+    # the same ensure every other compilation of the control plane runs —
+    # a no-op when a fresh artifact is already in the tree. The skip path
+    # above (dev/snapshot runs) never reaches this, so pack stays free of it.
+    sh scripts/wasm-ensure.sh
     CGO_ENABLED=0 go build -trimpath \
         -ldflags "-s -w -X github.com/TevaServices/mach/internal/version.Version=$VER" \
         -o "$MARKER" ./cmd/mach-server

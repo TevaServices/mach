@@ -81,6 +81,42 @@ func TestSecretFrameShapes(t *testing.T) {
 		}
 	})
 
+	t.Run("delete request carries a name only", func(t *testing.T) {
+		raw, err := json.Marshal(SecretDeleteRequest{Name: "API_KEY"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(raw) != `{"name":"API_KEY"}` {
+			t.Errorf("SecretDeleteRequest = %s, want a name-only shape", raw)
+		}
+		if strings.Contains(string(raw), "value") {
+			t.Errorf("secret_delete carries a value field — it must not: %s", raw)
+		}
+	})
+
+	t.Run("delete result carries name and status, never a value", func(t *testing.T) {
+		raw, err := json.Marshal(SecretDeleteResult{Name: "API_KEY", OK: false, Error: "store unreadable"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), "value") {
+			t.Errorf("secret_delete_result carries a value field: %s", raw)
+		}
+		var back SecretDeleteResult
+		if err := json.Unmarshal(raw, &back); err != nil || back.Name != "API_KEY" || back.OK || back.Error != "store unreadable" {
+			t.Errorf("round trip = %+v (%v)", back, err)
+		}
+	})
+
+	t.Run("value bounds are the shared rule", func(t *testing.T) {
+		if err := ValidSecretValue(strings.Repeat("x", MinSecretValueBytes)); err != nil {
+			t.Errorf("a minimum-length value refused: %v", err)
+		}
+		if err := ValidSecretValue(strings.Repeat("x", MaxSecretValueBytes+1)); err == nil {
+			t.Error("an oversized value accepted")
+		}
+	})
+
 	t.Run("payload round trip", func(t *testing.T) {
 		raw, err := json.Marshal(SecretPayload{Name: "DB_PASSWORD", Org: "bcross", Value: "s3cr3tvalue", CreatedAt: "t"})
 		if err != nil {

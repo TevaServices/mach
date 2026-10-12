@@ -64,6 +64,11 @@ check() { # check <desc> <cond exit code>
 }
 
 step "build"
+# The browser-seal wasm is a gitignored build artifact that mach-server
+# embeds: whatever compiles the control plane runs the same ensure first —
+# a no-op when the artifact is fresh, a real build when its inputs changed —
+# so a raw `bash scripts/e2e.sh` works like the mise path does.
+sh scripts/wasm-ensure.sh
 go build -o "$WORKDIR/mach" ./cmd/mach || { echo "build mach failed"; exit 1; }
 go build -o "$WORKDIR/mach-server" ./cmd/mach-server || { echo "build mach-server failed"; exit 1; }
 ok "binaries built"
@@ -1137,6 +1142,104 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$UI_BASE/ui/unblock" -b "
 uic exec "$UI_MACHINE" "echo unblocked-ok" >/dev/null 2>&1; check "exec works again after unblock" $?
 OUT=$(curl -sS "$UI_BASE/v1/machines" -H "Authorization: Bearer $UI_ADMIN" 2>&1)
 [[ "$OUT" != *'"blocked":true'* ]]; check "the fleet listing clears the block" $?
+
+step "web UI: secrets — names only here, values sealed in the browser"
+
+# Baseline via the console CLI, whose push travels the same relay the browser
+# uses: the value is sealed client-side and only the blob reaches the server.
+printf 'u1t3st-s3cr3t' | uic secrets push "$UI_MACHINE" UI_TEST_KEY --value-file - >/dev/null 2>&1
+check "console push registers the name" $?
+OUT=$(uic secrets list 2>&1); [[ "$OUT" == *"UI_TEST_KEY"* ]]
+check "the registry lists the name" $?
+OUT=$(MACH_STATE_DIR="$WORKDIR/agent-ui" "$WORKDIR/mach" secrets list --local 2>&1)
+[[ "$OUT" == *"UI_TEST_KEY"* ]]
+check "the machine holds the value (its own store, names only)" $?
+
+# The page itself: the name, the seal key the browser needs, and no value.
+CODE=$(curl -s -o "$WORKDIR/ui-secrets.html" -w '%{http_code}' "$UI_BASE/ui/secrets" -b "$JAR")
+[[ "$CODE" == "200" ]]; check "the secrets page renders" $?
+OUT=$(grep -o 'UI_TEST_KEY' "$WORKDIR/ui-secrets.html" | head -1); [[ "$OUT" == "UI_TEST_KEY" ]]
+check "the page lists the registered name" $?
+E2EPUB=$(curl -sS "$UI_BASE/v1/machines/$UI_MACHINE/e2epub" -H "Authorization: Bearer $UI_ADMIN" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['pub_e2e'])")
+[[ -n "$E2EPUB" ]]; check "the control plane advertises the machine's seal key" $?
+OUT=$(grep -o "$E2EPUB" "$WORKDIR/ui-secrets.html" | head -1); [[ "$OUT" == "$E2EPUB" ]]
+check "the page carries that key for the browser to seal with" $?
+
+# The push a browser would send: seal here, post only the blob. The helper is
+# the internal/e2e seal, so the wire shape is what the page's wasm produces.
+SEALED=$(printf 'browser-v4lu@' | go run ./scripts/sealsecret --key "$E2EPUB" --name UI_TEST_KEY --org "$ORG")
+[[ -n "$SEALED" ]]; check "the test seal helper produced a blob" $?
+CODE=$(curl -s -o "$WORKDIR/ui-push.html" -w '%{http_code}' -X POST "$UI_BASE/ui/secrets/push" -b "$JAR" \
+  -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' \
+  --data-urlencode "machine=$UI_MACHINE" --data-urlencode 'name=UI_TEST_KEY' --data-urlencode "sealed=$SEALED")
+[[ "$CODE" == "200" ]]; check "a browser-sealed push is accepted (an update to the same name)" $?
+# The value on the machine is now the browser's, and scrubbing turns it into a
+# marker in any output — the strongest end-to-end probe of delivery there is.
+OUT=$(uic exec --inject UI_TEST_KEY "$UI_MACHINE" 'printf %s "$UI_TEST_KEY"' 2>&1)
+[[ "$OUT" == *'[REDACTED:UI_TEST_KEY]'* ]]
+check "the pushed value is on the machine and scrubbed from its output" $?
+
+# The line this feature exists for: a form that arrives carrying a plaintext
+# value field is refused without dispatch, whatever else it says.
+CODE=$(curl -s -o "$WORKDIR/ui-plain-refusal.html" -w '%{http_code}' -X POST "$UI_BASE/ui/secrets/push" -b "$JAR" \
+  -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' \
+  --data-urlencode "machine=$UI_MACHINE" --data-urlencode 'name=UI_TEST_KEY' --data-urlencode 'value=leak-attempt')
+[[ "$CODE" == "403" ]]; check "a form with a plaintext value field is refused" $?
+OUT=$(grep -o 'unsealed' "$WORKDIR/ui-plain-refusal.html" | head -1); [[ "$OUT" == "unsealed" ]]
+check "and the refusal says why" $?
+# No seal (a scripting-off browser) is the CLI fallback, never a plaintext path.
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$UI_BASE/ui/secrets/push" -b "$JAR" \
+  -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' \
+  --data-urlencode "machine=$UI_MACHINE" --data-urlencode 'name=UI_TEST_KEY')
+[[ "$CODE" == "400" ]]; check "a seal-less push is refused" $?
+# A name that cannot exist is refused before anything is dispatched.
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$UI_BASE/ui/secrets/push" -b "$JAR" \
+  -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' \
+  --data-urlencode "machine=$UI_MACHINE" --data-urlencode 'name=mach_token' --data-urlencode "sealed=$SEALED")
+[[ "$CODE" == "400" ]]; check "an invalid secret name is refused" $?
+
+# Delete: typed confirmation, then the registry row goes and reachable
+# machines actually drop the value.
+CODE=$(curl -s -o "$WORKDIR/ui-sdel1.html" -w '%{http_code}' -X POST "$UI_BASE/ui/secrets/delete" -b "$JAR" \
+  -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' --data-urlencode "org=$ORG" --data-urlencode 'name=UI_TEST_KEY')
+[[ "$CODE" == "200" ]]; check "secret delete asks for confirmation" $?
+OUT=$(grep -o 'confirm_name' "$WORKDIR/ui-sdel1.html" | head -1); [[ "$OUT" == "confirm_name" ]]
+check "secret delete requires the name to be typed" $?
+OUT=$(curl -sS "$UI_BASE/v1/secrets" -H "Authorization: Bearer $UI_ADMIN" 2>&1)
+[[ "$OUT" == *"UI_TEST_KEY"* ]]; check "the registry row survives an unconfirmed delete" $?
+OUT=$(curl -sS -X POST "$UI_BASE/ui/secrets/delete" -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' \
+  --data-urlencode "org=$ORG" --data-urlencode 'name=UI_TEST_KEY' \
+  --data-urlencode 'confirm=1' --data-urlencode 'confirm_name=UI_TEST_KEY' 2>&1)
+[[ "$OUT" == *'report clean'* ]]; check "delete confirmed: the reachable machine reports the drop" $?
+OUT=$(curl -sS "$UI_BASE/v1/secrets" -H "Authorization: Bearer $UI_ADMIN" 2>&1)
+[[ "$OUT" != *"UI_TEST_KEY"* ]]; check "the registry row is gone" $?
+OUT=$(MACH_STATE_DIR="$WORKDIR/agent-ui" "$WORKDIR/mach" secrets list --local 2>&1)
+[[ "$OUT" != *"UI_TEST_KEY"* ]]
+check "the machine dropped the value" $?
+OUT=$(uic exec --inject UI_TEST_KEY "$UI_MACHINE" 'echo ran' 2>&1)
+[[ "$OUT" == *"unknown secret name"* ]]
+check "injection of the deleted name is refused at the machine" $?
+
+# The E2E gate: pushing a VALUE is refused for an org with sealing off — from
+# a browser exactly as from a console — because there is no honest way to send
+# one. Delete carries a name only, so it keeps working.
+MACH_DB="$UI_DB" "$WORKDIR/mach-server" e2e off --org "$ORG" >/dev/null
+CODE=$(curl -s -o "$WORKDIR/ui-e2eoff.html" -w '%{http_code}' -X POST "$UI_BASE/ui/secrets/push" -b "$JAR" \
+  -H "X-CSRF-Token: $CSRF" -H 'HX-Request: true' \
+  --data-urlencode "machine=$UI_MACHINE" --data-urlencode 'name=UI_OFF_KEY' --data-urlencode 'sealed=AAAA')
+[[ "$CODE" == "403" ]]; check "pushing a value to an E2E-off org is refused" $?
+OUT=$(grep -o 'disabled' "$WORKDIR/ui-e2eoff.html" | head -1); [[ "$OUT" == "disabled" ]]
+check "and the refusal says the setting is the reason" $?
+ERR=$(printf 'off0org-value' | uic secrets push "$UI_MACHINE" UI_TEST_KEY --value-file - 2>&1); RC=$?
+[[ "$RC" -ne 0 && "$ERR" == *"disabled"* ]]
+check "the console refuses to push a value while E2E is off, and there is no plaintext fallback" $?
+OUT=$(uic secrets list 2>&1); [[ "$OUT" != *"UI_OFF_KEY"* ]]
+check "nothing of the refused push was registered" $?
+MACH_DB="$UI_DB" "$WORKDIR/mach-server" e2e on --org "$ORG" >/dev/null
+E2EPUB_RESTORED=$(curl -sS "$UI_BASE/v1/machines/$UI_MACHINE/e2epub" -H "Authorization: Bearer $UI_ADMIN" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['pub_e2e'])")
+[[ "$E2EPUB_RESTORED" == "$E2EPUB" ]]; check "turning E2E back on restores sealing (same key, no re-enroll)" $?
 
 step "web UI: org management"
 CODE=$(curl -s -o "$WORKDIR/ui-orgs.html" -w '%{http_code}' -X POST "$UI_BASE/ui/orgs/add" -b "$JAR" \

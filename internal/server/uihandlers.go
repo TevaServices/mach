@@ -44,9 +44,20 @@ func uiHeaders(w http.ResponseWriter) {
 	h.Set("X-Frame-Options", "DENY")
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
-	h.Set("Content-Security-Policy",
-		"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'")
+	h.Set("Content-Security-Policy", uiCSPDefault)
 }
+
+// uiCSPDefault is every page's policy, and the secrets page's starting point.
+const uiCSPDefault = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'"
+
+// uiCSPWasm is the secrets page's policy: the same policy plus the
+// 'wasm-unsafe-eval' keyword for script-src, which lets the browser compile
+// WebAssembly WITHOUT also letting JavaScript eval past this policy. The
+// keyword exists precisely for this: every browser gates wasm compilation
+// behind it (or behind the much wider 'unsafe-eval'), and a page that
+// compiles no wasm never needs it — which is why the default stays the
+// stricter of the two and only this one page's response relaxes it.
+const uiCSPWasm = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self'; form-action 'self'"
 
 // sameSiteRequest is the same defense-in-depth test the pair page applies to its
 // POST: Sec-Fetch-Site must be same-origin, or absent (a non-browser client).
@@ -551,11 +562,16 @@ func (s *Server) renderSignInMessage(w http.ResponseWriter, status int, title, r
 // knownStaticFiles is a strict allowlist, mirroring knownAgentFiles for agent
 // downloads: an explicit map, never a file server over a directory.
 //
-// The embed itself and the cache-busting digest live in assets.go.
+// mach-seal.wasm and wasm_exec.js serve the secrets page's browser-side
+// sealing (cmd/uiseal, the wasm build of internal/e2e); the wasm carries the
+// application/wasm MIME the streaming instantiation gate requires.
 var knownStaticFiles = map[string]string{
-	"htmx.min.js": "text/javascript; charset=utf-8",
-	"app.js":      "text/javascript; charset=utf-8",
-	"ui.css":      "text/css; charset=utf-8",
+	"htmx.min.js":    "text/javascript; charset=utf-8",
+	"app.js":         "text/javascript; charset=utf-8",
+	"ui.css":         "text/css; charset=utf-8",
+	"secrets.js":     "text/javascript; charset=utf-8",
+	"wasm_exec.js":   "text/javascript; charset=utf-8",
+	"mach-seal.wasm": "application/wasm",
 }
 
 func (s *Server) handleUIStatic(w http.ResponseWriter, r *http.Request) {

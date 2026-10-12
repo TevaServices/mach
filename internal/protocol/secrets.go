@@ -6,6 +6,28 @@ import (
 	"strings"
 )
 
+// Secret value bounds, next to the name rule for the same reason the name
+// rule is here: a VALUE crosses the console/UI push paths and is validated by
+// the agent's store, and both ends must refuse the same things. The minimum is
+// not pedantry: a value too short to be a secret would also make the agent's
+// scrubbing meaningless (a 3-byte value appears by accident in ordinary
+// output, and the replacement would corrupt it). The maximum bounds one entry
+// of a file the agent re-reads on every exec.
+const (
+	MinSecretValueBytes = 8
+	MaxSecretValueBytes = 4096
+)
+
+// ValidSecretValue enforces the value length bounds.
+func ValidSecretValue(value string) error {
+	if n := len(value); n < MinSecretValueBytes {
+		return fmt.Errorf("secret value is %d bytes; the minimum is %d — a value too short to be a secret makes scrubbing meaningless", n, MinSecretValueBytes)
+	} else if n > MaxSecretValueBytes {
+		return fmt.Errorf("secret value is %d bytes; the maximum is %d", n, MaxSecretValueBytes)
+	}
+	return nil
+}
+
 // Secrets: names travel, values never do.
 //
 // A secret's VALUE lives only on the target machine, in each agent's local
@@ -30,6 +52,13 @@ import (
 //	secret_push_result    agent → control plane: SecretPushResult.
 //	secret_list           control plane → agent (no payload).
 //	secret_list_result    agent → control plane: SecretListResult — names only.
+//	secret_delete         control plane → agent: SecretDeleteRequest — a NAME
+//	                      only, so it needs no seal and no E2E setting; there
+//	                      is no value on this path to protect.
+//	secret_delete_result  agent → control plane: SecretDeleteResult — name and
+//	                      status; OK means the machine holds no entry by that
+//	                      name (removed or already absent), which keeps an
+//	                      org-wide delete idempotent.
 //	secrets_announce      agent → control plane: SecretsAnnounce — names only,
 //	                      sent at connect and after a successful push.
 //	secrets_announce_ack  control plane → agent: SecretsAnnounceAck.
@@ -72,6 +101,27 @@ type SecretPushResult struct {
 type SecretListResult struct {
 	Org   string   `json:"org"`
 	Names []string `json:"names"`
+}
+
+// SecretDeleteRequest is the secret_delete payload: the NAME to drop from the
+// machine's local store, and nothing else. Because a name is not a secret and
+// no value travels here, this frame is neither sealed nor gated on the org's
+// E2E setting — that gate is the push path's, for the reason the push path has.
+type SecretDeleteRequest struct {
+	Name string `json:"name"`
+}
+
+// SecretDeleteResult is the agent's reply to a secret_delete. Name and status
+// only, mirroring SecretPushResult. OK is deliberately the loose one: the
+// machine removed the entry, or never held one — "already absent" is success,
+// so a delete fanned out across an org stays idempotent and a machine that
+// never received the push reports clean rather than alarming. An Error covers
+// a real failure (an unreadable store, an invalid name) and never quotes a
+// value, exactly like SecretPushResult.
+type SecretDeleteResult struct {
+	Name  string `json:"name"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
 }
 
 // SecretsAnnounce is sent by the agent at connect and after a successful

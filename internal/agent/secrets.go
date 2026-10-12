@@ -43,13 +43,12 @@ import (
 	"github.com/TevaServices/mach/internal/protocol"
 )
 
-// Secret value bounds. The minimum is not pedantry: a value too short to be
-// a secret would also make scrubbing meaningless (a 3-byte value appears by
-// accident in ordinary output, and the replacement would corrupt it). The
-// maximum bounds one entry of a file the agent re-reads on every exec.
+// Secret value bounds and the name rule live in the wire package (protocol),
+// which is the one home both ends share. The agent re-exports them because its
+// callers and tests speak this spelling; the rule itself is protocol's.
 const (
-	MinSecretValueBytes = 8
-	MaxSecretValueBytes = 4096
+	MinSecretValueBytes = protocol.MinSecretValueBytes
+	MaxSecretValueBytes = protocol.MaxSecretValueBytes
 )
 
 // redactedMarker is what a scrubbed value becomes: [REDACTED:<NAME>], so a
@@ -78,15 +77,9 @@ var errSecretStoreUnreadable = errors.New("secrets store unreadable")
 // and the agent cannot disagree about what a name is.
 func ValidSecretName(name string) error { return protocol.ValidSecretName(name) }
 
-// ValidSecretValue enforces the value length bounds.
-func ValidSecretValue(value string) error {
-	if n := len(value); n < MinSecretValueBytes {
-		return fmt.Errorf("secret value is %d bytes; the minimum is %d — a value too short to be a secret makes scrubbing meaningless", n, MinSecretValueBytes)
-	} else if n > MaxSecretValueBytes {
-		return fmt.Errorf("secret value is %d bytes; the maximum is %d", n, MaxSecretValueBytes)
-	}
-	return nil
-}
+// ValidSecretValue is the wire package's rule, re-exported like the name rule
+// above: the control plane and the agent cannot disagree about what a value is.
+func ValidSecretValue(value string) error { return protocol.ValidSecretValue(value) }
 
 // secretEntry is one stored secret. Org is the org the entry was provisioned
 // under, which is what makes a name resolvable: an entry whose org is not
@@ -125,6 +118,11 @@ type secretStore interface {
 	// put stores an entry pushed from the control plane. The caller has
 	// already validated name/value/org against this machine's own org.
 	put(name, value, org string) error
+	// remove deletes an entry by NAME, which may be one the machine does not
+	// hold — an org-wide delete fans out to machines that have the secret and
+	// machines that never received it. An absent name is (nil, nil): callers
+	// report "already absent" as success, not as a failure.
+	remove(name string) error
 }
 
 // ---- the file store (installed agent) ----
@@ -239,16 +237,23 @@ func (s *fileSecretStore) put(name, value, org string) error {
 	return s.write(d)
 }
 
-// remove deletes an entry (the local CLI's `mach secrets remove`). Any org's
-// entry may be removed: this is the machine owner's hygiene, not a
-// cross-org capability.
+// remove deletes an entry by name. Any org's entry may go, local CLI or a
+// control-plane delete_frame alike: this is hygiene on this machine's own
+// file, not a cross-org capability — and an entry tagged for another org is
+// unreachable by injection here anyway. The name must still pass
+// ValidSecretName: a delete frame that cannot name a real secret is refused
+// like any other frame, so a malformed name can never smuggle arbitrary map
+// keys into the store's file.
 func (s *fileSecretStore) remove(name string) error {
+	if err := ValidSecretName(name); err != nil {
+		return err
+	}
 	d, err := s.load()
 	if err != nil {
 		return err
 	}
 	if _, ok := d.Secrets[name]; !ok {
-		return fmt.Errorf("no secret named %s", name)
+		return fmt.Errorf("%w: %s", errNoSuchSecret, name)
 	}
 	delete(d.Secrets, name)
 	return s.write(d)
@@ -333,6 +338,22 @@ func (m *memSecretStore) put(name, value, org string) error {
 	return errors.New("temporary session holds no persistent secrets")
 }
 
+// remove drops an in-memory entry. A temporary session may hold values it
+// created locally, so its own connection may be told to drop one; there is no
+// disk to keep clean, and "already absent" reports like the file store does.
+func (m *memSecretStore) remove(name string) error {
+	if err := ValidSecretName(name); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.entries[name]; !ok {
+		return fmt.Errorf("%w: %s", errNoSuchSecret, name)
+	}
+	delete(m.entries, name)
+	return nil
+}
+
 func (m *memSecretStore) resolve(name string) (string, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -412,6 +433,10 @@ func (noSecretStore) scrubValues() (map[string]string, error) {
 	return nil, nil
 }
 func (noSecretStore) put(name, value, org string) error {
+	return errors.New("machine has no org; re-enroll")
+}
+
+func (noSecretStore) remove(name string) error {
 	return errors.New("machine has no org; re-enroll")
 }
 
@@ -662,6 +687,58 @@ func openSealedSecret(e2eKey *E2EKeyPair, push protocol.SealedSecretPush) ([]byt
 		return nil, err
 	}
 	return e2e.Open(&e2eKey.Private, body)
+}
+
+// handleSecretDelete drops one NAME from this machine's local store. The frame
+// carries a name only — nothing to seal and no value to protect — so it is
+// neither encrypted nor gated on the org's E2E setting, and the reply carries
+// name and status only. Off the frame loop: a file store remove writes a file.
+//
+// OK is the loose one (see protocol.SecretDeleteResult): the entry was removed
+// or was never here, and both are success, so a delete fanned out across an
+// org is idempotent. A removal that happened is announced, so the control
+// plane's registry stays in step with the machine.
+func handleSecretDelete(conn *protocol.WSConn, env protocol.Envelope, store secretStore) {
+	res, removed := secretDeleteOutcome(store, env.Payload)
+	payload, err := json.Marshal(res)
+	if err != nil {
+		log.Printf("agent: failed to encode secret_delete_result: %v", err)
+		return
+	}
+	if err := conn.WriteEnvelope(protocol.Envelope{Type: "secret_delete_result", ReqID: env.ReqID, Payload: payload}); err != nil {
+		log.Printf("agent: failed to send secret_delete_result: %v", err)
+	}
+	if removed {
+		announceSecrets(conn, store)
+	}
+}
+
+// errNoSuchSecret is what the stores report for a name not held. The delete
+// outcome maps it to plain success: "already gone" is the result an org-wide
+// delete expects from every machine that never received the push.
+var errNoSuchSecret = errors.New("no such secret")
+
+// secretDeleteOutcome is handleSecretDelete's decision, split from the writing
+// so a test can drive the whole thing without a socket. The bool is "an entry
+// went away", which is the case that announces.
+func secretDeleteOutcome(store secretStore, payload []byte) (protocol.SecretDeleteResult, bool) {
+	var req protocol.SecretDeleteRequest
+	if err := json.Unmarshal(payload, &req); err != nil || req.Name == "" {
+		return protocol.SecretDeleteResult{Error: "bad secret_delete payload"}, false
+	}
+	if err := ValidSecretName(req.Name); err != nil {
+		return protocol.SecretDeleteResult{Name: req.Name, Error: err.Error()}, false
+	}
+	if err := store.remove(req.Name); err != nil {
+		if errors.Is(err, errNoSuchSecret) {
+			return protocol.SecretDeleteResult{Name: req.Name, OK: true}, false
+		}
+		// A store that cannot be read cannot be safely rewritten — the same
+		// fail-closed posture every other store read takes. The error names
+		// the failure, never a value.
+		return protocol.SecretDeleteResult{Name: req.Name, Error: err.Error()}, false
+	}
+	return protocol.SecretDeleteResult{Name: req.Name, OK: true}, true
 }
 
 // handleSecretList answers a secret_list with names only: this machine's own

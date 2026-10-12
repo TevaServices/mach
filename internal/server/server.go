@@ -367,6 +367,15 @@ func (s *Server) Routes() http.Handler {
 		mux.HandleFunc("POST /ui/orgs/add", s.uiPost(s.handleUIOrgAdd))
 		mux.HandleFunc("POST /ui/orgs/remove", s.uiPost(s.handleUIOrgRemove))
 		mux.HandleFunc("POST /ui/orgs/e2e", s.uiPost(s.handleUIOrgE2E))
+
+		// Secrets (internal/server/uisecrets.go): the names-only registry page,
+		// a browser-side-sealed push (the wasm build of internal/e2e seals in
+		// the browser, so no plaintext value ever arrives here), and the
+		// org-wide delete fan-out. Both actions go through uiPost's session +
+		// same-site + CSRF layers, and the machine touch gate on top.
+		mux.HandleFunc("GET /ui/secrets", s.uiGet(s.handleUISecrets))
+		mux.HandleFunc("POST /ui/secrets/push", s.uiPost(s.handleUISecretPush))
+		mux.HandleFunc("POST /ui/secrets/delete", s.uiPost(s.handleUISecretDelete))
 	}
 	return mux
 }

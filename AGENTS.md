@@ -355,6 +355,18 @@ This is `mach`: remote CLI access to registered machines, outbound-only
     union of all locally stored values from every outgoing byte; that
     scrubbing is best-effort and documented as such, and an unreadable
     secrets store refuses commands rather than shipping unscrubbed output.
+
+    The web UI's add/update rides the same rule by sealing in the browser:
+    the page's wasm (`cmd/_uiseal`, internal/e2e compiled for js/wasm) seals
+    the value to the machine's advertised key and its handler accepts only
+    the sealed blob — a form that arrives with a plaintext value field is
+    refused outright, so the UI cannot become a plaintext entry point however
+    it is driven, and its push shares `relaySealedSecretPush` with the
+    console path rather than restating the guards. The browser pins the
+    machine's key the way the console does (localStorage, per machine) per
+    SECURITY-NOTES. The wire-format note below — exactly one seal
+    implementation — is why the wasm is a build of internal/e2e rather than
+    a hand-written JS copy.
 27. **The MCP endpoint is an adapter, never a second implementation.**
     `/v2/mcp` (Streamable HTTP, bearer keys only in this cut) runs its three
     tools (`machines_list`, `secrets_list`, `exec`) by invoking the real
@@ -423,7 +435,11 @@ to run it, and for why the driver difference matters.
   can be replayed by the transport), policy, protocol, oidcauth (a fake issuer,
   one broken check per test), release and in-toto all have coverage; keep it
   that way for touched code.
-- `mise run lint` — the gofmt check plus `go vet`. Read-only; `mise run fmt`
+- `mise run lint` — the browser-seal artifact gate (`wasm:ensure` — the wasm
+  is a gitignored build artifact that every Go-compiling task ensures exists,
+  rebuilt only when its inputs' hash changes, so a lint never pays for a
+  rebuild its files did not cause), the gofmt check (`mise run fmt-check`,
+  read-only) and `go vet`; `mise run fmt`
   writes the formatting.
 - `mise run local:up` / `local:down` / `local:status` / `local:logs` — a real
   control plane and this host enrolled as its agent, both under `data/local/`
@@ -515,7 +531,16 @@ to run it, and for why the driver difference matters.
   same row), an operator grants it through the admin API, the approved command
   runs once (the mirror on the machine stands down for exactly that dispatch,
   never for the machine's own rules), and the spent grant stays in the record.
-  Green = 214 checks.
+  It also drives the secrets page in the web UI: a console push as the
+  baseline, the push a browser's wasm would produce (sealed by the
+  `scripts/sealsecret` helper against the machine's advertised key) landing
+  on the machine with the value scrubbed out of an injected exec's output,
+  the plaintext-value and seal-less refusals, the typed-name delete fanning
+  out to the machine (the value actually leaves the box) with injection of
+  the deleted name refusing afterwards, and the E2E-off org refusing every
+  push — from the console API and the browser surface alike — while the
+  names-only delete keeps working.
+  Green = 240 checks.
 - **The service-registration properties live in the shipped packaging
   artifacts** (`cmd/mach/packaging_test.go`), not in agent code: since the
   packages took over service registration (#44 removed `mach install`), the
@@ -541,6 +566,8 @@ to run it, and for why the driver difference matters.
 - Control plane runs in Docker (`docker compose up -d --build`); the image
   also carries prebuilt agent binaries for all six OS/arch targets under
   `/opt/mach-agents/` — copy one to a target machine; it never needs Go.
+  The image builds the browser-seal wasm itself in its build stage (the
+  artifact is not committed; `scripts/wasm-ensure.sh` runs there too).
   A machine that *itself* runs as a container can run `Dockerfile.agent`
   instead (`ghcr.io/<owner>/mach-agent` on releases): headless enrollment
   from `MACH_SERVER`/`MACH_API_KEY`/`MACH_NAME`, state in a `/data` volume,
@@ -587,11 +614,35 @@ to run it, and for why the driver difference matters.
   rather than hand-writing a dialect.
 - **SealedB64 is base64 of the SealedMessage JSON**
   (`{"v":2,"eph":...,"body":...}`). There is exactly one implementation of that
-  format — `internal/e2e`, used by the agent, the console and the tests. Do not
-  reintroduce a copy of it in the console: a second implementation is how a
+  format — `internal/e2e`, used by the agent, the console, the tests, and the
+  web UI's browser seal (built FOR js/wasm from the same package, `cmd/_uiseal`
+  → `internal/server/static/mach-seal.wasm`). Do not
+  reintroduce a copy of it in the console, and do not hand-write a JavaScript
+  version for the browser: a second implementation is how a
   field goes missing on one side and sealing fails on a machine that is
   otherwise healthy, and there is no dependency edge to avoid (internal/e2e
   imports only the standard library and x/crypto).
+
+  The wasm is NOT committed source — it is a gitignored build artifact,
+  produced wherever the control plane is compiled, and
+  `scripts/wasm-ensure.sh` is the one home for its recipe: the hash input
+  list (`cmd/_uiseal`, `internal/e2e`, `internal/protocol`, `go.mod`,
+  `go.sum`, the script itself), the flags, and the GOTOOLCHAIN pin — which
+  is the version the vendored `static/wasm_exec.js` came FROM, so the two
+  move together in one commit or the pair can fail at the browser. Every
+  mise task that compiles Go (`build`, `lint`, `test`, `e2e`) depends on
+  `wasm:ensure` and rebuilds only when the hash changes; CI stores the
+  artifact in a cache keyed by that same hash (`scripts/wasm-ensure.sh
+  --hash` prints it — one list, nowhere duplicated); the Docker image runs
+  the same script in its build stage, and so does every other place that
+  compiles the control plane: the goreleaser attest hook (its tool build),
+  e2e.sh, and the release workflow's attest-tool and brew-smoke scratch
+  builds. Consequences worth knowing: a cold
+  clone's first raw `go build ./cmd/mach-server` or `go test ./...` fails
+  with the embed error naming the wasm — run any of those mise tasks (or
+  `mise run wasm` to force) first; and a toolchain bump is bump-the-pin +
+  revendor-wasm_exec.js in one commit, after which the next ensure rebuilds
+  once.
 - **The AEAD key is derived, not the raw DH output.** `deriveKey` runs HKDF over
   the X25519 shared secret with the recipient's public key and the version bound
   into the info string, so a ciphertext cannot be re-pointed at another

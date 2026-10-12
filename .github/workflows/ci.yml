@@ -49,6 +49,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # The browser-seal wasm is a gitignored build artifact internal/server
+      # embeds: restore it from the cache keyed on its inputs' hash (the ONE
+      # input list lives in scripts/wasm-ensure.sh), so a PR that touched no
+      # seal-relevant file reuses the cached bytes and a PR that did rebuilds
+      # them inside `mise run lint`'s wasm:ensure.
+      - name: Seal-wasm cache key (the input list lives in the script)
+        id: wasmkey
+        run: echo "key=mach-seal-$(sh scripts/wasm-ensure.sh --hash)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            internal/server/static/mach-seal.wasm
+            internal/server/static/.mach-seal.stamp
+          key: ${{ steps.wasmkey.outputs.key }}
       - uses: jdx/mise-action@v4
       - run: mise run lint
 
@@ -56,6 +70,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Seal-wasm cache key (the input list lives in the script)
+        id: wasmkey
+        run: echo "key=mach-seal-$(sh scripts/wasm-ensure.sh --hash)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            internal/server/static/mach-seal.wasm
+            internal/server/static/.mach-seal.stamp
+          key: ${{ steps.wasmkey.outputs.key }}
       - uses: jdx/mise-action@v4
       - run: mise run test
 
@@ -69,6 +92,22 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
+      # The browser-seal wasm is a gitignored build artifact internal/server
+      # embeds; this job has no mise, so the ensure script runs directly
+      # (bash from Git for Windows), with the same cache the Linux jobs use.
+      - name: Seal-wasm cache key (the input list lives in the script)
+        id: wasmkey
+        shell: bash
+        run: echo "key=mach-seal-$(bash scripts/wasm-ensure.sh --hash)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            internal/server/static/mach-seal.wasm
+            internal/server/static/.mach-seal.stamp
+          key: ${{ steps.wasmkey.outputs.key }}
+      - name: Build the seal wasm if its inputs changed
+        shell: bash
+        run: bash scripts/wasm-ensure.sh
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -178,6 +217,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Seal-wasm cache key (the input list lives in the script)
+        id: wasmkey
+        run: echo "key=mach-seal-$(sh scripts/wasm-ensure.sh --hash)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            internal/server/static/mach-seal.wasm
+            internal/server/static/.mach-seal.stamp
+          key: ${{ steps.wasmkey.outputs.key }}
       - uses: jdx/mise-action@v4
       - run: |
           set -o pipefail

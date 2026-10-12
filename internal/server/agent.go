@@ -444,12 +444,17 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		case "secret_push_result":
 			var res protocol.SecretPushResult
 			if json.Unmarshal(env.Payload, &res) == nil {
-				s.completePushWaiter(env.ReqID, machine.Name, &res, nil)
+				s.completePushWaiter(env.ReqID, machine.Name, &res, nil, nil)
 			}
 		case "secret_list_result":
 			var res protocol.SecretListResult
 			if json.Unmarshal(env.Payload, &res) == nil {
-				s.completePushWaiter(env.ReqID, machine.Name, nil, &res)
+				s.completePushWaiter(env.ReqID, machine.Name, nil, &res, nil)
+			}
+		case "secret_delete_result":
+			var res protocol.SecretDeleteResult
+			if json.Unmarshal(env.Payload, &res) == nil {
+				s.completePushWaiter(env.ReqID, machine.Name, nil, nil, &res)
 			}
 		case "retire":
 			s.handleSelfRetire(machine.Name)

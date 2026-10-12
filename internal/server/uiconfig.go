@@ -342,6 +342,8 @@ var uiNotices = map[string]string{
 	"approvalgranted":        "Approval granted. The command may run once; the grant is spent by that run.",
 	"approvalgrantedsession": "Approval granted for the session. The command may run in that session until it ends.",
 	"approvaldenied":         "Approval denied. The command stays refused.",
+	"secretspushed":          "Secret pushed. The value traveled sealed end-to-end; this control plane cannot read it.",
+	"secretdeleted":          "Secret deleted from this org's registry.",
 }
 
 func uiNoticeText(code string) string { return uiNotices[code] }
