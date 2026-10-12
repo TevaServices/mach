@@ -464,7 +464,11 @@ jobs:
           awk '{print substr($0, length($0)-63)}' signing.key > dist/mach-release-signing-key.pub
 
           # The attest tool, rebuilt from the tagged tree (mise pins go): the
-          # same revision the binaries carry.
+          # same revision the binaries carry. mach-server embeds the
+          # browser-seal wasm — a gitignored build artifact, absent from a
+          # fresh checkout — so the same ensure script every other mach-server
+          # compilation runs builds it first.
+          sh scripts/wasm-ensure.sh
           CGO_ENABLED=0 go build -trimpath \
             -ldflags "-s -w -X github.com/TevaServices/mach/internal/version.Version=$VER" \
             -o .attest-tool ./cmd/mach-server
@@ -722,7 +726,11 @@ jobs:
           # never satisfy: the plist shows `error` within seconds of the start
           # (v0.12.2, the first run this ever executed — #57). Enroll first,
           # the way every real deployment does: a scratch control plane to
-          # enroll against, then the start is a meaningful assertion.
+          # enroll against, then the start is a meaningful assertion. The
+          # scratch mach-server embeds the browser-seal wasm, a gitignored
+          # build artifact: ensure it the way every other mach-server
+          # compilation does.
+          sh scripts/wasm-ensure.sh
           mkdir -p cp
           CGO_ENABLED=0 go build -o ./cp/mach-server ./cmd/mach-server
           SCP="MACH_DB=$PWD/cp/mach.db MACH_SERVER_KEY=$PWD/cp/mach.db.key MACH_ORG=brew MACH_LISTEN=127.0.0.1:18117 MACH_PUBLIC_URL=http://127.0.0.1:18117"

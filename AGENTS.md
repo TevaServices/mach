@@ -634,7 +634,10 @@ to run it, and for why the driver difference matters.
   `wasm:ensure` and rebuilds only when the hash changes; CI stores the
   artifact in a cache keyed by that same hash (`scripts/wasm-ensure.sh
   --hash` prints it — one list, nowhere duplicated); the Docker image runs
-  the same script in its build stage. Consequences worth knowing: a cold
+  the same script in its build stage, and so does every other place that
+  compiles the control plane: the goreleaser attest hook (its tool build),
+  e2e.sh, and the release workflow's attest-tool and brew-smoke scratch
+  builds. Consequences worth knowing: a cold
   clone's first raw `go build ./cmd/mach-server` or `go test ./...` fails
   with the embed error naming the wasm — run any of those mise tasks (or
   `mise run wasm` to force) first; and a toolchain bump is bump-the-pin +

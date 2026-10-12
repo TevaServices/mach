@@ -64,6 +64,11 @@ check() { # check <desc> <cond exit code>
 }
 
 step "build"
+# The browser-seal wasm is a gitignored build artifact that mach-server
+# embeds: whatever compiles the control plane runs the same ensure first —
+# a no-op when the artifact is fresh, a real build when its inputs changed —
+# so a raw `bash scripts/e2e.sh` works like the mise path does.
+sh scripts/wasm-ensure.sh
 go build -o "$WORKDIR/mach" ./cmd/mach || { echo "build mach failed"; exit 1; }
 go build -o "$WORKDIR/mach-server" ./cmd/mach-server || { echo "build mach-server failed"; exit 1; }
 ok "binaries built"
