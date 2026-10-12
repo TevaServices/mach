@@ -83,7 +83,8 @@ func TestAssetVersionIsADigestOfTheAssets(t *testing.T) {
 	}
 }
 
-// The wasm is a committed build artifact, and everything around it assumes it
+// The wasm is a generated build artifact (produced by scripts/wasm-ensure.sh
+// wherever the control plane compiles), and everything around it assumes it
 // is the real one: the page's CSP relaxes script-src for wasm compilation, and
 // a browser caches the bytes under the asset digest for a year. A file that is
 // not a wasm module (a stale placeholder, a stray text file) would fail at the

@@ -5,7 +5,9 @@
 // compiled for js/wasm, not a second implementation of the format: a page
 // adding a secret from the admin UI runs the same bytes the agent runs, so a
 // version field cannot quietly go missing on one side. Build it with
-// `mise run wasm` and commit static/mach-seal.wasm along with it. (The
+// `mise run wasm` (script: scripts/wasm-ensure.sh) — the artifact is a
+// gitignored build output the server embeds at compile time, never
+// committed. (The
 // underscore in cmd/_uiseal keeps ./... from vetting or testing a main
 // package that only exists for js/wasm; see doc.go on the non-wasm side.)
 //

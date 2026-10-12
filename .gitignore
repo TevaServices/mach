@@ -9,3 +9,8 @@ console.json
 coverage.out
 # goreleaser build output (local `mise run pack` / snapshot runs)
 dist/
+# the browser-side seal: a built artifact, not committed source —
+# internal/server embeds it, scripts/wasm-ensure.sh owns the build
+internal/server/static/mach-seal.wasm
+internal/server/static/.mach-seal.stamp
+internal/server/static/.mach-seal.lock/

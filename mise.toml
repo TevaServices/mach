@@ -16,42 +16,26 @@ MACH_TEST_ORG = "bcross"
 description = "Verify toolchain and download Go modules"
 run = "go mod download"
 
-# The browser-side seal (cmd/uiseal) is internal/e2e compiled for js/wasm.
-# Its artifact is committed (internal/server/static/mach-seal.wasm) and serves
-# from the embedded assets, so the flags below are also a contract with
-# wasm:check, which rebuilds to a temp file and refuses drift. Rebuild and
-# commit whenever cmd/uiseal or internal/e2e changes, or after a toolchain
-# bump — wasm_exec.js is vendored from the same toolchain and must match it.
+# The browser-side seal (cmd/_uiseal) is built wherever the control plane is
+# built — not committed and not compared against a committed copy. Its input
+# hash decides, and scripts/wasm-ensure.sh is the ONE home for that list, for
+# the build flags and for the GOTOOLCHAIN pin (which must move together with
+# the vendored static/wasm_exec.js — both from one toolchain). Every task here
+# that compiles Go depends on wasm:ensure, so a fresh clone or a changed
+# internal/e2e gets the artifact rebuilt, and only when its inputs changed;
+# CI caches the artifact keyed on the same hash and the Docker image runs the
+# same script in its build stage.
 [tasks.wasm]
-description = "Build the browser seal (internal/e2e for js/wasm) into the committed asset"
-run = '''
-# The toolchain is pinned because the artifact is committed and
-# wasm:check compares bytes: a 1.26.x patch difference would rebuild the
-# wasm differently and fail the check for no reason. Bump this pin together
-# with the vendored static/wasm_exec.js (from the same tree's lib/wasm) —
-# the two must come from one toolchain.
-GOTOOLCHAIN=go1.26.6 CGO_ENABLED=0 GOOS=js GOARCH=wasm go build -trimpath -ldflags="-s -w" \
-  -o internal/server/static/mach-seal.wasm ./cmd/_uiseal
-echo "built: internal/server/static/mach-seal.wasm"
-'''
+description = "Force-rebuild the browser seal (internal/e2e for js/wasm) into the gitignored asset"
+run = "scripts/wasm-ensure.sh --force"
 
-[tasks."wasm:check"]
-description = "Rebuild the browser seal to a temp file and compare with the committed asset (read-only)"
-run = '''
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-GOTOOLCHAIN=go1.26.6 CGO_ENABLED=0 GOOS=js GOARCH=wasm go build -trimpath -ldflags="-s -w" \
-  -o "$tmp/mach-seal.wasm" ./cmd/_uiseal
-if ! cmp -s "$tmp/mach-seal.wasm" internal/server/static/mach-seal.wasm; then
-  echo "internal/server/static/mach-seal.wasm is stale: it does not match a fresh build of ./cmd/_uiseal (GOTOOLCHAIN=go1.26.6)." >&2
-  echo "run: mise run wasm   (and commit the rebuilt artifact)" >&2
-  exit 1
-fi
-echo "wasm: fresh"
-'''
+[tasks."wasm:ensure"]
+description = "Ensure the browser-seal artifact exists, rebuilding only when its inputs changed"
+run = "scripts/wasm-ensure.sh"
 
 [tasks.build]
 description = "Build mach and mach-server into bin/ (stamp a release with MACH_VERSION=0.3.0)"
+depends = ["wasm:ensure"]
 run = '''
 mkdir -p bin
 # Unset means no -X at all, never an empty one: an empty stamp would make every
@@ -84,6 +68,7 @@ ls bin/cross
 
 [tasks.test]
 description = "Run unit tests (all packages, race + cover)"
+depends = ["wasm:ensure"]
 run = '''
 # -race is a cgo test: the race runtime links C, and on Linux the toolchain
 # refuses to start it under CGO_ENABLED=0 rather than silently un-checking.
@@ -110,12 +95,13 @@ echo "gofmt: clean"
 '''
 
 [tasks.lint]
-description = "wasm freshness + gofmt check + go vet across the tree (read-only: never rewrites files)"
-depends = ["fmt-check", "wasm:check"]
+description = "browser-seal artifact check + gofmt check + go vet across the tree"
+depends = ["fmt-check", "wasm:ensure"]
 run = "go vet ./..."
 
 [tasks.e2e]
 description = "End-to-end test: spins up control plane + agents on 127.0.0.1 (script builds its own binaries)"
+depends = ["wasm:ensure"]
 run = "bash scripts/e2e.sh"
 
 # Local packaging check (no publishing): validates .goreleaser.yaml and
