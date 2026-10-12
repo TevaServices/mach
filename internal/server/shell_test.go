@@ -47,7 +47,7 @@ func TestUIPagesHaveExactlyOneH1(t *testing.T) {
 		t.Fatalf("seed machine: %v", err)
 	}
 
-	for _, path := range []string{"/ui", "/ui/orgs", "/ui/orgs/acme"} {
+	for _, path := range []string{"/ui", "/ui/secrets", "/ui/orgs", "/ui/orgs/acme"} {
 		body := uiGetPage(t, h, session, path)
 		if n := strings.Count(body, "<h1>"); n != 1 {
 			t.Errorf("%s has %d h1 elements, want exactly 1", path, n)

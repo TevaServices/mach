@@ -20,14 +20,10 @@ import (
 	"github.com/TevaServices/mach/internal/protocol"
 )
 
-// secretValueBounds mirrors the agent's own limits: a value too short to be
-// a secret would also make the machine's scrubbing meaningless. The client
-// refuses before sealing so the operator learns immediately, not from the
-// machine's rejection.
-const (
-	minSecretValueBytes = 8
-	maxSecretValueBytes = 4096
-)
+// The value bounds are the wire package's rule (protocol.ValidSecretValue),
+// not a local mirror: the console refuses before sealing so the operator
+// learns immediately, not from the machine's rejection — but the rule it
+// refuses with is the one the agent will enforce at storage time.
 
 // registrySecret is one row of the control plane's names-only registry.
 type registrySecret struct {
@@ -100,8 +96,9 @@ func (c *client) SecretsPush(machine, name, valueFile string) int {
 		fmt.Fprintln(os.Stderr, "mach: "+err.Error())
 		return 2
 	}
-	if len(value) < minSecretValueBytes || len(value) > maxSecretValueBytes {
-		fmt.Fprintf(os.Stderr, "mach: secret value must be %d..%d bytes\n", minSecretValueBytes, maxSecretValueBytes)
+	if len(value) < protocol.MinSecretValueBytes || len(value) > protocol.MaxSecretValueBytes {
+		fmt.Fprintf(os.Stderr, "mach: secret value must be %d..%d bytes\n",
+			protocol.MinSecretValueBytes, protocol.MaxSecretValueBytes)
 		return 2
 	}
 

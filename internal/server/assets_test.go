@@ -68,13 +68,49 @@ func TestAssetVersionIsADigestOfTheAssets(t *testing.T) {
 	}
 	// Computed here as one concatenated buffer, where assets.go writes
 	// incrementally, so the two expressions are genuinely independent rather than
-	// the same line asserted against itself.
+	// the same line asserted against itself. The file list matches assets.go's
+	// digest set — the six files every secrets page's behaviour (and the wasm
+	// request shape) depends on.
 	all := append([]byte{}, mustAsset("static/htmx.min.js")...)
 	all = append(all, mustAsset("static/app.js")...)
 	all = append(all, uiCSSBytes...)
+	all = append(all, mustAsset("static/secrets.js")...)
+	all = append(all, mustAsset("static/wasm_exec.js")...)
+	all = append(all, mustAsset("static/mach-seal.wasm")...)
 	sum := sha256.Sum256(all)
 	if want := hex.EncodeToString(sum[:4]); assetVersion != want {
 		t.Fatalf("assetVersion = %q, but the embedded bytes digest to %q", assetVersion, want)
+	}
+}
+
+// The wasm is a committed build artifact, and everything around it assumes it
+// is the real one: the page's CSP relaxes script-src for wasm compilation, and
+// a browser caches the bytes under the asset digest for a year. A file that is
+// not a wasm module (a stale placeholder, a stray text file) would fail at the
+// browser, far from where the mistake happened, so the first bytes are pinned.
+func TestTheSealWasmIsAWasmBinary(t *testing.T) {
+	b := mustAsset("static/mach-seal.wasm")
+	if len(b) < 8 {
+		t.Fatalf("mach-seal.wasm is only %d bytes", len(b))
+	}
+	want := []byte{0x00, 0x61, 0x73, 0x6d} // \0asm — the module header
+	if string(b[:4]) != string(want) {
+		t.Fatalf("mach-seal.wasm does not begin with the wasm module magic %q", b[:4])
+	}
+	if b[4] != 0x01 || b[5] != 0x00 || b[6] != 0x00 || b[7] != 0x00 {
+		t.Fatalf("mach-seal.wasm declares binary version %v, want 1", b[4:8])
+	}
+	// The ABI the page calls: a rebuilt-but-empty or foreign wasm would pass
+	// the magic and still break the page, so pin the exported names the
+	// secrets page binds to — they live in the wasm's export section.
+	found := 0
+	for _, name := range []string{"machSeal", "machFingerprint"} {
+		if strings.Contains(string(b), name) {
+			found++
+		}
+	}
+	if found != 2 {
+		t.Fatalf("mach-seal.wasm does not carry the machSeal/machFingerprint exports the page calls; was it built from cmd/_uiseal?")
 	}
 }
 
@@ -219,6 +255,7 @@ func TestUIRejectsInlineStyles(t *testing.T) {
 	for _, tmpl := range []struct{ name, src string }{
 		{"shell", shellSource}, {"fleet", fleetSource}, {"fleettable", fleetInnerSource},
 		{"orgs", orgsSource}, {"orge2e", orgE2ESource}, {"orgmember", memberSource},
+		{"secrets", secretsSource}, {"secretdelete", secretDeleteConfirmSource}, {"secretdeletepage", secretDeleteConfirmPageSource},
 		{"enroll", enrollSource}, {"enrollpick", enrollPickSource},
 		{"pair", pairPageHead + pairPageCSS + pairPageBody},
 	} {

@@ -115,13 +115,21 @@ const shellSource = `<!doctype html>
 <meta name="htmx-config" content='{"includeIndicatorStyles":false}'>
 <title>{{.Title}}</title>
 <link rel="stylesheet" href="/static/ui.css?v={{.AssetVersion}}">
+{{/* htmx and app.js drive every page. The two scripts below serve only the
+     secrets page: wasm_exec.js is the Go js/wasm runtime (vendored, like
+     htmx), and secrets.js loads the seal wasm and wires the push form.
+     Pages that never compile wasm get no wasm script at all, so the one
+     page's relaxation stays one page's. */}}
 <script src="/static/htmx.min.js?v={{.AssetVersion}}" defer></script>
 <script src="/static/app.js?v={{.AssetVersion}}" defer></script>
+{{if eq .Page "secrets"}}<script src="/static/wasm_exec.js?v={{.AssetVersion}}" defer></script>
+<script src="/static/secrets.js?v={{.AssetVersion}}" defer></script>{{end}}
 </head><body hx-headers='{"X-CSRF-Token":"{{.CSRF}}"}'>
 {{if not .Public}}<a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header"><nav aria-label="Main">
   <span class="nav-links">
     <a href="/ui" {{if eq .Page "fleet"}}aria-current="page"{{end}}>Fleet</a>
+    <a href="/ui/secrets" {{if eq .Page "secrets"}}aria-current="page"{{end}}>Secrets</a>
     <a href="/ui/orgs" {{if or (eq .Page "orgs") (eq .Page "orgmember")}}aria-current="page"{{end}}>Orgs</a>
   </span>
   {{/* .nav-right is one group pushed to the end of the row. The reading order
@@ -608,6 +616,170 @@ has machines cannot be removed.</p>
 {{end}}
 {{end}}`
 
+// secretsSource is the secrets page: the registry's names for the orgs this
+// session may see, the machines it can act on (as the seal-info data
+// attribute the browser's sealing script reads), the add/update form, and a
+// typed-name delete confirmation per row.
+//
+// The page renders NAMES only. There is no value field in its row type and no
+// name attribute on the value input — the two shapes the control that keeps
+// values off this server can take. The value input is deliberately anonymous
+// (no name), so HTML form semantics themselves refuse to submit it: neither a
+// scripting-on htmx submission nor a scripting-off fallback POST can ever
+// carry the plaintext, whatever the form's other fields do. The server-side
+// handler refuses a request that arrives with a value field anyway, because
+// the page is not the only way a form can be POSTed.
+//
+// The push form is a PLAIN form even on the htmx path — its submit is
+// intercepted by secrets.js, which seals the value and posts with
+// htmx.ajax — because htmx's own request building cannot run a seal first,
+// and a form the browser can build without the seal must not be htmx-drivable
+// either. Without scripting the form still renders and still submits; the
+// server answers the missing seal with the CLI fallback, never with a
+// plaintext fallback.
+//
+// The seal info rides on the container as escaped JSON in a data attribute:
+// the browser needs each machine's PUBLIC E2E key to seal with, which is the
+// same fact /e2epub would hand a console and no more secret than the machine
+// names the page already shows.
+const secretsSource = `{{define "secrets"}}
+<div id="secrets-main" data-mach-seal="{{.SealJSON}}" data-mach-asset="{{.SealAssetVersion}}">
+<p class="muted">A secret's value lives only on the machines it was pushed to. Every list
+here shows NAMES only — the form masks the value and seals it in your browser
+to the target machine's end-to-end key, and this control plane relays the
+ciphertext without being able to read it. With E2E off for an org, pushing is
+refused rather than sent some weaker way.</p>
+{{if .Super}}<p class="muted">You are signed in as a superadmin, so every org's rows are listed.</p>{{end}}
+{{if not .Rows}}
+  <p class="muted">No secrets registered for the orgs you can see. Push one below —
+  or from a configured console: <code>mach secrets push &lt;machine&gt; NAME --value-file -</code></p>
+{{else}}
+  <div class="table-scroll" role="region" aria-label="Registered secrets" tabindex="0">
+  <table>
+  <caption class="sr-only">Secret names registered on this control plane, with their provenance. Values never appear — there are no value fields.</caption>
+  <thead><tr>
+    {{if .Super}}<th scope="col">Org</th>{{end}}
+    <th scope="col">Name</th><th scope="col">Registered</th><th scope="col">By</th><th scope="col">Last seen</th><th scope="col">Actions</th>
+  </tr></thead>
+  <tbody>
+  {{range .Rows}}
+    <tr>
+      {{if $.Super}}<td><code>{{.Org}}</code></td>{{end}}
+      <td><code>{{.Name}}</code></td>
+      <td class="muted">{{.CreatedAt}}</td>
+      <td class="muted">{{if .CreatedBy}}{{.CreatedBy}}{{else}}-{{end}}</td>
+      <td class="muted">{{if .LastSeenAt}}{{.LastSeenAt}}{{else}}-{{end}}</td>
+      <td>
+        <div class="row-actions">
+        <form class="inline" method="post" action="/ui/secrets/delete" hx-post="/ui/secrets/delete" hx-target="#secrets-confirm" hx-swap="innerHTML">
+          <input type="hidden" name="org" value="{{.Org}}">
+          <input type="hidden" name="name" value="{{.Name}}">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <button type="submit" class="danger">Delete</button>
+        </form>
+        </div>
+      </td>
+    </tr>
+  {{end}}
+  </tbody></table>
+  </div>
+  <p class="muted">Delete asks every reachable machine of the org to drop the value and
+  removes the name from this registry. A machine that is offline keeps its
+  value until it reconnects or the box is cleaned with
+  <code>mach secrets remove NAME</code>, and a machine that still holds
+  the value re-registers the name here at its next connect. Commands that
+  inject this name refuse until it is pushed again.</p>
+{{end}}
+<div id="secrets-confirm"></div>
+
+<h2>Add or update a secret</h2>
+<p class="muted">Pick the machine, NAME the secret, paste the value. Pushing the same
+NAME to the same machine again replaces the value; the machine keeps the
+secret's original registration time.</p>
+<datalist id="machines">{{range .Machines}}<option value="{{.}}">{{end}}</datalist>
+<div class="panel">
+<form id="secret-push-form" method="post" action="/ui/secrets/push">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <input type="hidden" name="sealed" value="">
+  <label>Machine
+    <input list="machines" name="machine" autocomplete="off" spellcheck="false" required>
+  </label>
+  <label>Name <span class="muted">(uppercase letters, digits and underscore)</span>
+    <input name="name" pattern="[A-Z_][A-Z0-9_]*" autocomplete="off" spellcheck="false" required>
+  </label>
+  <label>Value <span class="muted">(masked; never sent unsealed)</span>
+    <input type="password" id="secret-value" autocomplete="off" required>
+  </label>
+  <p class="row-actions"><button type="submit">Seal and push</button></p>
+  <div id="seal-note" class="muted" role="status">Values are sealed in your
+  browser, so this server never sees them. With scripting unavailable, use a
+  configured console instead: <code>mach secrets push &lt;machine&gt; NAME --value-file -</code></div>
+</form>
+</div>
+</div>
+{{end}}`
+
+// secretsActionSource is the response to a push or delete: the refreshed
+// region plus the notice, out of band — the same shape every other fleet
+// action's response uses.
+const secretsActionSource = `{{define "secretsaction"}}{{template "noticeoob" .}}{{template "secrets" .}}{{end}}`
+
+// secretDeleteConfirmSource renders the typed-name confirmation into
+// #secrets-confirm, outside the swapped #secrets-main region — the same
+// structure machine delete uses (see deleteConfirmSource). A dialog would be
+// a click through; deleting a secret takes the name away from every plaintext
+// command that injects it, and it must not be reachable by a misclick on the
+// wrong row.
+//
+// The typed value is the NAME, not the org: a row is identified by both, and
+// the org rides as a hidden field it was rendered from — while the typed
+// NAME is what makes the operator look at what they are deleting.
+const secretDeleteConfirmSource = `{{define "secretdeleteconfirm"}}
+<div class="panel">
+  <p>Delete <code>{{.Name}}</code> from org <code>{{.Org}}</code>?</p>
+  <p class="muted">The registry row goes away and every reachable machine of
+  this org is told to drop it; one that is offline keeps its value until it
+  reconnects or the box is cleaned.</p>
+  <form method="post" action="/ui/secrets/delete" hx-post="/ui/secrets/delete" hx-target="#secrets-main" hx-swap="outerHTML">
+    <input type="hidden" name="org" value="{{.Org}}">
+    <input type="hidden" name="name" value="{{.Name}}">
+    <input type="hidden" name="confirm" value="1">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label>Type <code>{{.Name}}</code> to confirm
+      <input type="text" name="confirm_name" autocomplete="off" autofocus></label>
+    <p class="row-actions">
+      <button class="btn-primary" type="submit">Delete secret</button>
+      <button type="button" hx-get="/ui/confirm/clear" hx-target="#secrets-confirm"
+              hx-swap="innerHTML" hx-params="none">Cancel</button>
+    </p>
+  </form>
+</div>
+{{end}}`
+
+// secretDeleteConfirmPageSource is the same confirmation as a page, for a
+// form post with scripting off — a near-copy on purpose rather than a shared
+// define, in exactly the way deleteConfirmPageSource is (see its comment).
+const secretDeleteConfirmPageSource = `{{define "secretdeleteconfirmpage"}}
+<div class="panel">
+  <p>Delete <code>{{.Name}}</code> from org <code>{{.Org}}</code>?</p>
+  <p class="muted">The registry row goes away and every reachable machine of
+  this org is told to drop it; one that is offline keeps its value until it
+  reconnects or the box is cleaned.</p>
+  <form method="post" action="/ui/secrets/delete">
+    <input type="hidden" name="org" value="{{.Org}}">
+    <input type="hidden" name="name" value="{{.Name}}">
+    <input type="hidden" name="confirm" value="1">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label>Type <code>{{.Name}}</code> to confirm
+      <input type="text" name="confirm_name" autocomplete="off" autofocus></label>
+    <p class="row-actions">
+      <button class="btn-primary" type="submit">Delete secret</button>
+      <a class="btn" href="/ui/secrets">Cancel</a>
+    </p>
+  </form>
+</div>
+{{end}}`
+
 // loginFailedSource is shown when sign-in could not complete. The reason is a
 // fixed string from the server, never the identity provider's error text.
 //
@@ -629,7 +801,8 @@ var uiTmpl = template.Must(template.New("ui").Parse(
 	fleetInnerSource + fleetSource + fleetActionSource + deleteConfirmSource + deleteConfirmPageSource + confirmClearedSource +
 		approvalsSource + approvalsActionSource +
 		orgsSource + orgsActionSource + orgE2ESource + orgE2EActionSource +
-		memberSource + loginFailedSource + uiErrorSource + uiErrorPageSource + noticeOOBSource))
+		memberSource + secretsSource + secretsActionSource + secretDeleteConfirmSource + secretDeleteConfirmPageSource +
+		loginFailedSource + uiErrorSource + uiErrorPageSource + noticeOOBSource))
 
 // renderPage executes a content template and wraps it in the shared shell.
 func (s *Server) renderPage(w http.ResponseWriter, status int, sess uiSession, notice, title string,

@@ -377,6 +377,11 @@ func dialAndServe(cfg *Config, id *Identity, e2eKey *E2EKeyPair, ctl *sessionCtl
 		case "secret_list":
 			// Names only, ever — that is the whole contract.
 			handleSecretList(conn, env, activeSecrets())
+		case "secret_delete":
+			// Remove one NAME from this machine's store. Carries a name only,
+			// so no seal and no E2E gate; off the frame loop like the push,
+			// because the same handler writes the same file.
+			go handleSecretDelete(conn, env, activeSecrets())
 		case "secrets_announce_ack":
 			handleSecretsAnnounceAck(env)
 		case "pong":

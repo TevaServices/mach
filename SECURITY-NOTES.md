@@ -155,6 +155,9 @@ from the broker; nothing protects content from the machine's own operator.
 | Per-machine command policy on the agent itself (`MACH_POLICY` / `policy.txt`), evaluated where no upstream can override it, on both paths | agent/policy.go, internal/policy |
 | E2E sealing of one-shot exec: X25519 + ChaCha20-Poly1305, ephemeral sender key per command, AEAD key derived with HKDF (recipient and format version bound into the info string), AAD = the sender's ephemeral pubkey, format version checked on the way in | internal/e2e, agent/e2eexec.go |
 | **Trust-on-first-use pinning of each machine's E2E key** on the console: a changed key refuses to seal (naming both fingerprints and the remedy) instead of sealing to whatever the control plane now advertises | console/pins.go, client.go runExec |
+| **The web UI's secret pushes are sealed in the browser**: the value is typed into an unnamed input no request can carry, and the page's wasm (`cmd/_uiseal` = internal/e2e built for js/wasm) seals it to the machine's advertised key before anything is posted; the server-side handler refuses a request that arrives with a plaintext value field and shares the console push's core (E2E gate, soft block, audit, registry) rather than restating it | server/uisecrets.go, relaySealedSecretPush, cmd/_uiseal, static/secrets.js |
+| **Browser-side TOFU for UI pushes**: the first push from a browser to a machine records the key's fingerprint in localStorage; a later push against a different key refuses loudly naming both fingerprints, and accepting the change requires typing the machine's name — with the console pin's own limit (a first-use substitution wins silently) carried over rather than hidden | static/secrets.js |
+| **A UI secret delete is a fan-out, not bookkeeping**: the registry row goes first, then every reachable machine of the org gets a `secret_delete` frame (name-only, so the org's E2E setting does not gate it) through the shared dispatch gate; offline machines keep the value and re-register the name when they reconnect, and every outcome is audited | server/secrets.go orgSecretDelete, agent/secrets.go handleSecretDelete |
 | `readonly` keys refused on the streaming endpoint (it is command execution, not observation), and on `/e2epub` too — that endpoint hands out the key commands are sealed to, so a key that may not run commands has no use for it | stream.go handleConsoleStreamWS, consoleapi.go handleE2EPub |
 | Confinement of remote commands: own process group (unix), SIGKILL as a tree on timeout (Windows: timeout + caps only) | agent/confine*.go |
 | Output caps per path, with visible truncation markers; streamed frames dropped rather than stalling an agent whose console stopped reading | agent/run.go, agent/streamexec.go |
@@ -453,9 +456,14 @@ the winget manifest's InstallerSha256), verified by the consuming tool.
    prefix enrollable. `MACH_OIDC_ALLOWED_DOMAINS` is the knob; with it unset, the
    issuer's registration policy *is* the authorization model, and the control
    plane says so at startup rather than leaving it to be discovered.
-10. **The UI relaxes the CSP on two pages, and that is a real widening.**
+10. **The UI relaxes the CSP on three pages, and that is a real widening.**
     `/ui/*` and the public enrollment page need `script-src 'self'` for the
-    vendored htmx and the copy button. No `'unsafe-eval'` and no inline script:
+    vendored htmx and the copy button. The secrets page needs one keyword
+    more — `script-src 'self' 'wasm-unsafe-eval'` — because it compiles
+    WebAssembly (the browser-side seal), which every browser gates behind
+    that keyword; the keyword allows wasm compilation and nothing else (JS
+    eval stays blocked, and every page that does not compile wasm keeps the
+    stricter policy). No `'unsafe-eval'` and no inline script:
     htmx's `Function()` call sites are reachable only through `hx-on:` and
     JS-valued `hx-vals`, which these templates never use, and `form-action
     'self'` is required because `default-src 'none'` falls back to it. The pair
@@ -580,7 +588,6 @@ the winget manifest's InstallerSha256), verified by the consuming tool.
     how long the *console* waits, not a kill the machine honours forever). The
     confinement is a process group and a SIGKILL, not rlimits; see the
     `internal/agent/confine.go` package comment.
-
 26. **(Closed for UI deployments.)** With OIDC configured, the org list is no
     longer public: the enrollment page shows a signed-in member their own
     orgs, and the pair page offers only the approver's memberships. A
@@ -602,6 +609,23 @@ the winget manifest's InstallerSha256), verified by the consuming tool.
     re-enrolling is what pins one. This is backward compatibility with a loud
     warning, not a silent downgrade, and it is worth knowing before someone
     reads the warning as harmless.
+29. **The secrets page's browser seal has a residue worth naming.** The value
+    never crosses the control plane in plaintext — the wasm (internal/e2e
+    compiled for js/wasm, whose binary the control plane serves) seals it in
+    the browser, and the push handler refuses anything that arrives with an
+    unsealed value field — but the browser path inherits the console's TOFU
+    honesty plus some of its own: the pin lives in this browser's
+    localStorage, so a first push to a machine pins whatever key the control
+    plane advertised then, silently (the same first-use gap the console has);
+    a browser that cannot store pins proceeds unpinned and says so on screen
+    rather than quietly; the seal is only as good as the wasm the control
+    plane itself serves, so a hostile control plane serves a hostile seal —
+    the wasm's value is transparency of the build, not a check the browser
+    can make; and a delete fan-out reaches only the machines that are
+    online — offline machines keep the value until they reconnect or the box
+    is cleaned, and a machine that still holds the value re-registers its
+    NAME in the registry at its next connect (the registry is an honest
+    mirror, so that re-registration is correct, not a bug).
 
 ## Deployment checklist
 
