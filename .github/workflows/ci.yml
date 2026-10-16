@@ -57,7 +57,7 @@ jobs:
       - name: Seal-wasm cache key (the input list lives in the script)
         id: wasmkey
         run: echo "key=mach-seal-$(sh scripts/wasm-ensure.sh --hash)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             internal/server/static/mach-seal.wasm
@@ -73,7 +73,7 @@ jobs:
       - name: Seal-wasm cache key (the input list lives in the script)
         id: wasmkey
         run: echo "key=mach-seal-$(sh scripts/wasm-ensure.sh --hash)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             internal/server/static/mach-seal.wasm
@@ -99,7 +99,7 @@ jobs:
         id: wasmkey
         shell: bash
         run: echo "key=mach-seal-$(bash scripts/wasm-ensure.sh --hash)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             internal/server/static/mach-seal.wasm
@@ -220,7 +220,7 @@ jobs:
       - name: Seal-wasm cache key (the input list lives in the script)
         id: wasmkey
         run: echo "key=mach-seal-$(sh scripts/wasm-ensure.sh --hash)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             internal/server/static/mach-seal.wasm
